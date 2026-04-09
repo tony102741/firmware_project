@@ -1,0 +1,8 @@
+rootfs/
+work/
+*.img
+*.bin
+*.zip
+tools/tmp_*
+*.log
+__pycache__/
