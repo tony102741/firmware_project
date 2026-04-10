@@ -58,12 +58,15 @@ src/
   parser/
     init_parser.py       # .rc 파일 파싱 → service 목록 수집
   analyzer/
-    risk.py              # 핵심 스코어링 엔진 (분석 루프 전체 포함)
+    risk.py              # 분석 루프 조합: ELF 확인·경로 해석·노이즈 필터·결과 조립
     strings_analyzer.py  # ELF strings 추출 + 키워드 필터
     sink_detector.py     # 위험 함수 탐지 (3단계 분류)
+    input_classifier.py  # classify_input() / has_input_handler()
+    dataflow.py          # analyze_dataflow() / has_dangerous_memcpy_context() + 패턴 상수
+    scoring.py           # score_sinks() / calc_score()
     binder_detector.py   # Binder IPC 탐지 (현재 미사용)
     input_detector.py    # 입력 소스 탐지 (현재 미사용)
-  scanner/               # 독립 스캐너 모듈 (현재 분석 루프에 미통합)
+  scanner/               # 독립 실행 가능; run_filesystem_checks()를 통해 main.py에 통합됨
     scan_setuid.py       # setuid 파일 탐지
     scan_perm.py         # world-writable 파일 탐지
     scan_su.py           # su/busybox 존재 여부 탐지
@@ -86,23 +89,28 @@ tools/
 
 `collect_images()`: `extracted_*/` 내부에 partition 디렉터리(`system/`, `vendor/`)가 있으면 `work/`로 복사해 Format B 경로가 작동하게 함.
 
-### 2. 취약점 분석 (`src/analyzer/risk.py`)
+### 2. 취약점 분석 (`src/analyzer/`)
 
 ```
 init_parser: rootfs/**/*.rc 파싱
   → service { name, exec, user, socket[] }
-  → resolve_path(): exec 경로를 rootfs/system 또는 rootfs/vendor로 매핑
-  → is_elf() 확인 + strings -n6 추출
+  → resolve_path() [risk.py]: exec 경로를 rootfs/system 또는 rootfs/vendor로 매핑
+  → is_elf() 확인 + strings -n6 추출 [strings_analyzer.py]
 
-risk.py 분석 루프:
-  → is_noise_service() 필터
-  → classify_input(): "binder"(onTransact) | "socket"(recv/accept)
-  → detect_sinks(): 3단계 분류 반환
-  → is_valid_sink(): C++ mangled 심볼·긴 문자열·prose 제거
-  → analyze_dataflow(): 패턴 체인 → (flow_score, flow_type)
-  → weak sink 조건부 채택 (flow_score ≥ 3 AND has_dangerous_memcpy_context())
-  → calc_score(): 입력·권한·소켓권한·sink·flow 합산
+risk.py 분석 루프 (모듈별 역할):
+  → is_noise_service() 필터                              [risk.py]
+  → classify_input(): "binder"(onTransact) | "socket"   [input_classifier.py]
+  → detect_sinks(): 3단계 분류 반환                      [sink_detector.py]
+  → is_valid_sink(): C++ mangled 심볼·긴 문자열·prose 제거 [sink_detector.py]
+  → analyze_dataflow(): 패턴 체인 → (flow_score, type)  [dataflow.py]
+  → has_dangerous_memcpy_context(): weak sink 채택 조건  [dataflow.py]
+  → score_sinks() + calc_score(): 점수 합산 (cap 25)    [scoring.py]
   → 레벨 분류 → 정렬 출력
+
+main.py 출력:
+  → HIGH/MEDIUM(/LOW --all) 결과 출력
+  → run_filesystem_checks(): scan_setuid / scan_world_writable / scan_su
+     결과 중 분석 결과와 겹치는 바이너리에 [LEVEL] 어노테이션 표시
 ```
 
 ## Sink Tiers (`analyzer/sink_detector.py`)
@@ -115,7 +123,7 @@ risk.py 분석 루프:
 
 `weak` sink는 **dataflow 체인 확인 후에만** 결과에 포함된다.
 
-## Dataflow Patterns (`analyzer/risk.py: analyze_dataflow`)
+## Dataflow Patterns (`analyzer/dataflow.py: analyze_dataflow`)
 
 | 패턴 | 조건 | flow_score |
 |---|---|---|
@@ -149,6 +157,6 @@ risk.py 분석 루프:
 - **`resolve_path` 설계**: `root_path`는 항상 `rootfs/system`. vendor 바이너리는 `os.path.dirname(root_path)` → `rootfs/vendor`로 파생.
 - **노이즈 서비스 목록**: `wpa_supplicant`, `hostapd`, `vndservicemanager`, `bcmbtlinux`, `btsnoop`, `netd`, `adbd`, `healthd`, `lmkd`, `logd`, `statsd`, `tombstoned`, `incidentd`, `traced`, `storaged`, `installd`
 - **동일 exec 중복 제거**: 여러 .rc에서 같은 바이너리를 참조할 경우 첫 번째만 분석.
-- **`scanner/` 모듈**: 현재 메인 파이프라인에 통합되어 있지 않음. 독립 실행 또는 추후 통합 가능.
+- **`scanner/` 모듈**: `main.py`의 `run_filesystem_checks()`를 통해 통합됨. setuid·world-writable·su 결과를 분석 결과(`exec_map`)와 교차 조회해 위험 조합을 플래그. 독립 실행도 가능.
 - **`src/parser/extractor.py`**: 레거시 파일. 현재 파이프라인과 무관한 다른 payload dumper(`payload_dumper/` Python 패키지)를 호출하며, 실제로 사용되지 않음.
 - **파티션 탐색 순서** (`find_partition_dir`): `work/<name>/` → `extracted/**/<name>/` → 프로젝트 전체 트리 순으로 폴백. `_looks_like_partition_root()`는 `bin/`, `lib/`, `lib64/`, `etc/` 등의 지시자 디렉터리로 실제 루트를 판별.
