@@ -1,3 +1,16 @@
+firmware/
+data/
+build/
+*.zip
+*.img
+*.bin
+data/
+build/
+*.zip
+*.img
+*.bin
+*.tar
+ghidra_projects/
 rootfs/
 work/
 *.img

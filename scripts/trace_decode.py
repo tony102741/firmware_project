@@ -9,8 +9,8 @@ Flag: rev/rev16 (ntohl), ldr w (length field reads), memcpy/strcpy, stack alloc
 """
 
 import os, sys, re
-BINARY = "/home/user/firmware_project/rootfs/vendor/bin/hw/gpsd"
-PROJECT_DIR = "/home/user/ghidra_projects"
+BINARY      = os.environ.get("GPSD_BINARY",      "/workspace/data/rootfs/vendor/bin/hw/gpsd")
+PROJECT_DIR = os.environ.get("GHIDRA_PROJECT_DIR", "/workspace/ghidra_projects")
 PROJECT_NAME = "gpsd_analysis"
 
 TARGETS = [

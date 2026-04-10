@@ -1,17 +1,23 @@
 # Tiered sink classification:
-#   critical — command execution, direct code execution
+#   critical — command execution, dynamic code loading
 #   strong   — unchecked memory/string ops (no bounds check)
 #   weak     — compiler-added checked variants (__chk), ubiquitous in Android;
 #              only meaningful when dataflow confirms dangerous context
 
 CRITICAL_SINKS = [
+    # Command / shell execution
     "system(", "popen(", "execl(", "execv(", "execve(", "execvp(",
     "/bin/sh", "sh -c",
+    # Dynamic library loading — code execution if path is controllable
+    "dlopen(", "dlsym(",
 ]
 
 STRONG_SINKS = [
+    # Unbounded string operations
     "strcpy(", "strcat(", "sprintf(", "vsprintf(",
     "gets(", "scanf(", "sscanf(",
+    # Format string risk when argument is user-controlled
+    "printf(",
 ]
 
 WEAK_SINKS = [
