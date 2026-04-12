@@ -58,6 +58,25 @@ def detect_sinks(strings_list):
     return results
 
 
+def detect_sinks_from_imports(imports_dict):
+    """
+    Exact sink detection from ELF import table.
+
+    Replaces string matching for the sink-detection stage: every name here
+    is a real dynamic-linker symbol, not a substring of a log message.
+
+    imports_dict: {sym_name: plt_va} from elf_analyzer.get_imports()
+    Returns the same {"critical", "strong", "weak"} shape as detect_sinks().
+    """
+    from .elf_analyzer import SINK_IMPORTS
+    results = {"critical": [], "strong": [], "weak": []}
+    for sym_name in imports_dict:
+        for tier, syms in SINK_IMPORTS.items():
+            if sym_name in syms:
+                results[tier].append(sym_name)
+    return results
+
+
 def is_valid_sink(s, tier):
     """
     Filter out common false-positive sink strings.

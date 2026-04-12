@@ -40,7 +40,10 @@ def score_sinks(sinks_by_tier):
 
 
 def calc_score(input_type, user, socket_perm, sink_score, flow_score,
-               source="system", has_dlopen=False, is_parsing_heavy=False):
+               source="system", has_dlopen=False, is_parsing_heavy=False,
+               taint_confidence=0.3, validation_penalty=0.0,
+               controllability="MEDIUM", flow_confidence="WEAK",
+               memory_impact="NONE", flow_type=None):
     """
     Aggregate all scoring factors into a single exploitability score.
 
@@ -51,13 +54,28 @@ def calc_score(input_type, user, socket_perm, sink_score, flow_score,
       sink_score   : from score_sinks()
       flow_score   : from analyze_dataflow()
 
-    New bonus factors:
+    Bonus factors:
       socket+root  : combo bonus +2  (externally reachable AND maximally privileged)
       vendor source: +2              (vendor services are less audited / hardened)
       has_dlopen   : +3              (dynamic loading widens the attack surface)
       parsing_heavy: +1              (more parsing code → more parser bugs)
 
     Cap raised to 35 to preserve ranking fidelity when multiple bonuses apply.
+
+    taint_confidence: float 0.0–1.0 from elf_analyzer / dataflow graph.
+      1.0  LDRH→MUL→sink taint confirmed in function body
+      0.7  BFS path confirmed, short chain (≤3 hops)
+      0.5  BFS path confirmed, longer chain
+      0.3  string co-presence only (original pipeline default)
+      0.0  no evidence — sink_score contributes nothing
+
+    validation_penalty: float 0.0–0.40 from detect_validation_signals().
+      Applied as a proportional reduction to the final score.
+      0.0  — no safe-variant evidence detected (no reduction)
+      0.40 — binary exclusively uses bounded ops (max ~40% reduction)
+
+      Penalty NEVER eliminates a candidate — it only reduces its rank.
+      Minimum post-penalty score is 1 (if pre-penalty score > 0).
     """
     score = 0
 
@@ -107,8 +125,50 @@ def calc_score(input_type, user, socket_perm, sink_score, flow_score,
         score += 1
 
     # ── Sink and dataflow scores ──────────────────────────────────────────────
+    # Sink contribution is gated by taint_confidence to suppress false positives.
+    # flow_score is not gated — it reflects chain structure, not sink reachability.
 
-    score += sink_score
+    score += int(round(sink_score * taint_confidence))
     score += flow_score
 
-    return min(score, 35)   # Raised from 25 to preserve ranking at the top
+    score = min(score, 35)   # Raised from 25 to preserve ranking at the top
+
+    # ── Validation penalty ────────────────────────────────────────────────────
+    # Proportional reduction — never eliminates; floor of 1 for any non-zero score.
+
+    if validation_penalty > 0.0 and score > 0:
+        score = max(1, int(round(score * (1.0 - validation_penalty))))
+
+    # ── Controllability multiplier ────────────────────────────────────────────
+    # HIGH  — attacker-reachable without privilege: boost ranking
+    # MEDIUM — default: no change
+    # LOW   — requires privileged writer or internal-only path: strong penalty
+
+    if controllability == "HIGH":
+        score = int(round(score * 1.3))
+    elif controllability == "LOW":
+        score = max(1, int(round(score * 0.4)))
+    # MEDIUM: multiplier 1.0 — no operation needed
+
+    # ── Flow confidence multiplier ────────────────────────────────────────────
+    # Penalise weak chains to reduce MEDIUM noise; reward confirmed chains.
+
+    if flow_confidence == "LOW":
+        score = int(round(score * 0.7))
+    elif flow_confidence == "HIGH":
+        score = int(round(score * 1.2))
+    # MEDIUM: multiplier 1.0 — no operation needed
+
+    # ── Memory impact boost ───────────────────────────────────────────────────
+    # CONFIRMED overflow chain elevates urgency independent of other factors.
+
+    if memory_impact == "CONFIRMED":
+        score = int(round(score * 1.3))
+
+    # ── High-severity flow type boost ─────────────────────────────────────────
+    # Command execution and dynamic loading represent highest-impact primitives.
+
+    if flow_type in ("cmd_injection", "dlopen_injection"):
+        score = int(round(score * 1.2))
+
+    return score

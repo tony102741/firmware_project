@@ -60,3 +60,48 @@ def has_input_handler(strings):
         or "netlink" in s.lower()
         for s in strings
     )
+
+
+def classify_input_from_imports(imports_dict):
+    """
+    Exact input surface classification from ELF import table.
+
+    Priority mirrors classify_input() but uses symbol names instead of
+    substrings, eliminating matches against log strings like "recvfailed".
+
+    imports_dict: {sym_name: plt_va} from elf_analyzer.get_imports()
+    Returns: "binder" | "socket" | "netlink" | "file" | None
+    """
+    from .elf_analyzer import INPUT_IMPORTS
+    names = set(imports_dict.keys())
+
+    # Binder: onTransact is a vtable symbol, not a PLT import — keep string path
+    # for binder detection; import table alone is insufficient.
+
+    # Network socket: these are the canonical recv-family imports
+    if names & {"SSL_read", "recvfrom", "recvmsg", "recvmmsg", "accept", "accept4"}:
+        return "socket"
+    if names & {"recv"}:
+        return "socket"
+
+    # Netlink: raw read() with netlink strings is handled by the string path;
+    # no distinctive PLT import exists, so fall through to string classifier.
+
+    # File input
+    if names & {"fread", "fgets", "__fgets_chk"}:
+        return "file"
+
+    # Generic read() — could be socket or file; defer to string classifier
+    if "read" in names or "__read_chk" in names:
+        return "socket"   # conservative: treat raw read() as socket surface
+
+    return None
+
+
+def has_input_handler_from_imports(imports_dict):
+    """
+    Import-based equivalent of has_input_handler().
+    Returns True if any known input symbol is present in the import table.
+    """
+    from .elf_analyzer import INPUT_IMPORTS
+    return bool(set(imports_dict.keys()) & INPUT_IMPORTS)

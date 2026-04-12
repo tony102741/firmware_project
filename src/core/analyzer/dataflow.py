@@ -149,3 +149,164 @@ def analyze_dataflow(strings):
         return 5, "config_injection"
 
     return 0, None
+
+
+# ── Graph-based dataflow analysis ─────────────────────────────────────────────
+
+def analyze_dataflow_with_graph(cg, binary_path=None):
+    """
+    Dataflow analysis using the call graph built by elf_analyzer.build_call_graph().
+
+    Replaces the co-presence heuristic with actual reachability: a source→sink
+    chain is only reported when a BFS path exists in the call graph.
+
+    Returns: (flow_score, flow_type, path_len, taint_confidence)
+
+      flow_score       — same scale as analyze_dataflow() for scoring compat.
+      flow_type        — string label matching existing categories.
+      path_len         — hop count source→sink; shorter = higher confidence.
+      taint_confidence — float 0.0–1.0:
+                           1.0  path confirmed + LDRH/MUL taint in bottleneck
+                           0.7  path confirmed, short (≤3 hops)
+                           0.5  path confirmed, longer (4–7 hops)
+                           0.3  path confirmed, long chain (>7 hops)
+                           0.0  no path found (falls back to string analysis)
+
+    Parser-pattern boost: if binary_path is supplied, detect_parser_patterns()
+    is called to identify TLV/ASN.1/LPF/SEQOF functions on the confirmed path.
+    Any high-scoring (≥3) parser hit on the path raises taint_conf by 0.2
+    (capped at 1.0), reflecting elevated confidence that the length field is
+    actually network-controlled.
+    """
+    from .elf_analyzer import find_shortest_path, SINK_IMPORTS
+
+    source_fns = cg.get('_source_fns', set())
+    sink_fns   = cg.get('_sink_fns',   {})
+
+    if not source_fns or not sink_fns:
+        return 0, None, 999, 0.0
+
+    path, sink_sym, sink_tier = find_shortest_path(cg)
+
+    if path is None:
+        return 0, None, 999, 0.0
+
+    path_len = len(path)
+
+    # Map sink tier to flow primitives used by the rest of the pipeline
+    if sink_tier == "critical":
+        flow_type  = "cmd_injection"
+        flow_score = 10
+    elif sink_tier == "strong":
+        flow_type  = "buffer_overflow"
+        flow_score = 6
+    else:
+        flow_type  = "net_copy_partial"
+        flow_score = 3
+
+    # Base confidence from path length
+    if path_len <= 3:
+        taint_conf = 0.7
+    elif path_len <= 7:
+        taint_conf = 0.5
+    else:
+        taint_conf = 0.3
+
+    # Parser-pattern boost: network-controlled length confirmed on path
+    if binary_path is not None:
+        try:
+            from .elf_analyzer import detect_parser_patterns
+            parser_hits = detect_parser_patterns(binary_path, cg)
+            path_set = set(n for n in path if isinstance(n, int))
+            if any(parser_hits.get(va, {}).get('score', 0) >= 3 for va in path_set):
+                taint_conf = min(taint_conf + 0.2, 1.0)
+        except Exception:
+            pass  # parser scan is best-effort; never block scoring
+
+    return flow_score, flow_type, path_len, taint_conf
+
+
+def detect_validation_signals(imports_or_strings, use_imports=True):
+    """
+    Detect bounds-checking / validation discipline.
+
+    Returns a penalty float in [0.0, 0.40]:
+      0.0  — no safe-variant evidence; do not penalise
+      0.40 — binary exclusively uses bounded ops; likely defensive code
+
+    Logic
+    -----
+    Bounded copy (strncpy/strncat/__chk) present WITHOUT unsafe (strcpy/strcat)
+    → the binary was written to avoid the classic overflow pattern (+0.20).
+
+    Bounded format (snprintf/vsnprintf) WITHOUT unsafe (sprintf/vsprintf)
+    → format string overflow unlikely (+0.15).
+
+    Mixed (both safe and unsafe present) → partial credit (+0.08 / +0.05).
+
+    Presence of gets() WITHOUT any fgets() → no validation, subtract 0.05
+    so penalty cannot accidentally inflate on obviously dangerous binaries.
+
+    The returned value is passed to calc_score() as `validation_penalty`.
+    It reduces score proportionally but never eliminates a candidate.
+    """
+    if use_imports:
+        names = set(imports_or_strings.keys())
+        has_safe_copy   = bool(names & {"strncpy", "__strncpy_chk",
+                                        "strncat", "__strncat_chk"})
+        has_unsafe_copy = bool(names & {"strcpy", "strcat"})
+        has_safe_fmt    = bool(names & {"snprintf", "__snprintf_chk",
+                                        "vsnprintf", "__vsnprintf_chk"})
+        has_unsafe_fmt  = bool(names & {"sprintf", "vsprintf"})
+        has_safe_read   = bool(names & {"fgets", "__fgets_chk"})
+        has_unsafe_read = bool(names & {"gets"})
+    else:
+        lower = [s.lower() for s in imports_or_strings]
+        has_safe_copy   = any("strncpy" in l or "strncat" in l for l in lower)
+        has_unsafe_copy = any("strcpy(" in l or "strcat(" in l for l in lower)
+        has_safe_fmt    = any("snprintf" in l or "vsnprintf" in l for l in lower)
+        has_unsafe_fmt  = any("sprintf(" in l or "vsprintf(" in l for l in lower)
+        has_safe_read   = any("fgets" in l for l in lower)
+        has_unsafe_read = any("gets(" in l for l in lower)
+
+    penalty = 0.0
+
+    if has_safe_copy and not has_unsafe_copy:
+        penalty += 0.20
+    elif has_safe_copy and has_unsafe_copy:
+        penalty += 0.08
+
+    if has_safe_fmt and not has_unsafe_fmt:
+        penalty += 0.15
+    elif has_safe_fmt and has_unsafe_fmt:
+        penalty += 0.05
+
+    if has_unsafe_read and not has_safe_read:
+        penalty -= 0.05   # gets() present: actively dangerous, reduce penalty
+
+    return max(0.0, min(0.40, penalty))
+
+
+def upgrade_taint_confidence(path, cg, binary_path):
+    """
+    Attempt to upgrade taint_confidence to 1.0 by running check_length_taint_deep
+    (inter-procedural) on the function immediately before the sink in the
+    confirmed path.
+
+    Called lazily from risk.py only when the graph path was already confirmed
+    (taint_conf >= 0.5) to avoid expensive scans on unconfirmed chains.
+
+    Returns: updated taint_confidence (original value if upgrade fails).
+    """
+    from .elf_analyzer import check_length_taint_deep
+
+    if not path or len(path) < 2:
+        return 0.5
+
+    # Check the penultimate function (direct caller of the sink)
+    candidate = path[-2]
+    if not isinstance(candidate, int):
+        return 0.5
+
+    vulnerable, _evidence = check_length_taint_deep(binary_path, candidate, cg)
+    return 1.0 if vulnerable else 0.5
