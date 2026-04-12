@@ -10,3 +10,8 @@ ghidra_projects/
 __pycache__/
 .DS_Store
 CLAUDE.md
+build/
+data/
+logs/
+*.bin
+*.zip
