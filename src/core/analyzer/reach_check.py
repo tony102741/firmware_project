@@ -312,9 +312,6 @@ def check_flow_reachability(binary_path, flow, cgi_files, rootfs, web_config):
       remotely_reachable, endpoint, handler, auth_required, auth_strength,
       auth_evidence, input_param, input_method, exploit_scenario, keep
     """
-    binary_name = os.path.basename(binary_path)
-    is_webserver = binary_name.lower() in _WEB_SERVER_NAMES
-
     # ── 1. Find the HTTP handler ──────────────────────────────────────────────
 
     invokers = _find_invoking_scripts(binary_path, cgi_files, rootfs)
@@ -328,27 +325,7 @@ def check_flow_reachability(binary_path, flow, cgi_files, rootfs, web_config):
         auth_required, auth_strength, auth_evidence = _detect_auth(content)
         param_name, param_method = _extract_param(content, env_var)
         handler_rel = os.path.relpath(handler_path, rootfs)
-
-    elif is_webserver:
-        # Binary IS the web server; it handles HTTP directly
-        url            = f"port:{web_config['listen_ports'][0]}"
-        handler_path   = binary_path
-        handler_rel    = os.path.relpath(binary_path, rootfs)
-        env_var        = flow.get('env_var') or 'QUERY_STRING'
-        param_name     = flow.get('env_var') or 'HTTP_REQUEST'
-        param_method   = 'GET/POST'
-        # Auth check: web config or binary own auth logic
-        if web_config.get('has_auth_config'):
-            auth_required, auth_strength, auth_evidence = (
-                None, 'weak',
-                f"web server config has auth settings ({web_config['config_file']})"
-            )
-        else:
-            auth_required, auth_strength, auth_evidence = (
-                False, 'none', "no auth config found"
-            )
     else:
-        # Binary is not a web server and no invoking scripts found
         return {
             'remotely_reachable': False,
             'endpoint':           None,
@@ -362,6 +339,34 @@ def check_flow_reachability(binary_path, flow, cgi_files, rootfs, web_config):
             'keep':               False,
         }
 
+    if auth_required is not False:
+        return {
+            'remotely_reachable': False,
+            'endpoint':           None,
+            'handler':            handler_rel,
+            'auth_required':      auth_required,
+            'auth_strength':      auth_strength,
+            'auth_evidence':      auth_evidence,
+            'input_param':        param_name,
+            'input_method':       param_method,
+            'exploit_scenario':   None,
+            'keep':               False,
+        }
+
+    if not param_name or param_name == 'QUERY_STRING (raw)':
+        return {
+            'remotely_reachable': False,
+            'endpoint':           None,
+            'handler':            handler_rel,
+            'auth_required':      auth_required,
+            'auth_strength':      auth_strength,
+            'auth_evidence':      'no externally controllable HTTP parameter resolved',
+            'input_param':        param_name,
+            'input_method':       param_method,
+            'exploit_scenario':   None,
+            'keep':               False,
+        }
+
     # ── 2. Build exploit scenario ─────────────────────────────────────────────
 
     port   = web_config['listen_ports'][0] if web_config['listen_ports'] else 80
@@ -369,47 +374,30 @@ def check_flow_reachability(binary_path, flow, cgi_files, rootfs, web_config):
     origin = flow.get('origin', 'unknown')
 
     # Construct the HTTP request line
-    if param_name and 'QUERY_STRING' not in param_name:
-        payload_param = param_name
-    elif flow.get('env_var') and flow['env_var'] in ('QUERY_STRING',):
-        payload_param = 'cmd'   # generic, attacker-chosen name
-    else:
-        payload_param = param_name or 'param'
-
-    if url.startswith('port:'):
-        endpoint_str = f"http://device:{port}/ (direct)"
-        request_line = f"GET /?{payload_param}=id%3Bwhoami HTTP/1.1"
-    else:
-        endpoint_str = f"http://device:{port}{url}"
-        request_line = f"GET {url}?{payload_param}=id%3Bwhoami HTTP/1.1"
-
-    auth_note = ""
-    if auth_required is True:
-        auth_note = f" — requires auth ({auth_strength})"
-    elif auth_required is False:
-        auth_note = " — unauthenticated"
-    else:
-        auth_note = " — auth unknown"
+    payload_param = param_name
+    endpoint_str = f"http://device:{port}{url}"
+    request_line = f"GET {url}?{payload_param}=id%3Bwhoami HTTP/1.1"
 
     scenario = (
         f"{request_line}\n"
-        f"      → {sink}(\"id;whoami\") as root{auth_note}"
+        f"      → {sink}(\"id;whoami\") as root — unauthenticated"
     )
 
     # ── 3. Decide whether to keep ─────────────────────────────────────────────
 
     verdict = flow.get('verdict', 'UNCERTAIN')
-    keep = (
-        verdict in ('CONFIRMED', 'LIKELY')
-        and (auth_required is False or auth_required is None)
-    )
-
-    # Keep authenticated flows too, just ranked lower
-    if not keep and verdict in ('CONFIRMED', 'LIKELY') and auth_required is True:
-        keep = True
+    keep = verdict == 'CONFIRMED'
+    if verdict == 'LIKELY':
+        keep = (
+            flow.get('origin') == 'fmt_buf'
+            and 'getenv' in (flow.get('flow_str') or '').lower()
+            and auth_required is False
+            and bool(param_name)
+            and param_name != 'QUERY_STRING (raw)'
+        )
 
     return {
-        'remotely_reachable': True,
+        'remotely_reachable': keep,
         'endpoint':           endpoint_str,
         'handler':            handler_rel,
         'auth_required':      auth_required,

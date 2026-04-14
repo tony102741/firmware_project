@@ -51,10 +51,34 @@ NOISE_SERVICES = [
     "storaged", "installd",
 ]
 
+NOISE_BINARIES = {
+    "busybox", "[", "[[", "ash", "sh", "false", "true", "cat", "chmod", "chown",
+    "cmp", "cp", "cut", "date", "dd", "df", "dirname", "du", "echo", "env",
+    "expr", "head", "id", "kill", "killall", "ln", "ls", "mkdir", "mkfifo",
+    "mknod", "mktemp", "mv", "nice", "nohup", "od", "paste", "printf", "pwd",
+    "readlink", "rm", "rmdir", "sed", "seq", "sleep", "sort", "stat", "stty",
+    "sync", "tail", "tee", "test", "timeout", "touch", "tr", "uname", "uniq",
+    "unlink", "wc", "which", "whoami", "xargs", "yes", "basename", "find",
+    "grep", "egrep", "fgrep", "vi", "mount", "umount",
+}
+
 
 def is_noise_service(name):
     n = name.lower()
     return any(noise in n for noise in NOISE_SERVICES)
+
+
+def is_noise_binary(name, exec_path):
+    names = {
+        (name or "").strip().lower(),
+        os.path.basename((exec_path or "").strip()).lower(),
+    }
+    return any(n in NOISE_BINARIES for n in names if n)
+
+
+def _has_external_network_surface(surface):
+    sockets = surface.get("sockets", []) if surface else []
+    return any(s.startswith("port:") for s in sockets)
 
 
 # ── Controllability classification ─────────────────────────────────────────
@@ -126,7 +150,25 @@ def _classify_memory_impact(filtered, flow_score, taint_confidence):
 
 # ── Confidence label ────────────────────────────────────────────────────────
 
-def _flow_confidence(flow_score):
+def _has_argument_level_sink(sinks):
+    """
+    Return True only for sinks where attacker control of the *argument value*
+    materially changes code execution or file-write behavior.
+    """
+    for sink in sinks:
+        l = sink.lower()
+        if "system" in l or "popen" in l:
+            return True
+        if "dlopen" in l or "dlsym" in l:
+            return True
+        if "exec" in l and "dlsym" not in l and "dlopen" not in l:
+            return True
+        if any(k in l for k in ("fwrite", "fprintf", "write(", "pwrite", "fputs", "fputc")):
+            return True
+    return False
+
+
+def _flow_confidence(flow_score, flow_type=None, sinks=None):
     """
     Translate a numeric flow_score into a human-readable confidence label.
 
@@ -135,6 +177,20 @@ def _flow_confidence(flow_score):
     LOW    — weak signal: copy without parse confirmation
     WEAK   — no confirmed dataflow chain
     """
+    sinks = sinks or []
+    arg_sink = _has_argument_level_sink(sinks)
+
+    # Path-only control and UI-only influence should not be promoted as
+    # argument-level exploitability.
+    if flow_type == "file_path_injection":
+        return "LOW" if flow_score >= 3 else "WEAK"
+    if not arg_sink:
+        if flow_score >= 6:
+            return "LOW"
+        if flow_score >= 3:
+            return "WEAK"
+        return "WEAK"
+
     if flow_score >= 8:
         return "HIGH"
     if flow_score >= 6:
@@ -155,6 +211,8 @@ def analyze_services(services, root_path):
 
     for svc in services:
         if is_noise_service(svc["name"]):
+            continue
+        if is_noise_binary(svc.get("name", ""), svc.get("exec", "")):
             continue
         if svc["exec"] in seen_exec:
             continue
@@ -270,6 +328,11 @@ def analyze_services(services, root_path):
         all_sinks = filtered["critical"] + filtered["strong"] + filtered["weak"]
         if not all_sinks:
             continue
+        flow_confidence = _flow_confidence(flow_score, flow_type, all_sinks)
+        taint_for_score = (
+            taint_confidence if _has_argument_level_sink(all_sinks)
+            else min(taint_confidence, 0.3)
+        )
 
         # ── Stage 4: additional scoring factors ──────────────────────────────
 
@@ -315,10 +378,10 @@ def analyze_services(services, root_path):
             source=source,
             has_dlopen=dlopen,
             is_parsing_heavy=heavy,
-            taint_confidence=taint_confidence,
+            taint_confidence=taint_for_score,
             validation_penalty=validation_penalty,
             controllability=controllability,
-            flow_confidence=_flow_confidence(flow_score),
+            flow_confidence=flow_confidence,
             memory_impact=memory_impact,
             flow_type=flow_type,
         )
@@ -345,6 +408,9 @@ def analyze_services(services, root_path):
         # ── Input surface detection ───────────────────────────────────────────
 
         surface = detect_surface(strings)
+
+        if input_type in ("socket", "netlink") and not _has_external_network_surface(surface):
+            continue
 
         # ── Fuzzing hints ─────────────────────────────────────────────────────
 
@@ -383,7 +449,7 @@ def analyze_services(services, root_path):
 
             # Dataflow analysis
             "flow_type":   flow_type,
-            "confidence":  _flow_confidence(flow_score),
+            "confidence":  flow_confidence,
 
             # Taint confidence from ELF analysis (new)
             "taint_confidence": round(taint_confidence, 2),

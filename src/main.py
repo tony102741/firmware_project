@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import argparse
 
 # Ensure src/core/ is on sys.path so that 'from parser.init_parser import ...'
@@ -17,12 +18,26 @@ from scanner.scan_su import scan_su
 from scanner.scan_web import scan_web_surface
 from analyzer.verify_flow import verify_exploitable_flows
 from analyzer.reach_check import analyze_reachability
+from analyzer.strings_analyzer import extract_strings
 
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-ROOTFS_DIR  = os.path.join(_PROJECT_ROOT, "data/rootfs")
-SYSTEM_PATH = os.path.join(ROOTFS_DIR, "system")
-VENDOR_PATH = os.path.join(ROOTFS_DIR, "vendor")
+_DEFAULT_ROOTFS_DIR = os.path.join(_PROJECT_ROOT, "data/rootfs")
+_OVERRIDE_SYSTEM_PATH = os.environ.get("FIRMWARE_SYSTEM_PATH")
+_OVERRIDE_VENDOR_PATH = os.environ.get("FIRMWARE_VENDOR_PATH")
+
+if _OVERRIDE_SYSTEM_PATH:
+    SYSTEM_PATH = os.path.abspath(_OVERRIDE_SYSTEM_PATH)
+    ROOTFS_DIR = os.path.dirname(SYSTEM_PATH)
+    VENDOR_PATH = (
+        os.path.abspath(_OVERRIDE_VENDOR_PATH)
+        if _OVERRIDE_VENDOR_PATH
+        else os.path.join(ROOTFS_DIR, "vendor")
+    )
+else:
+    ROOTFS_DIR = _DEFAULT_ROOTFS_DIR
+    SYSTEM_PATH = os.path.join(ROOTFS_DIR, "system")
+    VENDOR_PATH = os.path.join(ROOTFS_DIR, "vendor")
 
 _W = 65   # output width — matches pipeline.py
 
@@ -131,6 +146,59 @@ def print_attack_surface_map(results):
               f" → [{r['name']}]"
               f" → [{r['exec']}]"
               f"  ctrl={ctrl}  mem={mem}  ({conf})", flush=True)
+
+
+def _has_web_layout(root):
+    if not os.path.isdir(root):
+        return False
+    for rel in (
+        "www", "cgi-bin", "usr/www", "var/www", "www/cgi-bin",
+        "www/webpages", "etc/wifidog", "usr/lib/lua/luci", "etc/config/uhttpd",
+    ):
+        if os.path.isdir(os.path.join(root, rel)):
+            return True
+        if os.path.isfile(os.path.join(root, rel)):
+            return True
+    return False
+
+
+def _find_web_servers(root):
+    if not os.path.isdir(root):
+        return []
+
+    names = {"httpd", "uhttpd", "lighttpd", "nginx", "mini_httpd", "boa"}
+    found = []
+    for rel in ("bin", "sbin", os.path.join("usr", "bin"), os.path.join("usr", "sbin")):
+        base = os.path.join(root, rel)
+        if not os.path.isdir(base):
+            continue
+        for name in names:
+            path = os.path.join(base, name)
+            if os.path.isfile(path):
+                found.append(path)
+    return sorted(set(found))
+
+
+def detect_analysis_mode():
+    reasons = []
+    web_layout = _has_web_layout(SYSTEM_PATH) or _has_web_layout(VENDOR_PATH)
+    web_servers = _find_web_servers(SYSTEM_PATH) + _find_web_servers(VENDOR_PATH)
+    has_android_layout = os.path.isdir(SYSTEM_PATH) and os.path.isdir(VENDOR_PATH)
+
+    if web_layout or web_servers:
+        if web_layout:
+            reasons.append("web paths detected (/www or /cgi-bin)")
+        if web_servers:
+            reasons.append(
+                "web server binaries detected "
+                f"({', '.join(sorted({os.path.basename(p) for p in web_servers}))})"
+            )
+        return "iot_web", "; ".join(reasons)
+
+    if has_android_layout:
+        return "android", "Android-style system/vendor layout detected"
+
+    return "general", "no web interface or Android-specific layout detected"
 
 
 # ── Filesystem cross-reference ────────────────────────────────────────────────
@@ -286,7 +354,262 @@ def _relevel(score, confidence):
     return "LOW"
 
 
-def _print_iot_entry(r):
+def _has_exec_sink(result):
+    sinks = [s.lower() for s in (result.get("all_sinks") or [])]
+    return any(
+        "system" in s or "popen" in s or ("exec" in s and "dlsym" not in s and "dlopen" not in s)
+        for s in sinks
+    )
+
+
+def _has_confirmed_exec_flow(result):
+    if not result.get("verified_flows"):
+        return result.get("confidence") in ("HIGH", "MEDIUM")
+    for flow in result.get("verified_flows", []):
+        verdict = flow.get("verdict")
+        sink = (flow.get("sink_sym") or "").lower()
+        if verdict in ("CONFIRMED", "LIKELY") and (
+            sink == "system" or sink == "popen" or sink.startswith("exec")
+        ):
+            return True
+    return False
+
+
+def _retune_results(results, cgi_files=None, strict_high=False):
+    has_web_scripts = bool(cgi_files)
+
+    for r in results:
+        if not has_web_scripts and r.get("input_type") == "socket":
+            r["score"] = max(1, int(round(r["score"] * 0.7)))
+            if r["level"] == "HIGH":
+                r["level"] = "MEDIUM"
+            elif r["level"] == "MEDIUM" and r["score"] < 8:
+                r["level"] = "LOW"
+
+        if strict_high and r.get("level") == "HIGH":
+            user_controlled = r.get("controllability") == "HIGH"
+            reachable = bool(r.get("web_exposed")) or bool(r.get("exploit_candidates"))
+            sink_confirmed = _has_exec_sink(r) and _has_confirmed_exec_flow(r)
+            if not (user_controlled and reachable and sink_confirmed):
+                r["level"] = "MEDIUM"
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+
+
+def _is_generic_shell_utility(result):
+    generic = {
+        "sh", "ash", "bash", "busybox", "ls", "cat", "cp", "mv", "rm", "echo",
+        "pwd", "test", "sleep", "grep", "sed", "awk", "tar", "gzip", "gunzip",
+        "zcat", "dmesg", "ps", "top", "time", "free", "hexdump", "md5sum",
+        "strings", "clear", "uptime", "pidof", "passwd",
+    }
+    name = (result.get("name") or "").lower()
+    sinks = [s.lower() for s in (result.get("all_sinks") or [])]
+    return name in generic or any("/bin/sh" in s or "shell=/bin/sh" in s for s in sinks)
+
+
+def _is_direct_web_exposed(bp, cgi_files):
+    bp = os.path.normpath(bp)
+    cgi_norm = {os.path.normpath(p) for p in cgi_files}
+    if bp in cgi_norm:
+        return True
+
+    rel = os.path.relpath(bp, SYSTEM_PATH).replace("\\", "/")
+    base = os.path.basename(bp).lower()
+    if base in {"httpd", "uhttpd", "lighttpd", "boa", "nginx", "mini_httpd", "thttpd"}:
+        return True
+    return any(part in rel for part in ("/www/", "/cgi-bin/", "/htdocs/", "/webroot/")) or \
+        rel.startswith(("www/", "cgi-bin/", "htdocs/", "webroot/"))
+
+
+_EXEC_PATH_RE = re.compile(r'(/(?:usr/)?s?bin/[A-Za-z0-9_.-]+)')
+_EXEC_CMD_RE = re.compile(
+    r'(?:system|popen|execlp?|execvp?|execve|execvpe)\s*\(\s*["\']([^"\']+)["\']',
+    re.IGNORECASE,
+)
+_HTTP_PATH_RE = re.compile(r'/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+(?:\.(?:cgi|asp|aspx|php|lua|htm|html|json|xml|js))?')
+_PARAM_NAME_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]{1,31})=')
+_AUTH_HINT_RE = re.compile(r'(login|auth|session|passwd|password|realm|token|cookie)', re.I)
+
+
+def _extract_runtime_exec_deps(binary_path, rootfs):
+    deps = set()
+    try:
+        strings = extract_strings(binary_path)
+    except Exception:
+        return deps
+
+    for s in strings:
+        for cmd_match in _EXEC_CMD_RE.finditer(s):
+            cmd = cmd_match.group(1).strip()
+            if cmd in ("/bin/sh", "sh", "/bin/ash", "ash"):
+                continue
+            if not any(ch in cmd for ch in (" ", "\t")) and cmd.endswith(("/bin/sh", "/bin/ash")):
+                continue
+            for m in _EXEC_PATH_RE.finditer(cmd):
+                path = m.group(1)
+                if path in ("/bin/sh", "/usr/bin/sh", "/bin/ash", "/usr/bin/ash"):
+                    continue
+                rel = path.lstrip("/")
+                candidate = os.path.normpath(os.path.join(rootfs, rel))
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    deps.add(candidate)
+    return deps
+
+
+def _reprioritize_iot_results(results, web_bins, cgi_files):
+    direct_web_bins = {os.path.normpath(p) for p in web_bins}
+    web_reachable = set(direct_web_bins)
+    by_path = {
+        os.path.normpath(r.get("binary_path", "")): r
+        for r in results if r.get("binary_path")
+    }
+
+    changed = True
+    while changed:
+        changed = False
+        seeds = list(web_reachable)
+        for bp in seeds:
+            if not os.path.isfile(bp):
+                continue
+            for dep in _extract_runtime_exec_deps(bp, SYSTEM_PATH):
+                if dep not in web_reachable:
+                    web_reachable.add(dep)
+                    changed = True
+
+    for r in results:
+        bp = os.path.normpath(r.get("binary_path", ""))
+        r["web_exposed"] = (
+            _is_direct_web_exposed(bp, cgi_files)
+            or bp in direct_web_bins
+            or _has_handler_binary_ref(bp, cgi_files)
+        )
+        r["web_reachable"] = bp in web_reachable
+        r["web_candidate"] = r["web_exposed"] or r["web_reachable"]
+
+        if r["web_candidate"]:
+            r["score"] = int(round(r["score"] * 1.5))
+            r["level"] = _relevel(r["score"], r["confidence"])
+        elif _is_generic_shell_utility(r):
+            r["score"] = max(1, int(round(r["score"] * 0.4)))
+            if r["level"] == "HIGH":
+                r["level"] = "MEDIUM"
+            elif r["level"] == "MEDIUM":
+                r["level"] = "LOW"
+
+    results.sort(key=lambda x: (
+        0 if x.get("web_exposed") else 1 if x.get("web_reachable") else 2,
+        -x["score"],
+    ))
+
+
+def _find_frontend_refs(binary_path, cgi_files):
+    name = os.path.basename(binary_path)
+    refs = []
+    pattern = re.compile(
+        r'(?:^|[\s\'"(/])' + re.escape(name) + r'(?:\s|["\'\);]|$)',
+        re.IGNORECASE,
+    )
+    for script_path in cgi_files:
+        try:
+            content = open(script_path, "r", encoding="utf-8", errors="ignore").read()
+        except Exception:
+            continue
+        if pattern.search(content) or name in content:
+            refs.append(os.path.relpath(script_path, _PROJECT_ROOT))
+    return refs[:3]
+
+
+def _has_handler_binary_ref(binary_path, cgi_files):
+    bp = os.path.normpath(binary_path)
+    if not bp or not cgi_files:
+        return False
+
+    rel = os.path.relpath(bp, SYSTEM_PATH).replace("\\", "/")
+    base = os.path.basename(bp)
+    exact_refs = {f"/{rel}".lower(), rel.lower()}
+    base_pat = re.compile(
+        r'(?:^|[\s\'"(/])' + re.escape(base) + r'(?:\s|["\'\);]|$)',
+        re.IGNORECASE,
+    )
+    allow_basename = base.lower() not in {
+        "sh", "ash", "bash", "busybox", "ls", "cat", "cp", "mv", "rm", "echo",
+        "pwd", "test", "sleep", "grep", "sed", "awk", "tar", "gzip", "gunzip",
+        "zcat", "dmesg", "ps", "top", "time", "free", "hexdump", "md5sum",
+        "strings", "clear", "uptime", "pidof", "passwd",
+    }
+
+    for script_path in cgi_files:
+        try:
+            content = open(script_path, "r", encoding="utf-8", errors="ignore").read()
+        except Exception:
+            continue
+        lower = content.lower()
+        if any(ref in lower for ref in exact_refs):
+            return True
+        if allow_basename and base_pat.search(content):
+            return True
+    return False
+
+
+def _manual_review_hints(result, cgi_files):
+    bp = result.get("binary_path", "")
+    if not bp or not os.path.isfile(bp):
+        return None
+
+    sink = next(
+        (s for s in (result.get("all_sinks") or [])
+         if any(k in s.lower() for k in ("system", "popen", "exec"))),
+        ((result.get("all_sinks") or [None])[0]),
+    )
+
+    try:
+        strings = extract_strings(bp)
+    except Exception:
+        strings = []
+
+    path_hits = []
+    param_hits = []
+    auth_hits = []
+    for s in strings:
+        for m in _HTTP_PATH_RE.finditer(s):
+            hit = m.group(0)
+            if hit not in path_hits and any(tok in hit for tok in ("/www", "/web", "/cgi-bin", ".cgi", ".asp", ".lua", ".php", ".htm")):
+                path_hits.append(hit)
+        for m in _PARAM_NAME_RE.finditer(s):
+            key = m.group(1)
+            if key.lower() not in ("http", "https", "content", "charset") and key not in param_hits:
+                param_hits.append(key)
+        m = _AUTH_HINT_RE.search(s)
+        if m:
+            hint = m.group(1).lower()
+            if hint not in auth_hits:
+                auth_hits.append(hint)
+
+    frontend = _find_frontend_refs(bp, cgi_files)
+    if not frontend:
+        frontend = [os.path.relpath(p, _PROJECT_ROOT) for p in (_find_web_servers(SYSTEM_PATH)[:1] or _find_web_servers(VENDOR_PATH)[:1])]
+
+    verified = result.get("verified_flows") or []
+    arg_level = any(
+        f.get("origin") in ("getenv", "fmt_buf", "arg_pass") or
+        "arg(" in (f.get("flow_str") or "") or
+        "system(" in (f.get("flow_str") or "")
+        for f in verified
+    )
+
+    return {
+        "binary": os.path.relpath(bp, _PROJECT_ROOT),
+        "sink": sink or "?",
+        "frontend": frontend[:2],
+        "auth": auth_hits[:3],
+        "paths": path_hits[:4],
+        "params": param_hits[:6],
+        "control": "argument-level" if arg_level else "coarse/granular",
+    }
+
+
+def _print_iot_entry(r, cgi_files=None):
     flow = r.get("flow_type") or "none"
     conf = r.get("confidence", "WEAK")
     ctrl = r.get("controllability", "?")
@@ -313,6 +636,17 @@ def _print_iot_entry(r):
 
     for hint in r.get("fuzzing_hints", []):
         print(f"    → {hint}", flush=True)
+
+    if r.get("web_exposed") and cgi_files is not None:
+        review = _manual_review_hints(r, cgi_files)
+        if review:
+            print(f"    review binary:   {review['binary']}", flush=True)
+            print(f"    review sink:     {review['sink']}", flush=True)
+            print(f"    review frontend: {', '.join(review['frontend']) if review['frontend'] else '?'}", flush=True)
+            print(f"    review auth:     {', '.join(review['auth']) if review['auth'] else 'none seen'}", flush=True)
+            print(f"    review paths:    {', '.join(review['paths']) if review['paths'] else 'none seen'}", flush=True)
+            print(f"    review params:   {', '.join(review['params']) if review['params'] else 'none seen'}", flush=True)
+            print(f"    review control:  {review['control']}", flush=True)
 
 
 def _run_deep_verification(results, top_n=10):
@@ -504,22 +838,16 @@ def run_iot_analysis(show_all=False):
 
     results = analyze_services(services, SYSTEM_PATH)
 
-    # ── Apply web-exposure score boost (1.5×) and re-level ───────────────────
-    web_norm = {os.path.normpath(p) for p in web_bins}
-    for r in results:
-        bp = os.path.normpath(r.get("binary_path", ""))
-        r["web_exposed"] = bp in web_norm
-        if r["web_exposed"]:
-            r["score"] = int(round(r["score"] * 1.5))
-            r["level"] = _relevel(r["score"], r["confidence"])
-
-    results.sort(key=lambda x: x["score"], reverse=True)
+    # ── Reprioritize toward real web-routed components ───────────────────────
+    _reprioritize_iot_results(results, web_bins, cgi_files)
+    _retune_results(results, cgi_files=cgi_files, strict_high=True)
 
     # ── Partition results ─────────────────────────────────────────────────────
-    web_results   = [r for r in results if r.get("web_exposed")]
-    high_results  = [r for r in results if not r.get("web_exposed") and r["level"] == "HIGH"]
-    med_results   = [r for r in results if not r.get("web_exposed") and r["level"] == "MEDIUM"]
-    low_results   = [r for r in results if not r.get("web_exposed") and r["level"] == "LOW"]
+    focused = [r for r in results if r.get("web_candidate")]
+    web_results   = [r for r in focused if r.get("web_exposed")]
+    high_results  = [r for r in focused if not r.get("web_exposed") and r["level"] == "HIGH"]
+    med_results   = [r for r in focused if not r.get("web_exposed") and r["level"] == "MEDIUM"]
+    low_results   = [r for r in focused if not r.get("web_exposed") and r["level"] == "LOW"]
 
     total_shown = len(web_results) + len(high_results) + len(med_results)
     print(f"[DONE]  {len(results)} candidate(s)  "
@@ -532,22 +860,22 @@ def run_iot_analysis(show_all=False):
     if web_results:
         print("\n  ── Web-exposed ──────────────────────────────────────────", flush=True)
         for r in web_results:
-            _print_iot_entry(r)
+            _print_iot_entry(r, cgi_files=cgi_files)
 
     if high_results:
         print("\n  ── HIGH (not directly web-exposed) ──────────────────────", flush=True)
         for r in high_results:
-            _print_iot_entry(r)
+            _print_iot_entry(r, cgi_files=cgi_files)
 
     if med_results:
         print("\n  ── MEDIUM ───────────────────────────────────────────────", flush=True)
         for r in med_results:
-            _print_iot_entry(r)
+            _print_iot_entry(r, cgi_files=cgi_files)
 
     if show_all and low_results:
         print("\n  ── LOW ──────────────────────────────────────────────────", flush=True)
         for r in low_results:
-            _print_iot_entry(r)
+            _print_iot_entry(r, cgi_files=cgi_files)
 
     if not (web_results or high_results or med_results):
         print("  (none — the firmware may use stripped binaries or an unsupported format)",
@@ -568,6 +896,7 @@ def run_iot_analysis(show_all=False):
 
     # ── Reachability and exploit scenario generation ──────────────────────────
     # Only runs on candidates that have verified CONFIRMED/LIKELY flows.
+    exploit_candidates = []
     if priority_results:
         _sec("REMOTELY EXPLOITABLE FLOWS")
         print("    Checking HTTP reachability and authentication ...", flush=True)
@@ -603,11 +932,12 @@ def run_iot_analysis(show_all=False):
                   flush=True)
 
     print(f"\n{'─' * _W}", flush=True)
+    return {"mode": "iot_web", "remote_count": len(exploit_candidates)}
 
 
 # ── Main analysis entry point ─────────────────────────────────────────────────
 
-def run_analysis(show_all=False):
+def run_android_analysis(show_all=False):
     if not os.path.exists(SYSTEM_PATH):
         print("[!] data/rootfs/system not found — was the extraction step successful?",
               flush=True)
@@ -630,6 +960,8 @@ def run_analysis(show_all=False):
     sys.stdout.flush()
 
     results = analyze_services(services, SYSTEM_PATH)
+    _, cgi_files = scan_web_surface(SYSTEM_PATH)
+    _retune_results(results, cgi_files=cgi_files, strict_high=True)
 
     high   = [r for r in results if r["level"] == "HIGH"]
     medium = [r for r in results if r["level"] == "MEDIUM"]
@@ -673,6 +1005,43 @@ def run_analysis(show_all=False):
         print("  Run with --all to inspect LOW-scored services.", flush=True)
 
     print(f"\n{'─' * _W}", flush=True)
+    return {"mode": "android", "remote_count": 0}
+
+
+def run_general_analysis(show_all=False):
+    print("\n[*] General mode fallback uses the standard service analysis path.",
+          flush=True)
+    return run_android_analysis(show_all=show_all)
+
+
+def run_analysis(show_all=False):
+    if not os.path.exists(SYSTEM_PATH):
+        print("[!] data/rootfs/system not found — was the extraction step successful?",
+              flush=True)
+        print(f"    Expected: {SYSTEM_PATH}", flush=True)
+        print("    Tip: run without --skip to re-extract, or check data/extracted/",
+              flush=True)
+        return
+
+    mode, reason = detect_analysis_mode()
+    _sec("ANALYSIS MODE")
+    print(f"  selected mode: {mode}", flush=True)
+    print(f"  reason: {reason}", flush=True)
+
+    if mode == "iot_web":
+        return run_iot_analysis(show_all=show_all)
+
+    if mode == "android":
+        result = run_android_analysis(show_all=show_all)
+    else:
+        result = run_general_analysis(show_all=show_all)
+
+    if result and result.get("remote_count", 0) == 0:
+        _sec("ANALYSIS RETRY")
+        print("  selected mode: iot_web", flush=True)
+        print("  reason: no remotely exploitable candidates found in initial analysis",
+              flush=True)
+        return run_iot_analysis(show_all=show_all)
 
 
 if __name__ == "__main__":

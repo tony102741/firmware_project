@@ -67,6 +67,16 @@ _FMT_SYMS = frozenset({
     "vsnprintf", "vsprintf",
 })
 
+_HTTP_READ_SYMS = frozenset({
+    "read", "__read_chk", "recv", "recvfrom", "recvmsg",
+    "fgets", "__fgets_chk", "fread", "SSL_read",
+})
+
+_HTTP_PARSE_SYMS = frozenset({
+    "getenv", "sscanf", "strstr", "strchr", "strncmp", "strcmp",
+    "snprintf", "__snprintf_chk", "sprintf", "__sprintf_chk",
+})
+
 _SANITISE_SYMS = frozenset({
     "strcmp", "strncmp", "strcasecmp", "strncasecmp",
     "strchr", "strrchr", "strstr",
@@ -286,7 +296,7 @@ def _find_sink_callsites_in_func(data, segments, func_va, sink_va_set,
     return hits
 
 
-def _verdict_from_x0(x0_info, has_input_import):
+def _verdict_from_x0(x0_info, has_input_import, has_http_input=False):
     """
     Translate x0 classification into a verdict.
 
@@ -298,11 +308,6 @@ def _verdict_from_x0(x0_info, has_input_import):
 
     if t == 'const_cmd':
         s = x0_info['detail']
-        # Heuristic: if the constant is a shell invocation with metacharacters, keep
-        if s and any(c in s for c in ('%', '$', '`', '|', '&', ';')):
-            return ('LIKELY',
-                    f"const fmt-like → system({s!r})",
-                    "constant with shell metacharacters — format injection possible")
         return ('FALSE_POSITIVE',
                 f"system({s!r})",
                 "constant command argument — no user input reaches sink")
@@ -310,65 +315,55 @@ def _verdict_from_x0(x0_info, has_input_import):
     if t == 'getenv':
         ev = x0_info['env_var'] or 'UNKNOWN_VAR'
         if sanit:
-            return ('UNCERTAIN',
+            return ('FALSE_POSITIVE',
                     f"getenv({ev!r}) → [sanitized] → system()",
-                    f"getenv({ev!r}) reaches system() but sanitization observed — verify bypass")
+                    f"getenv({ev!r}) reaches system() but sanitization/filtering is present")
         if ev in _CGI_ENV_VARS or 'HTTP_' in ev or 'QUERY' in ev:
             return ('CONFIRMED',
                     f"getenv({ev!r}) → system()",
                     f"HTTP parameter {ev!r} flows directly to system() with no observed sanitization")
-        return ('CONFIRMED',
+        return ('FALSE_POSITIVE',
                 f"getenv({ev!r}) → system()",
-                f"env var {ev!r} flows directly to system() — user-controlled in CGI context")
+                f"env var {ev!r} reaches system() but remote user control is unproven")
 
     if t == 'net_input':
         src = x0_info['detail']
         if sanit:
-            return ('UNCERTAIN',
+            return ('FALSE_POSITIVE',
                     f"{src} → [sanitized] → system()",
-                    f"network input via {src} reaches system() but sanitization call observed")
+                    f"network input via {src} reaches system() but sanitization/filtering is present")
         return ('CONFIRMED',
                 f"{src} → system()",
                 f"network-sourced buffer from {src} reaches system() unsanitized")
 
     if t == 'fmt_buf':
-        if sanit:
-            return ('UNCERTAIN',
-                    f"snprintf(cmd, ...) → [sanitized] → system(cmd)",
-                    "formatted command buffer reaches system() — sanitization observed, verify completeness")
-        if has_input_import:
+        if not sanit and has_http_input:
             return ('LIKELY',
-                    f"snprintf(cmd, fmt, input) → system(cmd)",
-                    "formatted command passed to system(); function also receives external input — format arg likely tainted")
-        return ('UNCERTAIN',
+                    f"getenv(...) → snprintf(cmd, ...) → system(cmd)",
+                    "HTTP/CGI input appears to populate the command buffer passed into the sink")
+        return ('FALSE_POSITIVE',
                 f"snprintf(cmd, ...) → system(cmd)",
-                "formatted command passed to system(); format arg taint unclear")
+                "formatted command reaches system(), but HTTP/CGI argument continuity is not fully verified")
 
     if t in ('stack_addr', 'stack_load', 'indirect_load'):
-        if has_input_import and not sanit:
-            return ('LIKELY',
-                    f"buf[stack] → system(buf)",
-                    "stack buffer reaches system(); function receives external input — buffer likely filled from user data")
-        if sanit:
-            return ('UNCERTAIN',
-                    f"buf[stack] → [sanitized] → system(buf)",
-                    "stack buffer with sanitization — trace sanitization completeness")
-        return ('UNCERTAIN',
+        return ('FALSE_POSITIVE',
                 f"buf[stack] → system(buf)",
-                "stack buffer reaches system(); input origin unclear")
+                "stack buffer reaches system(); verified input-to-sink continuity is missing")
 
     if t == 'arg_pass':
-        if has_input_import:
-            return ('LIKELY',
-                    "arg(X0) → system(X0)",
-                    "command string passed as argument; function also handles external input")
-        return ('UNCERTAIN',
+        return ('FALSE_POSITIVE',
                 "arg(X0) → system(X0)",
-                "command string is a parameter — trace callers for taint origin")
+                "command string is a parameter — verified caller-to-sink propagation is missing")
 
-    return ('UNCERTAIN',
+    return ('FALSE_POSITIVE',
             f"X0[{t}] → system()",
-            f"sink argument origin is {t!r} — manual confirmation needed")
+            f"sink argument origin is {t!r} — strict exploitability not proven")
+
+
+def _looks_like_http_input(callee_syms):
+    if 'getenv' in callee_syms:
+        return True
+    return bool(callee_syms & _HTTP_READ_SYMS) and bool(callee_syms & _HTTP_PARSE_SYMS)
 
 
 # ── AArch64 verification ──────────────────────────────────────────────────────
@@ -420,6 +415,7 @@ def _verify_aarch64(binary_path, cg):
         node           = cg.get(func_va, {})
         callee_syms    = {sym for _, sym in node.get('callees', set()) if sym}
         has_input      = bool(callee_syms & _INPUT_SYMS)
+        has_http_input = _looks_like_http_input(callee_syms)
         has_sanitise   = bool(callee_syms & _SANITISE_SYMS or
                               any(any(k in s.lower()
                                       for k in _SANITISE_KEYWORDS)
@@ -429,7 +425,8 @@ def _verify_aarch64(binary_path, cg):
             x0_info = _classify_x0_at_sink(
                 data, segments, func_va, call_idx, plt_rev)
 
-            verdict, flow_str, reason = _verdict_from_x0(x0_info, has_input)
+            verdict, flow_str, reason = _verdict_from_x0(
+                x0_info, has_input, has_http_input=has_http_input)
 
             results.append({
                 'func_va':   func_va,
@@ -480,70 +477,6 @@ def _verify_heuristic(binary_path, imports, strings=None):
                 fmt_templates.append(s)
 
     sink_sym = next(iter(imp_set & _CMD_SINKS))  # pick one representative
-
-    if has_getenv and cgi_vars and not has_sanitise:
-        ev   = sorted(cgi_vars)[0]
-        flow = (f"getenv({ev!r}) → "
-                + (f"snprintf(cmd, fmt, input) → " if has_fmt else "")
-                + f"{sink_sym}(cmd)")
-        results.append({
-            'func_va':   None,
-            'func_sym':  '(heuristic)',
-            'sink_sym':  sink_sym,
-            'sink_va':   None,
-            'origin':    'getenv',
-            'sanitized': False,
-            'flow_str':  flow,
-            'reason':    (f"CGI env var {ev!r} flows to {sink_sym}() "
-                          f"with no observed sanitization — confirmed CGI injection surface"),
-            'verdict':   'LIKELY',
-        })
-    elif has_getenv and cgi_vars and has_sanitise:
-        ev = sorted(cgi_vars)[0]
-        results.append({
-            'func_va':   None,
-            'func_sym':  '(heuristic)',
-            'sink_sym':  sink_sym,
-            'sink_va':   None,
-            'origin':    'getenv',
-            'sanitized': True,
-            'flow_str':  f"getenv({ev!r}) → [sanitized?] → {sink_sym}()",
-            'reason':    (f"CGI env var {ev!r} reaches {sink_sym}() with possible "
-                          f"sanitization — verify sanitization is complete"),
-            'verdict':   'UNCERTAIN',
-        })
-    elif has_net and not has_sanitise:
-        results.append({
-            'func_va':   None,
-            'func_sym':  '(heuristic)',
-            'sink_sym':  sink_sym,
-            'sink_va':   None,
-            'origin':    'net_input',
-            'sanitized': False,
-            'flow_str':  f"network_input() → {sink_sym}()",
-            'reason':    (f"binary reads from network and calls {sink_sym}() "
-                          f"with no observed sanitization — likely exploitable"),
-            'verdict':   'LIKELY',
-        })
-    elif has_cmd_sink:
-        # Check for format-string templates that look injectable
-        injectable = [t for t in fmt_templates
-                      if '%s' in t and ('cmd' in t.lower() or
-                                        '/bin' in t or '/sbin' in t or
-                                        len(t) < 64)]
-        if injectable:
-            results.append({
-                'func_va':   None,
-                'func_sym':  '(heuristic)',
-                'sink_sym':  sink_sym,
-                'sink_va':   None,
-                'origin':    'fmt_template',
-                'sanitized': has_sanitise,
-                'flow_str':  f"fmt({injectable[0]!r}) → {sink_sym}()",
-                'reason':    (f"format string with %s feeds {sink_sym}() "
-                              f"— confirm format argument is attacker-controlled"),
-                'verdict':   'UNCERTAIN',
-            })
 
     return results
 
