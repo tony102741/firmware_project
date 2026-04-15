@@ -31,10 +31,12 @@ from datetime import datetime
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
 
-FIRMWARE_DIR  = os.path.join(PROJECT_ROOT, "data/input")
-WORK_DIR      = os.path.join(PROJECT_ROOT, "build")
-ROOTFS_DIR    = os.path.join(PROJECT_ROOT, "data/rootfs")
-EXTRACTED_DIR = os.path.join(PROJECT_ROOT, "data/extracted")
+INPUTS_DIR    = os.path.join(PROJECT_ROOT, "inputs")
+CACHE_DIR     = os.path.join(PROJECT_ROOT, ".cache")
+FIRMWARE_DIR  = INPUTS_DIR
+WORK_DIR      = os.path.join(CACHE_DIR, "build")
+ROOTFS_DIR    = os.path.join(CACHE_DIR, "rootfs")
+EXTRACTED_DIR = os.path.join(CACHE_DIR, "extracted")
 RUNS_DIR      = os.path.join(PROJECT_ROOT, "runs")
 
 DUMPER      = os.path.join(PROJECT_ROOT, "tools/payload-dumper-go/payload-dumper-go")
@@ -107,7 +109,36 @@ def _fmt_time(seconds):
 
 def _slugify(text):
     text = re.sub(r'[^A-Za-z0-9._-]+', "-", text or "")
-    return text.strip("-") or "run"
+    text = re.sub(r'-{2,}', "-", text.strip("-"))
+    return (text or "run").lower()
+
+
+def _short_run_label(input_path=None, max_len=24):
+    if not input_path:
+        return "run"
+
+    stem = os.path.splitext(os.path.basename(input_path))[0]
+    slug = _slugify(stem)
+    if len(slug) <= max_len:
+        return slug
+
+    parts = [p for p in re.split(r"[-_.]+", slug) if p]
+    if not parts:
+        return slug[:max_len]
+
+    chosen = []
+    total = 0
+    for part in parts:
+        piece = part[:10] if not chosen and len(part) > 10 else part
+        extra = len(piece) + (1 if chosen else 0)
+        if total + extra > max_len:
+            break
+        chosen.append(piece)
+        total += extra
+
+    if chosen:
+        return "-".join(chosen)
+    return slug[:max_len]
 
 
 def _json_dump(path, payload):
@@ -170,8 +201,8 @@ def _prune_dir_set(paths, keep):
 
 def _prepare_run_artifacts(input_path=None):
     os.makedirs(RUNS_DIR, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    suffix = _slugify(os.path.splitext(os.path.basename(input_path))[0] if input_path else "run")
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    suffix = _short_run_label(input_path)
     run_dir = os.path.join(RUNS_DIR, f"run_{ts}_{suffix}")
     os.makedirs(run_dir, exist_ok=True)
     return {
@@ -606,7 +637,7 @@ def clean(skip):
         _info("reuse mode — skipping extraction")
         return
 
-    _info("cleaning build/ and data/rootfs/ ...")
+    _info("cleaning .cache/build and .cache/rootfs/ ...")
     shutil.rmtree(WORK_DIR, ignore_errors=True)
     shutil.rmtree(ROOTFS_DIR, ignore_errors=True)
 
@@ -614,7 +645,7 @@ def clean(skip):
     os.makedirs(os.path.join(ROOTFS_DIR, "system"), exist_ok=True)
     os.makedirs(os.path.join(ROOTFS_DIR, "vendor"), exist_ok=True)
 
-    # data/extracted/ is never deleted — payload re-extraction is expensive
+    # .cache/extracted/ is never deleted — payload re-extraction is expensive
     os.makedirs(EXTRACTED_DIR, exist_ok=True)
     # ensure input dir exists for user guidance
     os.makedirs(FIRMWARE_DIR, exist_ok=True)
@@ -664,13 +695,13 @@ def collect_images():
     Surface .img files and partition directories produced by payload-dumper-go.
 
     Moves any extracted_<timestamp>/ directories from the project root into
-    data/extracted/, then copies .img files / partition directories into
-    build/ so the rest of the pipeline can find them.
+     .cache/extracted/, then copies .img files / partition directories into
+    .cache/build so the rest of the pipeline can find them.
     """
     imgs_found = []
     dirs_found = []
 
-    # Move stray extracted_* dirs from the project root into data/extracted/
+    # Move stray extracted_* dirs from the project root into .cache/extracted/
     for d in os.listdir(PROJECT_ROOT):
         if not d.startswith("extracted_"):
             continue
@@ -697,7 +728,7 @@ def collect_images():
                         dirs_found.append(sub)
             break  # top-level of each extracted_* only
 
-    # Also surface from data/extracted/ directly (when --out was honoured)
+    # Also surface from .cache/extracted/ directly (when --out was honoured)
     for entry in os.listdir(EXTRACTED_DIR):
         full = os.path.join(EXTRACTED_DIR, entry)
         if os.path.isfile(full) and entry.endswith(".img"):
@@ -741,7 +772,7 @@ def _validate_partition_images():
     print(f"        Searched: {system_img}", flush=True)
     print(f"                  {system_dir}", flush=True)
     print(f"                  {EXTRACTED_DIR} (recursive)", flush=True)
-    print("        Verify that payload-dumper-go produced output in data/extracted/",
+    print("        Verify that payload-dumper-go produced output in .cache/extracted/",
           flush=True)
     sys.exit(1)
 
@@ -802,8 +833,8 @@ def find_partition_dir(name):
     Locate the extracted partition directory for `name`.
 
     Search order:
-      1. build/<name>/
-      2. data/extracted/**/<name>/
+      1. .cache/build/<name>/
+      2. .cache/extracted/**/<name>/
       3. PROJECT_ROOT/**/<name>/
     """
     candidate = os.path.join(WORK_DIR, name)
@@ -928,7 +959,7 @@ def build_rootfs_for_partition(name):
         if count == 0:
             _warn(f"{name}: directory found but 0 files copied — check {found}")
             return False
-        _ok(f"{name:<10} → data/rootfs/{name} ({count} files)")
+        _ok(f"{name:<10} → .cache/rootfs/{name} ({count} files)")
         return True
 
     img_tmp = os.path.join(WORK_DIR, f"_tmp_{name}")
@@ -939,10 +970,10 @@ def build_rootfs_for_partition(name):
         if count == 0:
             _warn(f"{name}: extraction produced 0 files — verify {img_tmp}")
             return False
-        _ok(f"{name:<10} → data/rootfs/{name} ({count} files)")
+        _ok(f"{name:<10} → .cache/rootfs/{name} ({count} files)")
         return True
 
-    _warn(f"{name}: not found — data/rootfs/{name} will be empty")
+    _warn(f"{name}: not found — .cache/rootfs/{name} will be empty")
     return False
 
 
@@ -970,7 +1001,7 @@ def _validate_rootfs_structure():
     if missing:
         print("\n[FATAL] Invalid rootfs — missing critical directories:", flush=True)
         for name in missing:
-            print(f"        data/rootfs/system/{name}", flush=True)
+            print(f"         .cache/rootfs/system/{name}", flush=True)
         print("        The firmware extraction may have failed or used an unsupported format.",
               flush=True)
         sys.exit(1)
@@ -983,9 +1014,9 @@ def build_rootfs():
     build_rootfs_for_partition("vendor")
 
     if not system_ok:
-        print("\n[FATAL] Failed to populate data/rootfs/system.", flush=True)
+        print("\n[FATAL] Failed to populate .cache/rootfs/system.", flush=True)
         print(f"        Expected: {os.path.join(ROOTFS_DIR, 'system')}", flush=True)
-        print("        Verify extraction output in data/extracted/ and build/",
+        print("        Verify extraction output in .cache/extracted/ and .cache/build",
               flush=True)
         sys.exit(1)
 
@@ -1072,10 +1103,10 @@ def _latest_run_manifest():
 
 def print_cache_status():
     print("Cache / workspace status", flush=True)
-    print(f"  data/input      : {_format_size(_dir_size_bytes(FIRMWARE_DIR))}", flush=True)
-    print(f"  data/extracted  : {_format_size(_dir_size_bytes(EXTRACTED_DIR))}", flush=True)
-    print(f"  data/rootfs     : {_format_size(_dir_size_bytes(ROOTFS_DIR))}", flush=True)
-    print(f"  build           : {_format_size(_dir_size_bytes(WORK_DIR))}", flush=True)
+    print(f"  inputs          : {_format_size(_dir_size_bytes(FIRMWARE_DIR))}", flush=True)
+    print(f"  .cache/extracted: {_format_size(_dir_size_bytes(EXTRACTED_DIR))}", flush=True)
+    print(f"  .cache/rootfs   : {_format_size(_dir_size_bytes(ROOTFS_DIR))}", flush=True)
+    print(f"  .cache/build    : {_format_size(_dir_size_bytes(WORK_DIR))}", flush=True)
     print(f"  runs            : {_format_size(_dir_size_bytes(RUNS_DIR))}", flush=True)
 
     extracted = _recent_dirs(EXTRACTED_DIR, prefix="extracted_")
@@ -1697,7 +1728,7 @@ def resolve_input(input_arg, type_arg):
     Determine the absolute path and type of the input file.
 
     Auto-detection rules (when --input is not given):
-      - 0 files in data/input/ → [FATAL] exit
+      - 0 files in inputs/ → [FATAL] exit
       - 1 file                 → use it automatically
       - 2+ files               → list them and exit (user must pick with --input)
 
@@ -1718,7 +1749,7 @@ def resolve_input(input_arg, type_arg):
             candidates = []
 
         if not candidates:
-            print("\n[FATAL] No input file found in data/input/", flush=True)
+            print("\n[FATAL] No input file found in inputs/", flush=True)
             print(f"        Expected: {FIRMWARE_DIR}", flush=True)
             print("        Supported formats: .zip (OTA), payload.bin, .img", flush=True)
             sys.exit(1)
@@ -1802,6 +1833,20 @@ def _write_manifest(path, payload):
 def _load_json(path):
     if not path or not os.path.isfile(path):
         return None
+
+
+def _manifest_input_entry(path, type_name):
+    if not path:
+        return None
+    entry = {
+        "path": os.path.relpath(path, PROJECT_ROOT),
+        "type": type_name,
+        "exists": os.path.exists(path),
+    }
+    if os.path.exists(path):
+        entry["sha256"] = _sha256_file(path)
+        entry["size_bytes"] = os.path.getsize(path)
+    return entry
     try:
         with open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
@@ -1964,7 +2009,7 @@ def main():
     parser.add_argument(
         "--input", metavar="FILE",
         help="path to input file (OTA zip / payload.bin / .img); "
-             "default: the single file found in data/input/")
+             "default: the single file found in inputs/")
     parser.add_argument(
         "--type", metavar="TYPE",
         choices=["auto", "zip", "payload", "img", "iot"],
@@ -1978,10 +2023,10 @@ def main():
         help="validate tools and input file without running the pipeline")
     parser.add_argument(
         "--batch-iot", action="store_true",
-        help="run compact triage across all current IoT firmware inputs under data/input/")
+        help="run compact triage across all current IoT firmware inputs under inputs/")
     parser.add_argument(
         "--ingest-dir", metavar="DIR",
-        help="scan a folder and copy only IoT-like firmware inputs into data/input/")
+        help="scan a folder and copy only IoT-like firmware inputs into inputs/")
     parser.add_argument(
         "--status", action="store_true",
         help="show cache/workspace status and latest run metadata")
@@ -1994,7 +2039,7 @@ def main():
         help="keep only the newest N run artifact directories under runs/")
     parser.add_argument(
         "--retain-extracted", type=int,
-        help="keep only the newest N extracted_* directories under data/extracted/")
+        help="keep only the newest N extracted_* directories under .cache/extracted/")
     args = parser.parse_args()
 
     if args.status:
@@ -2018,12 +2063,34 @@ def main():
         apply_retention_limits(args.retain_runs, args.retain_extracted)
         sys.exit(0)
 
+    original_input_path = None
+    original_input_type = args.type
+    if args.input:
+        original_input_path = os.path.abspath(args.input)
+    elif not args.skip and not args.batch_iot and not args.ingest_dir:
+        try:
+            original_candidates = sorted(
+                f for f in os.listdir(FIRMWARE_DIR)
+                if os.path.isfile(os.path.join(FIRMWARE_DIR, f))
+            )
+        except FileNotFoundError:
+            original_candidates = []
+        if len(original_candidates) == 1:
+            original_input_path = os.path.join(FIRMWARE_DIR, original_candidates[0])
+
     preflight_path = None
     preflight_type = None
     if not args.skip and not args.batch_iot and not args.ingest_dir:
         preflight_path, preflight_type = resolve_input(args.input, args.type)
         if preflight_path is None:
             sys.exit(1)
+        if args.type == "auto":
+            if original_input_path and os.path.abspath(original_input_path) == os.path.abspath(preflight_path):
+                original_input_type = preflight_type
+            elif original_input_path:
+                original_input_type = detect_input_type(original_input_path)
+            else:
+                original_input_type = preflight_type
 
     run_artifacts = _prepare_run_artifacts(preflight_path)
     _log_fh = None
@@ -2063,7 +2130,10 @@ def main():
         "dossier_dir": os.path.relpath(run_artifacts["dossier_dir"], PROJECT_ROOT),
         "started_at": datetime.now().isoformat(timespec="seconds"),
         "status": "running",
-        "input": None,
+        "input": {
+            "original": _manifest_input_entry(original_input_path, original_input_type),
+            "resolved": None,
+        },
         "retention": {
             "retain_runs": args.retain_runs,
             "retain_extracted": args.retain_extracted,
@@ -2085,12 +2155,7 @@ def main():
             path, input_type = resolve_input(args.input, args.type)
         if path is None:
             sys.exit(1)
-        manifest["input"] = {
-            "path": os.path.relpath(path, PROJECT_ROOT),
-            "type": input_type,
-            "sha256": _sha256_file(path),
-            "size_bytes": os.path.getsize(path),
-        }
+        manifest["input"]["resolved"] = _manifest_input_entry(path, input_type)
         manifest["status"] = "dry_run_complete"
         manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
         _write_manifest(run_artifacts["manifest_path"], manifest)
@@ -2103,7 +2168,7 @@ def main():
         print(flush=True)
         _info("Pipeline would execute:")
         _info("  [2/4] Extraction    → unzip / payload-dumper-go / 7z")
-        _info("  [3/4] Rootfs        → assemble data/rootfs/system, vendor")
+        _info("  [3/4] Rootfs        → assemble .cache/rootfs/system, vendor")
         _info("  [4/4] Analysis      → parse .rc files + binary scan")
         print(flush=True)
         _ok("Dry run complete — no files modified")
@@ -2124,21 +2189,17 @@ def main():
         _info("Running...")
         t_ext = time.time()
 
-        path, input_type = preflight_path, preflight_type
-        if path is None:
-            path, input_type = resolve_input(args.input, args.type)
+        path, input_type = resolve_input(args.input, args.type)
         if path is None:
             print("\n[!] Input file not found.", flush=True)
             sys.exit(1)
-        manifest["input"] = {
-            "path": os.path.relpath(path, PROJECT_ROOT),
-            "type": input_type,
-            "sha256": _sha256_file(path),
-            "size_bytes": os.path.getsize(path),
-        }
+        manifest["input"]["resolved"] = _manifest_input_entry(path, input_type)
         _write_manifest(run_artifacts["manifest_path"], manifest)
         os.environ["FIRMWARE_INPUT_PATH"] = os.path.abspath(path)
         os.environ["FIRMWARE_INPUT_TYPE"] = input_type
+        if original_input_path:
+            os.environ["FIRMWARE_ORIGINAL_INPUT_PATH"] = os.path.abspath(original_input_path)
+            os.environ["FIRMWARE_ORIGINAL_INPUT_TYPE"] = original_input_type or input_type
 
         if input_type != INPUT_IOT:
             ensure_dumper()

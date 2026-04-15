@@ -24,13 +24,15 @@ from analyzer.strings_analyzer import extract_strings
 
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-_DEFAULT_ROOTFS_DIR = os.path.join(_PROJECT_ROOT, "data/rootfs")
+_DEFAULT_ROOTFS_DIR = os.path.join(_PROJECT_ROOT, ".cache", "rootfs")
 _OVERRIDE_SYSTEM_PATH = os.environ.get("FIRMWARE_SYSTEM_PATH")
 _OVERRIDE_VENDOR_PATH = os.environ.get("FIRMWARE_VENDOR_PATH")
 _RUN_DIR = os.environ.get("FIRMWARE_RUN_DIR")
 _DEFAULT_DOSSIER_DIR = os.environ.get("FIRMWARE_DOSSIER_DIR")
 _INPUT_PATH = os.environ.get("FIRMWARE_INPUT_PATH")
 _INPUT_TYPE = os.environ.get("FIRMWARE_INPUT_TYPE")
+_ORIGINAL_INPUT_PATH = os.environ.get("FIRMWARE_ORIGINAL_INPUT_PATH")
+_ORIGINAL_INPUT_TYPE = os.environ.get("FIRMWARE_ORIGINAL_INPUT_TYPE")
 _RUN_ID = os.environ.get("FIRMWARE_RUN_ID")
 
 if _OVERRIDE_SYSTEM_PATH:
@@ -213,7 +215,7 @@ def detect_analysis_mode():
 # ── Filesystem cross-reference ────────────────────────────────────────────────
 
 def _exec_key(path):
-    """Convert a scanner path (data/rootfs/system/bin/foo) to /system/bin/foo."""
+    """Convert a scanner path (.cache/rootfs/system/bin/foo) to /system/bin/foo."""
     return "/" + os.path.relpath(path, ROOTFS_DIR)
 
 
@@ -954,6 +956,18 @@ def _build_exploit_snapshot(entry):
     }
 
 
+def _is_actionable_dossier_candidate(result):
+    if result.get("web_exposed"):
+        return True
+    if any(flow.get("verdict") != "FALSE_POSITIVE" for flow in (result.get("verified_flows") or [])):
+        return True
+    if result.get("exploit_paths"):
+        return True
+    if result.get("level") == "HIGH" and result.get("web_candidate"):
+        return True
+    return False
+
+
 def _write_candidate_dossiers(results, output_dir, cgi_files=None, exploit_candidates=None):
     if not output_dir:
         return []
@@ -970,6 +984,8 @@ def _write_candidate_dossiers(results, output_dir, cgi_files=None, exploit_candi
             cgi_files=cgi_files,
             exploit_paths=exploit_by_id.get(_candidate_id(result), []),
         )
+        if not _is_actionable_dossier_candidate(snapshot):
+            continue
         md_path = os.path.join(output_dir, f"{snapshot['id']}.md")
         lines = [
             f"# {snapshot['name']}",
@@ -1053,8 +1069,14 @@ def _emit_analysis_bundle(mode, mode_reason, result, *, output_path=None, dossie
         "run_id": _RUN_ID,
         "run_dir": _safe_relpath(_RUN_DIR),
         "input": {
-            "path": _safe_relpath(_INPUT_PATH),
-            "type": _INPUT_TYPE,
+            "original": {
+                "path": _safe_relpath(_ORIGINAL_INPUT_PATH or _INPUT_PATH),
+                "type": _ORIGINAL_INPUT_TYPE or _INPUT_TYPE,
+            },
+            "resolved": {
+                "path": _safe_relpath(_INPUT_PATH),
+                "type": _INPUT_TYPE,
+            },
         },
         "analysis": {
             "mode": mode,
@@ -1223,10 +1245,10 @@ def run_iot_analysis(show_all=False):
 
 def run_android_analysis(show_all=False):
     if not os.path.exists(SYSTEM_PATH):
-        print("[!] data/rootfs/system not found — was the extraction step successful?",
+        print("[!] .cache/rootfs/system not found — was the extraction step successful?",
               flush=True)
         print(f"    Expected: {SYSTEM_PATH}", flush=True)
-        print("    Tip: run without --skip to re-extract, or check data/extracted/",
+        print("    Tip: run without --skip to re-extract, or check .cache/extracted/",
               flush=True)
         return
 
@@ -1312,10 +1334,10 @@ def run_general_analysis(show_all=False):
 
 def run_analysis(show_all=False, output_path=None, dossier_dir=None):
     if not os.path.exists(SYSTEM_PATH):
-        print("[!] data/rootfs/system not found — was the extraction step successful?",
+        print("[!] .cache/rootfs/system not found — was the extraction step successful?",
               flush=True)
         print(f"    Expected: {SYSTEM_PATH}", flush=True)
-        print("    Tip: run without --skip to re-extract, or check data/extracted/",
+        print("    Tip: run without --skip to re-extract, or check .cache/extracted/",
               flush=True)
         return
 

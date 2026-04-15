@@ -104,7 +104,7 @@ p7zip
 
 ## GitHub / WSL Setup
 
-This repository is intended to track code and docs only. Large firmware inputs, extraction outputs, logs, and run artifacts are ignored.
+This repository is intended to track code and docs only. Large firmware inputs, extraction outputs, and run artifacts are ignored.
 
 Clone on WSL and initialize your environment like this:
 
@@ -122,7 +122,7 @@ Notes:
 
 * `tools/payload-dumper-go/` is intentionally not committed. If missing, the pipeline will try to `git clone` and `go build` it automatically.
 * `tools/run-ghidra-mcp.sh` is a local machine helper and is intentionally ignored.
-* Keep firmware samples under `data/input/` locally; do not commit them.
+* Keep firmware samples under `inputs/` locally; do not commit them.
 
 ---
 
@@ -135,6 +135,12 @@ python3 src/pipeline.py --status
 python3 src/pipeline.py --cleanup build rootfs
 python3 src/pipeline.py --retain-runs 5 --retain-extracted 2
 ```
+
+Workspace layout:
+
+* `inputs/` — firmware files you drop in manually
+* `runs/` — run logs, manifests, JSON results, dossiers
+* `.cache/` — internal extraction, rootfs, and build intermediates
 
 ## Run Artifacts
 

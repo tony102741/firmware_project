@@ -1,10 +1,8 @@
+inputs/
+.cache/
 build/
 work/
 data/
-data/extracted/
-data/rootfs/
-data/input/
-logs/
 runs/
 fw_dump/
 
