@@ -3,8 +3,10 @@ Helper for validating and summarizing firmware candidate ledger files.
 
 Usage:
   python3 src/ledger.py research/my_ledger.jsonl
+  python3 src/ledger.py research/my_ledger.jsonl --pretty
 """
 
+import argparse
 import json
 import os
 import sys
@@ -87,18 +89,36 @@ def print_summary(entries):
     print(f"vendors: {dict(sorted(vendors.items()))}")
 
 
-def main():
-    if len(sys.argv) != 2:
-        print("usage: python3 src/ledger.py <ledger.jsonl>", file=sys.stderr)
-        sys.exit(2)
+def print_pretty(entries):
+    for idx, entry in enumerate(entries, 1):
+        if idx > 1:
+            print()
+        print(f"entry {idx}:")
+        print(json.dumps(entry, indent=2, ensure_ascii=False))
 
-    path = sys.argv[1]
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Validate, summarize, or pretty-print firmware candidate ledger files."
+    )
+    parser.add_argument("path", help="Path to the ledger file (JSONL).")
+    parser.add_argument(
+        "--pretty",
+        action="store_true",
+        help="Pretty-print each ledger entry after the summary.",
+    )
+    args = parser.parse_args()
+
+    path = args.path
     if not os.path.isfile(path):
         print(f"not found: {path}", file=sys.stderr)
         sys.exit(1)
 
     entries, errors = load_jsonl(path)
     print_summary(entries)
+    if args.pretty and entries:
+        print()
+        print_pretty(entries)
     if errors:
         print("\nvalidation errors:")
         for err in errors:

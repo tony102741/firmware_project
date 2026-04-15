@@ -168,7 +168,14 @@ You can validate and summarize a ledger file with:
 
 ```bash
 python3 src/ledger.py research/my_ledger.jsonl
+python3 src/ledger.py research/my_ledger.jsonl --pretty
 ```
+
+`--pretty` keeps the summary output and also prints each JSONL entry as formatted JSON for manual review.
+
+The `research/` folder can also hold real investigation snapshots, for example:
+
+* `research/totolink_a3002ru_initial.jsonl.json` — initial TOTOLINK A3002RU research leads captured from one pipeline run
 
 ---
 
