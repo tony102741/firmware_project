@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Firmware Candidate Ledger Entry",
+  "type": "object",
+  "required": [
+    "entry_id",
+    "firmware",
+    "candidate",
+    "review",
+    "pattern"
+  ],
+  "properties": {
+    "entry_id": {
+      "type": "string"
+    },
+    "firmware": {
+      "type": "object",
+      "required": ["vendor", "model", "version"],
+      "properties": {
+        "vendor": { "type": "string" },
+        "model": { "type": "string" },
+        "version": { "type": "string" },
+        "arch": { "type": "string" },
+        "input_path": { "type": "string" },
+        "run_id": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "candidate": {
+      "type": "object",
+      "required": ["name", "entry_point", "input", "processing_chain", "sink"],
+      "properties": {
+        "name": { "type": "string" },
+        "entry_point": { "type": "string" },
+        "input": { "type": "string" },
+        "processing_chain": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "sink": { "type": "string" },
+        "validation": { "type": "string" },
+        "impact": { "type": "string" },
+        "auth_required": {
+          "type": ["boolean", "null"]
+        }
+      },
+      "additionalProperties": true
+    },
+    "pattern": {
+      "type": "object",
+      "required": ["primary"],
+      "properties": {
+        "primary": { "type": "string" },
+        "secondary": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "review": {
+      "type": "object",
+      "required": ["verdict", "confidence", "cve_potential"],
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": ["CONFIRMED", "LIKELY", "REJECTED", "NEEDS_MORE_WORK"]
+        },
+        "confidence": {
+          "type": "string",
+          "enum": ["LOW", "MEDIUM", "HIGH"]
+        },
+        "cve_potential": {
+          "type": "string",
+          "enum": ["NO", "POSSIBLE", "STRONG"]
+        },
+        "accept_reason": { "type": "string" },
+        "reject_reason": { "type": "string" },
+        "exploit_idea": { "type": "string" },
+        "notes": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "binary_path": { "type": "string" },
+        "script_path": { "type": "string" },
+        "config_path": { "type": "string" },
+        "strings": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "references": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

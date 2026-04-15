@@ -141,6 +141,7 @@ Workspace layout:
 * `inputs/` — firmware files you drop in manually
 * `runs/` — run logs, manifests, JSON results, dossiers
 * `.cache/` — internal extraction, rootfs, and build intermediates
+* `research/` — exploitability checklist, pattern taxonomy, candidate ledger schema
 
 ## Run Artifacts
 
@@ -152,6 +153,22 @@ Each run now writes a dedicated artifact directory under `runs/`:
 * `dossiers/` — per-candidate review notes for manual follow-up
 
 If `--output` is omitted, `results.json` is written to the run directory automatically.
+
+## Research Loop
+
+Use the repository like this when you are collecting real vulnerability patterns across many firmware images:
+
+1. Put firmware into `inputs/`.
+2. Run the pipeline and inspect `runs/<run>/results.json` plus `dossiers/`.
+3. Review only strong candidates against `research/review_checklist.md`.
+4. Record every investigated candidate in your own JSONL ledger using `research/candidate_ledger.schema.json`.
+5. Reuse the primary pattern classes from `research/pattern_taxonomy.md`.
+
+You can validate and summarize a ledger file with:
+
+```bash
+python3 src/ledger.py research/my_ledger.jsonl
+```
 
 ---
 
