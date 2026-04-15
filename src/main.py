@@ -2,6 +2,8 @@ import os
 import sys
 import re
 import argparse
+import json
+from datetime import datetime
 
 # Ensure src/core/ is on sys.path so that 'from parser.init_parser import ...'
 # resolves to src/core/parser/init_parser.py regardless of how this script is
@@ -25,6 +27,11 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__f
 _DEFAULT_ROOTFS_DIR = os.path.join(_PROJECT_ROOT, "data/rootfs")
 _OVERRIDE_SYSTEM_PATH = os.environ.get("FIRMWARE_SYSTEM_PATH")
 _OVERRIDE_VENDOR_PATH = os.environ.get("FIRMWARE_VENDOR_PATH")
+_RUN_DIR = os.environ.get("FIRMWARE_RUN_DIR")
+_DEFAULT_DOSSIER_DIR = os.environ.get("FIRMWARE_DOSSIER_DIR")
+_INPUT_PATH = os.environ.get("FIRMWARE_INPUT_PATH")
+_INPUT_TYPE = os.environ.get("FIRMWARE_INPUT_TYPE")
+_RUN_ID = os.environ.get("FIRMWARE_RUN_ID")
 
 if _OVERRIDE_SYSTEM_PATH:
     SYSTEM_PATH = os.path.abspath(_OVERRIDE_SYSTEM_PATH)
@@ -152,8 +159,10 @@ def _has_web_layout(root):
     if not os.path.isdir(root):
         return False
     for rel in (
-        "www", "cgi-bin", "usr/www", "var/www", "www/cgi-bin",
+        "www", "web", "cgi-bin", "usr/www", "var/www", "var/web", "www/cgi-bin",
+        "web/cgi-bin", "web/cgi-bin/cstecgi.cgi",
         "www/webpages", "etc/wifidog", "usr/lib/lua/luci", "etc/config/uhttpd",
+        "etc/boa.org/boa.conf", "etc/boa.conf",
     ):
         if os.path.isdir(os.path.join(root, rel)):
             return True
@@ -402,6 +411,8 @@ def _is_generic_shell_utility(result):
         "pwd", "test", "sleep", "grep", "sed", "awk", "tar", "gzip", "gunzip",
         "zcat", "dmesg", "ps", "top", "time", "free", "hexdump", "md5sum",
         "strings", "clear", "uptime", "pidof", "passwd",
+        "hostname", "init", "reboot", "poweroff", "halt",
+        "ifconfig", "route", "brctl",
     }
     name = (result.get("name") or "").lower()
     sinks = [s.lower() for s in (result.get("all_sinks") or [])]
@@ -418,8 +429,22 @@ def _is_direct_web_exposed(bp, cgi_files):
     base = os.path.basename(bp).lower()
     if base in {"httpd", "uhttpd", "lighttpd", "boa", "nginx", "mini_httpd", "thttpd"}:
         return True
-    return any(part in rel for part in ("/www/", "/cgi-bin/", "/htdocs/", "/webroot/")) or \
-        rel.startswith(("www/", "cgi-bin/", "htdocs/", "webroot/"))
+    return any(part in rel for part in ("/www/", "/web/", "/cgi-bin/", "/htdocs/", "/webroot/")) or \
+        rel.startswith(("www/", "web/", "cgi-bin/", "htdocs/", "webroot/"))
+
+
+def _has_http_handler_surface(binary_path):
+    if not binary_path or not os.path.isfile(binary_path):
+        return False
+    try:
+        strings = extract_strings(binary_path)
+    except Exception:
+        return False
+    return any(
+        tok in s for s in strings
+        for tok in ("/boafrm/", "formWlSiteSurvey", "formSiteSurveyProfile",
+                    "cstecgi.cgi", "topicurl", "formUpload", "formFilter")
+    )
 
 
 _EXEC_PATH_RE = re.compile(r'(/(?:usr/)?s?bin/[A-Za-z0-9_.-]+)')
@@ -479,16 +504,22 @@ def _reprioritize_iot_results(results, web_bins, cgi_files):
 
     for r in results:
         bp = os.path.normpath(r.get("binary_path", ""))
+        direct_web = _is_direct_web_exposed(bp, cgi_files)
+        handler_ref = _has_handler_binary_ref(bp, cgi_files)
         r["web_exposed"] = (
-            _is_direct_web_exposed(bp, cgi_files)
-            or bp in direct_web_bins
-            or _has_handler_binary_ref(bp, cgi_files)
+            direct_web
+            or (handler_ref and not _is_generic_shell_utility(r))
         )
         r["web_reachable"] = bp in web_reachable
         r["web_candidate"] = r["web_exposed"] or r["web_reachable"]
+        r["handler_surface"] = _has_http_handler_surface(bp)
 
-        if r["web_candidate"]:
-            r["score"] = int(round(r["score"] * 1.5))
+        if r["web_exposed"]:
+            r["score"] = int(round(r["score"] * 1.8))
+            if r["handler_surface"]:
+                r["score"] += 4
+        elif r["web_candidate"]:
+            r["score"] = int(round(r["score"] * 1.2))
             r["level"] = _relevel(r["score"], r["confidence"])
         elif _is_generic_shell_utility(r):
             r["score"] = max(1, int(round(r["score"] * 0.4)))
@@ -496,9 +527,11 @@ def _reprioritize_iot_results(results, web_bins, cgi_files):
                 r["level"] = "MEDIUM"
             elif r["level"] == "MEDIUM":
                 r["level"] = "LOW"
+        else:
+            r["level"] = _relevel(r["score"], r["confidence"])
 
     results.sort(key=lambda x: (
-        0 if x.get("web_exposed") else 1 if x.get("web_reachable") else 2,
+        0 if x.get("handler_surface") else 1 if x.get("web_exposed") else 2 if x.get("web_reachable") else 3,
         -x["score"],
     ))
 
@@ -807,6 +840,239 @@ def _print_exploit_candidates(candidates):
     return True
 
 
+def _safe_relpath(path):
+    if not path:
+        return path
+    try:
+        return os.path.relpath(path, _PROJECT_ROOT)
+    except ValueError:
+        return path
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, set):
+        return sorted(_json_safe(v) for v in value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _candidate_id(result):
+    base = os.path.basename(result.get("binary_path") or result.get("exec") or result.get("name") or "candidate")
+    base = re.sub(r'[^A-Za-z0-9._-]+', "-", base).strip("-") or "candidate"
+    suffix = result.get("name") or base
+    suffix = re.sub(r'[^A-Za-z0-9._-]+', "-", suffix).strip("-") or "target"
+    return f"{base}__{suffix}".lower()
+
+
+def _result_path(result):
+    return _safe_relpath(result.get("binary_path", result.get("exec")))
+
+
+def _next_steps_for_result(result, review=None, exploit_paths=None):
+    path = _result_path(result)
+    steps = [
+        f"Open {path} in Ghidra and inspect the path into {', '.join((result.get('all_sinks') or result.get('sinks') or ['?'])[:2])}.",
+    ]
+
+    if review and review.get("frontend"):
+        steps.append(
+            f"Trace request entry from {review['frontend'][0]} into {os.path.basename(path or result.get('name', 'binary'))}."
+        )
+    if review and review.get("params"):
+        steps.append(f"Check whether parameters {', '.join(review['params'][:3])} reach argv/env parsing.")
+    if exploit_paths:
+        ep = exploit_paths[0].get("endpoint") or "(unknown endpoint)"
+        steps.append(f"Validate the reachable endpoint {ep} against the reported flow.")
+    elif result.get("web_exposed"):
+        steps.append("Confirm handler routing and auth checks from the web entrypoint before sink reachability review.")
+    else:
+        steps.append("Verify whether the candidate is actually externally reachable before spending time on deep taint review.")
+    return steps[:4]
+
+
+def _build_result_snapshot(result, cgi_files=None, exploit_paths=None):
+    review = _manual_review_hints(result, cgi_files or []) if cgi_files is not None else None
+    verified = [
+        flow for flow in (result.get("verified_flows") or [])
+        if flow.get("verdict") != "FALSE_POSITIVE"
+    ]
+    return {
+        "id": _candidate_id(result),
+        "name": result.get("name"),
+        "level": result.get("level"),
+        "score": result.get("score"),
+        "binary_path": _result_path(result),
+        "exec": result.get("exec"),
+        "source": result.get("source"),
+        "input_type": result.get("input_type"),
+        "priv": result.get("priv"),
+        "flow_type": result.get("flow_type"),
+        "confidence": result.get("confidence"),
+        "controllability": result.get("controllability"),
+        "memory_impact": result.get("memory_impact"),
+        "taint_confidence": result.get("taint_confidence"),
+        "web_exposed": result.get("web_exposed", False),
+        "web_reachable": result.get("web_reachable", False),
+        "web_candidate": result.get("web_candidate", False),
+        "handler_surface": result.get("handler_surface", False),
+        "all_sinks": list(result.get("all_sinks") or result.get("sinks") or []),
+        "attack_surface": _json_safe(result.get("attack_surface", {})),
+        "fuzzing_hints": list(result.get("fuzzing_hints") or []),
+        "manual_review": _json_safe(review),
+        "verified_flows": _json_safe(verified),
+        "exploit_paths": _json_safe(exploit_paths or []),
+        "next_steps": _next_steps_for_result(result, review=review, exploit_paths=exploit_paths),
+    }
+
+
+def _build_exploit_snapshot(entry):
+    result = entry["result"]
+    flow = entry["flow"]
+    reach = entry["reach"]
+    return {
+        "candidate_id": _candidate_id(result),
+        "candidate_name": result.get("name"),
+        "binary_path": _result_path(result),
+        "endpoint": reach.get("endpoint"),
+        "handler": reach.get("handler"),
+        "auth_required": reach.get("auth_required"),
+        "auth_evidence": reach.get("auth_evidence"),
+        "input_param": reach.get("input_param"),
+        "input_method": reach.get("input_method"),
+        "verdict": flow.get("verdict"),
+        "function": flow.get("func_sym"),
+        "sink": flow.get("sink_sym"),
+        "flow": flow.get("flow_str"),
+        "reason": flow.get("reason"),
+        "scenario": reach.get("exploit_scenario"),
+        "all_invokers": _json_safe(reach.get("all_invokers") or []),
+    }
+
+
+def _write_candidate_dossiers(results, output_dir, cgi_files=None, exploit_candidates=None):
+    if not output_dir:
+        return []
+
+    os.makedirs(output_dir, exist_ok=True)
+    exploit_by_id = {}
+    for entry in exploit_candidates or []:
+        exploit_by_id.setdefault(_candidate_id(entry["result"]), []).append(_build_exploit_snapshot(entry))
+
+    dossiers = []
+    for result in results:
+        snapshot = _build_result_snapshot(
+            result,
+            cgi_files=cgi_files,
+            exploit_paths=exploit_by_id.get(_candidate_id(result), []),
+        )
+        md_path = os.path.join(output_dir, f"{snapshot['id']}.md")
+        lines = [
+            f"# {snapshot['name']}",
+            "",
+            f"- id: `{snapshot['id']}`",
+            f"- level: `{snapshot['level']}`",
+            f"- score: `{snapshot['score']}`",
+            f"- binary: `{snapshot['binary_path']}`",
+            f"- flow: `{snapshot['flow_type'] or 'none'}`",
+            f"- sinks: `{', '.join(snapshot['all_sinks']) if snapshot['all_sinks'] else 'none'}`",
+        ]
+        review = snapshot.get("manual_review") or {}
+        if review:
+            lines.extend([
+                "",
+                "## Manual Review",
+                f"- frontend: `{', '.join(review.get('frontend') or []) or 'none'}`",
+                f"- params: `{', '.join(review.get('params') or []) or 'none'}`",
+                f"- auth hints: `{', '.join(review.get('auth') or []) or 'none'}`",
+                f"- control: `{review.get('control') or 'unknown'}`",
+            ])
+        if snapshot["verified_flows"]:
+            lines.append("")
+            lines.append("## Verified Flows")
+            for flow in snapshot["verified_flows"][:5]:
+                lines.append(
+                    f"- `{flow.get('verdict')}` {flow.get('func_sym') or '(heuristic)'} -> {flow.get('sink_sym')} :: {flow.get('flow_str')}"
+                )
+        if snapshot["exploit_paths"]:
+            lines.append("")
+            lines.append("## Reachability")
+            for exploit in snapshot["exploit_paths"][:5]:
+                lines.append(
+                    f"- `{exploit.get('verdict')}` endpoint `{exploit.get('endpoint') or '?'}` param `{exploit.get('input_param') or '?'}` auth `{exploit.get('auth_required')}`"
+                )
+        lines.append("")
+        lines.append("## Next Steps")
+        for step in snapshot["next_steps"]:
+            lines.append(f"- {step}")
+        with open(md_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        dossiers.append({
+            "candidate_id": snapshot["id"],
+            "path": _safe_relpath(md_path),
+        })
+    return dossiers
+
+
+def _write_output_bundle(output_path, bundle):
+    if not output_path:
+        return
+    parent = os.path.dirname(os.path.abspath(output_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as fh:
+        json.dump(_json_safe(bundle), fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    print(f"\n[OK] Wrote structured results: {output_path}", flush=True)
+
+
+def _emit_analysis_bundle(mode, mode_reason, result, *, output_path=None, dossier_dir=None, cgi_files=None):
+    all_results = result.get("results") or []
+    exploit_candidates = result.get("exploit_candidates") or []
+    exploit_by_id = {}
+    for entry in exploit_candidates:
+        exploit_by_id.setdefault(_candidate_id(entry["result"]), []).append(_build_exploit_snapshot(entry))
+
+    snapshots = [
+        _build_result_snapshot(r, cgi_files=cgi_files, exploit_paths=exploit_by_id.get(_candidate_id(r), []))
+        for r in all_results
+    ]
+    dossiers = _write_candidate_dossiers(
+        all_results,
+        dossier_dir,
+        cgi_files=cgi_files,
+        exploit_candidates=exploit_candidates,
+    )
+
+    bundle = {
+        "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "run_id": _RUN_ID,
+        "run_dir": _safe_relpath(_RUN_DIR),
+        "input": {
+            "path": _safe_relpath(_INPUT_PATH),
+            "type": _INPUT_TYPE,
+        },
+        "analysis": {
+            "mode": mode,
+            "reason": mode_reason,
+            "system_path": _safe_relpath(SYSTEM_PATH),
+            "vendor_path": _safe_relpath(VENDOR_PATH),
+        },
+        "summary": _json_safe(result.get("summary") or {}),
+        "candidates": snapshots,
+        "exploit_candidates": [
+            _build_exploit_snapshot(entry) for entry in exploit_candidates
+        ],
+        "dossiers": dossiers,
+    }
+    _write_output_bundle(output_path, bundle)
+    return bundle
+
+
 def run_iot_analysis(show_all=False):
     """
     IoT-specific analysis path.
@@ -848,11 +1114,14 @@ def run_iot_analysis(show_all=False):
     high_results  = [r for r in focused if not r.get("web_exposed") and r["level"] == "HIGH"]
     med_results   = [r for r in focused if not r.get("web_exposed") and r["level"] == "MEDIUM"]
     low_results   = [r for r in focused if not r.get("web_exposed") and r["level"] == "LOW"]
+    display_high = sum(1 for r in focused if r["level"] == "HIGH")
+    display_med = sum(1 for r in focused if r["level"] == "MEDIUM")
+    display_low = sum(1 for r in focused if r["level"] == "LOW")
 
     total_shown = len(web_results) + len(high_results) + len(med_results)
     print(f"[DONE]  {len(results)} candidate(s)  "
-          f"(web={len(web_results)}  HIGH={len(high_results)}"
-          f"  MEDIUM={len(med_results)}  LOW={len(low_results)})",
+          f"(web={len(web_results)}  HIGH={display_high}"
+          f"  MEDIUM={display_med}  LOW={display_low})",
           flush=True)
 
     _sec(f"IoT HIGH-PRIORITY TARGETS  ({total_shown})")
@@ -919,9 +1188,9 @@ def run_iot_analysis(show_all=False):
     _sec("SUMMARY")
     print(f"  Candidates analyzed : {len(results)}", flush=True)
     print(f"  Web-exposed         : {len(web_results)}", flush=True)
-    print(f"  HIGH                : {len(high_results)}", flush=True)
-    print(f"  MEDIUM              : {len(med_results)}", flush=True)
-    print(f"  LOW                 : {len(low_results)}", flush=True)
+    print(f"  HIGH                : {display_high}", flush=True)
+    print(f"  MEDIUM              : {display_med}", flush=True)
+    print(f"  LOW                 : {display_low}", flush=True)
 
     if web_results:
         print(f"\n  Top web-exposed targets:", flush=True)
@@ -932,7 +1201,22 @@ def run_iot_analysis(show_all=False):
                   flush=True)
 
     print(f"\n{'─' * _W}", flush=True)
-    return {"mode": "iot_web", "remote_count": len(exploit_candidates)}
+    return {
+        "mode": "iot_web",
+        "remote_count": len(exploit_candidates),
+        "results": results,
+        "cgi_files": cgi_files,
+        "exploit_candidates": exploit_candidates,
+        "summary": {
+            "candidates_analyzed": len(results),
+            "web_exposed": len(web_results),
+            "high": display_high,
+            "medium": display_med,
+            "low": display_low,
+            "exploit_candidates": len(exploit_candidates),
+            "unauthenticated_exploits": unauth_count if exploit_candidates else 0,
+        },
+    }
 
 
 # ── Main analysis entry point ─────────────────────────────────────────────────
@@ -948,8 +1232,7 @@ def run_android_analysis(show_all=False):
 
     # IoT firmware has no Android .rc files — use web-surface-aware analysis.
     if _is_iot_firmware(SYSTEM_PATH):
-        run_iot_analysis(show_all=show_all)
-        return
+        return run_iot_analysis(show_all=show_all)
 
     services = parse_init_services(SYSTEM_PATH)
     if os.path.exists(VENDOR_PATH):
@@ -1005,7 +1288,20 @@ def run_android_analysis(show_all=False):
         print("  Run with --all to inspect LOW-scored services.", flush=True)
 
     print(f"\n{'─' * _W}", flush=True)
-    return {"mode": "android", "remote_count": 0}
+    return {
+        "mode": "android",
+        "remote_count": 0,
+        "results": results,
+        "cgi_files": cgi_files,
+        "exploit_candidates": [],
+        "summary": {
+            "services_parsed": len(services),
+            "candidates_found": len(results),
+            "high": len(high),
+            "medium": len(medium),
+            "low": len(low),
+        },
+    }
 
 
 def run_general_analysis(show_all=False):
@@ -1014,7 +1310,7 @@ def run_general_analysis(show_all=False):
     return run_android_analysis(show_all=show_all)
 
 
-def run_analysis(show_all=False):
+def run_analysis(show_all=False, output_path=None, dossier_dir=None):
     if not os.path.exists(SYSTEM_PATH):
         print("[!] data/rootfs/system not found — was the extraction step successful?",
               flush=True)
@@ -1029,7 +1325,16 @@ def run_analysis(show_all=False):
     print(f"  reason: {reason}", flush=True)
 
     if mode == "iot_web":
-        return run_iot_analysis(show_all=show_all)
+        result = run_iot_analysis(show_all=show_all)
+        _emit_analysis_bundle(
+            "iot_web",
+            reason,
+            result,
+            output_path=output_path,
+            dossier_dir=dossier_dir,
+            cgi_files=result.get("cgi_files"),
+        )
+        return result
 
     if mode == "android":
         result = run_android_analysis(show_all=show_all)
@@ -1041,12 +1346,42 @@ def run_analysis(show_all=False):
         print("  selected mode: iot_web", flush=True)
         print("  reason: no remotely exploitable candidates found in initial analysis",
               flush=True)
-        return run_iot_analysis(show_all=show_all)
+        result = run_iot_analysis(show_all=show_all)
+        _emit_analysis_bundle(
+            "iot_web",
+            "retry after initial non-remote result set",
+            result,
+            output_path=output_path,
+            dossier_dir=dossier_dir,
+            cgi_files=result.get("cgi_files"),
+        )
+        return result
+
+    if result:
+        _emit_analysis_bundle(
+            mode,
+            reason,
+            result,
+            output_path=output_path,
+            dossier_dir=dossier_dir,
+            cgi_files=result.get("cgi_files"),
+        )
+    return result
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--all", action="store_true", help="show LOW results too")
+    parser.add_argument("--output", help="write structured JSON results to this path")
+    parser.add_argument("--dossier-dir", help="write candidate dossiers to this directory")
+    parser.add_argument("--context", help="optional run context label to embed in output")
     args = parser.parse_args()
 
-    run_analysis(show_all=args.all)
+    if args.context:
+        os.environ["FIRMWARE_RUN_CONTEXT"] = args.context
+
+    run_analysis(
+        show_all=args.all,
+        output_path=args.output,
+        dossier_dir=args.dossier_dir or _DEFAULT_DOSSIER_DIR,
+    )

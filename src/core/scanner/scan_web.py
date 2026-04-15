@@ -27,7 +27,7 @@ _WEB_SERVERS = {
 _WWW_NAMES = {"www", "webroot", "web", "htdocs", "cgi-bin", "cgi", "html"}
 
 # Frontend and handler files worth tracking as web-surface evidence
-_FRONTEND_EXTS = {".asp", ".htm", ".html", ".cgi", ".lua", ".json"}
+_FRONTEND_EXTS = {".asp", ".htm", ".html", ".cgi", ".lua", ".json", ".js"}
 
 # Script extensions whose content should be parsed for binary references
 _SCRIPT_EXTS = {".cgi", ".lua", ".sh", ".pl", ".py"}
@@ -35,6 +35,9 @@ _SCRIPT_EXTS = {".cgi", ".lua", ".sh", ".pl", ".py"}
 _WEB_ENTRY_NAMES = {"luci"}
 
 _WEB_ROOT_REL_HINTS = (
+    "web",
+    "web/cgi-bin",
+    "var/web",
     "www/webpages",
     "etc/wifidog",
     "usr/lib/lua/luci",
@@ -58,6 +61,7 @@ _INVOKE_RE = re.compile(
 _PATH_RE = re.compile(r'(/(?:usr/)?s?bin/[a-zA-Z0-9_.\-]+)')
 
 _WEB_CONFIGS = (
+    "etc/boa.org/boa.conf",
     "etc/config/uhttpd",
     "etc/uhttpd.conf",
     "etc/lighttpd/lighttpd.conf",

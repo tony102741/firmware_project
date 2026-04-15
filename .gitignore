@@ -5,13 +5,20 @@ data/extracted/
 data/rootfs/
 data/input/
 logs/
+runs/
 fw_dump/
 
 .codex
+.venv/
+.venv-ghidra-mcp/
+.pytest_cache/
+.mypy_cache/
 ghidra_projects/
 tools/ghidra
 tools/ghidra_11.3.2_PUBLIC/
 tools/tmp_*
+tools/payload-dumper-go/
+tools/run-ghidra-mcp.sh
 
 *.bin
 *.img
@@ -22,6 +29,7 @@ tools/tmp_*
 *.Zone.Identifier
 
 __pycache__/
+*.pyc
 .DS_Store
 CLAUDE.md
 ite|website_*

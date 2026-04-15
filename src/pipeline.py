@@ -22,6 +22,8 @@ import time
 import tempfile
 import re
 import lzma
+import json
+import hashlib
 from datetime import datetime
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
@@ -33,6 +35,7 @@ FIRMWARE_DIR  = os.path.join(PROJECT_ROOT, "data/input")
 WORK_DIR      = os.path.join(PROJECT_ROOT, "build")
 ROOTFS_DIR    = os.path.join(PROJECT_ROOT, "data/rootfs")
 EXTRACTED_DIR = os.path.join(PROJECT_ROOT, "data/extracted")
+RUNS_DIR      = os.path.join(PROJECT_ROOT, "runs")
 
 DUMPER      = os.path.join(PROJECT_ROOT, "tools/payload-dumper-go/payload-dumper-go")
 DUMPER_DIR  = os.path.dirname(DUMPER)
@@ -100,6 +103,85 @@ def _fmt_time(seconds):
     """Format elapsed seconds as '2m 31s' or '8s'."""
     m, s = divmod(int(seconds), 60)
     return f"{m}m {s:02d}s" if m else f"{s}s"
+
+
+def _slugify(text):
+    text = re.sub(r'[^A-Za-z0-9._-]+', "-", text or "")
+    return text.strip("-") or "run"
+
+
+def _json_dump(path, payload):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def _sha256_file(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _dir_size_bytes(path):
+    total = 0
+    if not os.path.exists(path):
+        return total
+    for root, _, files in os.walk(path):
+        for name in files:
+            full = os.path.join(root, name)
+            try:
+                total += os.path.getsize(full)
+            except OSError:
+                continue
+    return total
+
+
+def _recent_dirs(base_dir, prefix=None):
+    if not os.path.isdir(base_dir):
+        return []
+    items = []
+    for name in os.listdir(base_dir):
+        full = os.path.join(base_dir, name)
+        if not os.path.isdir(full):
+            continue
+        if prefix and not name.startswith(prefix):
+            continue
+        items.append((os.path.getmtime(full), full))
+    return [path for _, path in sorted(items, reverse=True)]
+
+
+def _prune_dir_set(paths, keep):
+    if keep is None or keep < 0:
+        return []
+    removed = []
+    for path in paths[keep:]:
+        shutil.rmtree(path, ignore_errors=True)
+        removed.append(path)
+    return removed
+
+
+def _prepare_run_artifacts(input_path=None):
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = _slugify(os.path.splitext(os.path.basename(input_path))[0] if input_path else "run")
+    run_dir = os.path.join(RUNS_DIR, f"run_{ts}_{suffix}")
+    os.makedirs(run_dir, exist_ok=True)
+    return {
+        "run_id": os.path.basename(run_dir),
+        "run_dir": run_dir,
+        "log_path": os.path.join(run_dir, "run.log"),
+        "result_path": os.path.join(run_dir, "results.json"),
+        "manifest_path": os.path.join(run_dir, "manifest.json"),
+        "dossier_dir": os.path.join(run_dir, "dossiers"),
+    }
 
 
 class _Tee:
@@ -976,22 +1058,89 @@ def _format_size(num_bytes):
     return f"{num_bytes}B"
 
 
+def _latest_run_manifest():
+    for run_dir in _recent_dirs(RUNS_DIR, prefix="run_"):
+        manifest = os.path.join(run_dir, "manifest.json")
+        if os.path.isfile(manifest):
+            try:
+                with open(manifest, "r", encoding="utf-8") as fh:
+                    return json.load(fh)
+            except Exception:
+                continue
+    return None
+
+
+def print_cache_status():
+    print("Cache / workspace status", flush=True)
+    print(f"  data/input      : {_format_size(_dir_size_bytes(FIRMWARE_DIR))}", flush=True)
+    print(f"  data/extracted  : {_format_size(_dir_size_bytes(EXTRACTED_DIR))}", flush=True)
+    print(f"  data/rootfs     : {_format_size(_dir_size_bytes(ROOTFS_DIR))}", flush=True)
+    print(f"  build           : {_format_size(_dir_size_bytes(WORK_DIR))}", flush=True)
+    print(f"  runs            : {_format_size(_dir_size_bytes(RUNS_DIR))}", flush=True)
+
+    extracted = _recent_dirs(EXTRACTED_DIR, prefix="extracted_")
+    print(f"  extracted sets  : {len(extracted)}", flush=True)
+    if extracted:
+        print(f"  latest extract  : {os.path.relpath(extracted[0], PROJECT_ROOT)}", flush=True)
+
+    runs = _recent_dirs(RUNS_DIR, prefix="run_")
+    print(f"  run artifacts   : {len(runs)}", flush=True)
+    latest = _latest_run_manifest()
+    if latest:
+        print(f"  latest run      : {latest.get('run_id')}", flush=True)
+        summary = latest.get("summary") or {}
+        if summary:
+            print(f"  latest summary  : {summary}", flush=True)
+
+
+def cleanup_targets(targets):
+    mapping = {
+        "build": [WORK_DIR],
+        "rootfs": [ROOTFS_DIR],
+        "runs": [RUNS_DIR],
+        "extracted": [EXTRACTED_DIR],
+        "input": [FIRMWARE_DIR],
+        "all-temp": [WORK_DIR, ROOTFS_DIR],
+    }
+    seen = set()
+    for target in targets:
+        for path in mapping[target]:
+            if path in seen:
+                continue
+            seen.add(path)
+            shutil.rmtree(path, ignore_errors=True)
+            print(f"removed: {path}", flush=True)
+
+
+def apply_retention_limits(retain_runs=None, retain_extracted=None):
+    removed = []
+    if retain_runs is not None:
+        removed.extend(_prune_dir_set(_recent_dirs(RUNS_DIR, prefix="run_"), retain_runs))
+    if retain_extracted is not None:
+        removed.extend(_prune_dir_set(_recent_dirs(EXTRACTED_DIR, prefix="extracted_"), retain_extracted))
+    for path in removed:
+        print(f"pruned: {os.path.relpath(path, PROJECT_ROOT)}", flush=True)
+    return removed
+
+
 def _describe_rootfs_candidate(path):
     file_count = _count_files_quiet(path)
     size_bytes = _dir_size_quiet(path)
 
     core_dirs = [
-        d for d in ("bin", "etc", "usr", "lib")
+        d for d in ("bin", "etc", "usr", "lib", "sbin")
         if os.path.isdir(os.path.join(path, d))
     ]
     web_hits = [
         rel for rel in (
             "www",
             "web",
+            "web/cgi-bin",
             "htdocs",
             "var/www",
             "var/web",
             "cgi-bin",
+            "web/cgi-bin/cstecgi.cgi",
             "bin/boa",
             "bin/httpd",
             "bin/goahead",
@@ -1004,6 +1153,7 @@ def _describe_rootfs_candidate(path):
             "usr/sbin/httpd",
             "usr/sbin/goahead",
             "usr/sbin/uhttpd",
+            "etc/boa.org/boa.conf",
             "etc/boa/boa.conf",
             "etc/boa.conf",
             "etc/lighttpd/lighttpd.conf",
@@ -1028,16 +1178,27 @@ def _describe_rootfs_candidate(path):
         )
         if os.path.exists(os.path.join(path, rel))
     ]
+    exec_hits = [
+        rel for rel in (
+            "bin/busybox",
+            "bin/boa",
+            "sbin/httpd",
+            "usr/sbin/httpd",
+            "usr/sbin/uhttpd",
+            "web/cgi-bin/cstecgi.cgi",
+        )
+        if os.path.exists(os.path.join(path, rel))
+    ]
 
     score = 0
     why = []
 
-    if file_count > 1500:
+    if file_count > 800:
         score += 3
-        why.append("files>1500")
-    if file_count < 500:
+        why.append("files>800")
+    if file_count < 120:
         score -= 5
-        why.append("files<500")
+        why.append("files<120")
 
     for d in core_dirs:
         score += 2
@@ -1045,14 +1206,20 @@ def _describe_rootfs_candidate(path):
         why.append("core:" + ",".join(core_dirs))
 
     if web_hits:
-        score += 4
+        score += 5
         why.append("web")
     if init_hits:
         score += 2
         why.append("init")
-    if size_bytes > 5 * 1024 * 1024:
+    if exec_hits:
+        score += 4
+        why.append("exec")
+    if size_bytes > 2 * 1024 * 1024:
         score += 2
-        why.append("size>5M")
+        why.append("size>2M")
+    if os.path.basename(path).lower() == "_raw_fs":
+        score += 2
+        why.append("raw-fs")
 
     # Prefer fuller outer roots over repeated nested duplicates.
     nested_depth = path.count("_nested_")
@@ -1075,20 +1242,29 @@ def _score_rootfs_candidate(path):
     return info["score"], info["file_count"]
 
 
+def _looks_like_rootfs_candidate(path):
+    info = _describe_rootfs_candidate(path)
+    core_count = len(info["core_dirs"])
+    webish = any(tag in info["why"] for tag in ("web", "exec", "init"))
+    if core_count >= 4:
+        return True
+    if core_count >= 3 and info["size_bytes"] >= 2 * 1024 * 1024:
+        return True
+    if core_count >= 2 and webish and info["file_count"] >= 200:
+        return True
+    return False
+
+
 def _find_rootfs_candidates(base_dir):
     candidates = []
     seen = set()
     for dirpath, dirnames, _ in os.walk(base_dir):
         for d in sorted(dirnames):
-            dl = d.lower()
-            if "squashfs" not in dl and "cramfs" not in dl and "ubifs" not in dl and "ubi" not in dl and dl not in ("rootfs", "root"):
-                continue
             candidate = os.path.join(dirpath, d)
             real_candidate = os.path.realpath(candidate)
             if real_candidate in seen:
                 continue
-            if not any(os.path.isdir(os.path.join(candidate, ind))
-                       for ind in ("bin", "lib", "etc", "usr", "sbin")):
+            if not _looks_like_rootfs_candidate(candidate):
                 continue
             seen.add(real_candidate)
             info = _describe_rootfs_candidate(candidate)
@@ -1257,13 +1433,18 @@ def _decompress_lzma_blob(blob_path, out_path):
         return False
 
 
+def _binwalk_extract_command(blob_path, out_dir):
+    # Binwalk 3.x rejects legacy -B usage; this form works on current CLI.
+    return f'binwalk -e -M -C "{out_dir}" "{blob_path}"'
+
+
 def _unpack_nested_blob(blob_path, out_dir):
     shutil.rmtree(out_dir, ignore_errors=True)
     os.makedirs(out_dir, exist_ok=True)
 
     extracted = False
     run(
-        f'binwalk -MeB "{blob_path}" -C "{out_dir}"',
+        _binwalk_extract_command(blob_path, out_dir),
         label=f"binwalk nested  {os.path.basename(blob_path)}",
         quiet=True,
     )
@@ -1317,7 +1498,7 @@ def _try_extract_iot_blob(blob_path, out_dir, label):
         return _extract_ubi_blob(blob_path, os.path.join(out_dir, "_ubi_extract"))
 
     run(
-        f'binwalk -MeB "{blob_path}" -C "{out_dir}"',
+        _binwalk_extract_command(blob_path, out_dir),
         label=label,
         quiet=True,
     )
@@ -1361,19 +1542,23 @@ def _validate_iot_rootfs(dst, min_files=2000):
     return count
 
 
-def _check_iot_rootfs(candidate, min_files=1500):
+def _check_iot_rootfs(candidate, min_files=800):
     if isinstance(candidate, dict):
         info = candidate
         path = info["path"]
         count = info.get("file_count", 0)
         size_bytes = info.get("size_bytes", 0)
         core_dirs = info.get("core_dirs", [])
+        score = info.get("score", 0)
+        why = info.get("why", [])
     else:
         path = candidate
         info = _describe_rootfs_candidate(path)
         count = info["file_count"]
         size_bytes = info["size_bytes"]
         core_dirs = info["core_dirs"]
+        score = info["score"]
+        why = info["why"]
 
     missing_core = [d for d in ("bin", "etc", "usr", "lib") if d not in core_dirs]
 
@@ -1391,7 +1576,10 @@ def _check_iot_rootfs(candidate, min_files=1500):
             f"too small to trust ({count} files, {_format_size(size_bytes)})"
         )
 
-    if size_bytes > 10 * 1024 * 1024 and len(core_dirs) >= 3:
+    if size_bytes > 8 * 1024 * 1024 and len(core_dirs) >= 3:
+        return count, None
+
+    if score >= 12 and any(tag in why for tag in ("web", "exec", "init")):
         return count, None
 
     return count, (
@@ -1595,6 +1783,9 @@ def run_analysis(output_path=None, system_path=None, vendor_path=None):
     cmd = f'python3 -u "{os.path.join(BASE_DIR, "main.py")}"'
     if output_path:
         cmd += f' --output "{output_path}"'
+    dossier_dir = env.get("FIRMWARE_DOSSIER_DIR")
+    if dossier_dir:
+        cmd += f' --dossier-dir "{dossier_dir}"'
 
     run_critical(
         cmd,
@@ -1602,6 +1793,20 @@ def run_analysis(output_path=None, system_path=None, vendor_path=None):
         env=env,
         timeout=3600,    # 1 hr; large rootfs can take a long time to scan
     )
+
+
+def _write_manifest(path, payload):
+    _json_dump(path, payload)
+
+
+def _load_json(path):
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
 
 
 def _is_iot_batch_candidate(path):
@@ -1777,19 +1982,59 @@ def main():
     parser.add_argument(
         "--ingest-dir", metavar="DIR",
         help="scan a folder and copy only IoT-like firmware inputs into data/input/")
+    parser.add_argument(
+        "--status", action="store_true",
+        help="show cache/workspace status and latest run metadata")
+    parser.add_argument(
+        "--cleanup", nargs="+",
+        choices=["build", "rootfs", "runs", "extracted", "input", "all-temp"],
+        help="remove selected cached directories")
+    parser.add_argument(
+        "--retain-runs", type=int,
+        help="keep only the newest N run artifact directories under runs/")
+    parser.add_argument(
+        "--retain-extracted", type=int,
+        help="keep only the newest N extracted_* directories under data/extracted/")
     args = parser.parse_args()
 
+    if args.status:
+        print_cache_status()
+        sys.exit(0)
+
+    if args.cleanup:
+        cleanup_targets(args.cleanup)
+        if args.retain_runs is not None or args.retain_extracted is not None:
+            apply_retention_limits(args.retain_runs, args.retain_extracted)
+        sys.exit(0)
+
+    if (args.retain_runs is not None or args.retain_extracted is not None) and not any([
+        args.dry_run,
+        args.skip,
+        args.input,
+        args.output,
+        args.batch_iot,
+        args.ingest_dir,
+    ]):
+        apply_retention_limits(args.retain_runs, args.retain_extracted)
+        sys.exit(0)
+
+    preflight_path = None
+    preflight_type = None
+    if not args.skip and not args.batch_iot and not args.ingest_dir:
+        preflight_path, preflight_type = resolve_input(args.input, args.type)
+        if preflight_path is None:
+            sys.exit(1)
+
+    run_artifacts = _prepare_run_artifacts(preflight_path)
+    _log_fh = None
     if not args.batch_iot:
-        # ── Log file setup (before any output so everything is captured) ──────
-        log_dir = os.path.join(PROJECT_ROOT, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        log_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        log_path = os.path.join(log_dir, log_name)
-        _log_fh  = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
+        _log_fh = open(run_artifacts["log_path"], "a", encoding="utf-8", errors="replace", buffering=1)
         sys.stdout = _Tee(sys.stdout, _log_fh)
         sys.stderr = _Tee(sys.stderr, _log_fh)
-        # Inherited by main.py subprocess so it can append its output to the same file
-        os.environ["FIRMWARE_LOG_FILE"] = log_path
+        os.environ["FIRMWARE_LOG_FILE"] = run_artifacts["log_path"]
+        os.environ["FIRMWARE_RUN_DIR"] = run_artifacts["run_dir"]
+        os.environ["FIRMWARE_DOSSIER_DIR"] = run_artifacts["dossier_dir"]
+        os.environ["FIRMWARE_RUN_ID"] = run_artifacts["run_id"]
 
     total = 4 if not args.skip else 2
 
@@ -1804,10 +2049,27 @@ def main():
 
     print("─" * _W, flush=True)
     print("  Firmware Vulnerability Analysis Pipeline", flush=True)
-    print(f"  Log: logs/{log_name}", flush=True)
+    print(f"  Run dir: {os.path.relpath(run_artifacts['run_dir'], PROJECT_ROOT)}", flush=True)
+    print(f"  Log: {os.path.relpath(run_artifacts['log_path'], PROJECT_ROOT)}", flush=True)
     print("─" * _W, flush=True)
 
     t_total = time.time()
+    output_path = os.path.abspath(args.output) if args.output else run_artifacts["result_path"]
+    manifest = {
+        "run_id": run_artifacts["run_id"],
+        "run_dir": os.path.relpath(run_artifacts["run_dir"], PROJECT_ROOT),
+        "log_path": os.path.relpath(run_artifacts["log_path"], PROJECT_ROOT),
+        "result_path": os.path.relpath(output_path, PROJECT_ROOT),
+        "dossier_dir": os.path.relpath(run_artifacts["dossier_dir"], PROJECT_ROOT),
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "status": "running",
+        "input": None,
+        "retention": {
+            "retain_runs": args.retain_runs,
+            "retain_extracted": args.retain_extracted,
+        },
+    }
+    _write_manifest(run_artifacts["manifest_path"], manifest)
 
     # ── [0] Pre-flight ────────────────────────────────────────────────────────
     _stage(0, total, "Pre-flight checks")
@@ -1818,16 +2080,26 @@ def main():
         print(flush=True)
         _info("DRY RUN — validating prerequisites only, nothing will execute")
         ensure_dumper()
-        path, input_type = resolve_input(args.input, args.type)
+        path, input_type = preflight_path, preflight_type
+        if path is None:
+            path, input_type = resolve_input(args.input, args.type)
         if path is None:
             sys.exit(1)
+        manifest["input"] = {
+            "path": os.path.relpath(path, PROJECT_ROOT),
+            "type": input_type,
+            "sha256": _sha256_file(path),
+            "size_bytes": os.path.getsize(path),
+        }
+        manifest["status"] = "dry_run_complete"
+        manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _write_manifest(run_artifacts["manifest_path"], manifest)
         print(flush=True)
         _info(f"Input file:   {os.path.basename(path)}")
         _info(f"Input type:   {input_type}")
         _info(f"Rootfs:       {ROOTFS_DIR}")
-        _info(f"Logs:         logs/")
-        if args.output:
-            _info(f"JSON output:  {args.output}")
+        _info(f"Run dir:      {run_artifacts['run_dir']}")
+        _info(f"JSON output:  {output_path}")
         print(flush=True)
         _info("Pipeline would execute:")
         _info("  [2/4] Extraction    → unzip / payload-dumper-go / 7z")
@@ -1844,6 +2116,7 @@ def main():
 
     analysis_system_path = None
     analysis_vendor_path = None
+    input_type = preflight_type
 
     if not args.skip:
         # ── [2] Extraction ────────────────────────────────────────────────────
@@ -1851,10 +2124,21 @@ def main():
         _info("Running...")
         t_ext = time.time()
 
-        path, input_type = resolve_input(args.input, args.type)
+        path, input_type = preflight_path, preflight_type
+        if path is None:
+            path, input_type = resolve_input(args.input, args.type)
         if path is None:
             print("\n[!] Input file not found.", flush=True)
             sys.exit(1)
+        manifest["input"] = {
+            "path": os.path.relpath(path, PROJECT_ROOT),
+            "type": input_type,
+            "sha256": _sha256_file(path),
+            "size_bytes": os.path.getsize(path),
+        }
+        _write_manifest(run_artifacts["manifest_path"], manifest)
+        os.environ["FIRMWARE_INPUT_PATH"] = os.path.abspath(path)
+        os.environ["FIRMWARE_INPUT_TYPE"] = input_type
 
         if input_type != INPUT_IOT:
             ensure_dumper()
@@ -1895,10 +2179,21 @@ def main():
         analysis_vendor_path = os.path.join(ROOTFS_DIR, "vendor")
 
     run_analysis(
-        output_path=args.output,
+        output_path=output_path,
         system_path=analysis_system_path,
         vendor_path=analysis_vendor_path,
     )
+
+    result_payload = _load_json(output_path) or {}
+    manifest["status"] = "completed"
+    manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    manifest["elapsed_seconds"] = int(time.time() - t_total)
+    manifest["summary"] = result_payload.get("summary")
+    manifest["analysis"] = result_payload.get("analysis")
+    _write_manifest(run_artifacts["manifest_path"], manifest)
+
+    if args.retain_runs is not None or args.retain_extracted is not None:
+        apply_retention_limits(args.retain_runs, args.retain_extracted)
 
     print(f"\n[DONE] Total execution time: {_fmt_time(time.time() - t_total)}", flush=True)
     print("─" * _W, flush=True)
