@@ -352,6 +352,93 @@ def _collect_iot_services(system_path, web_bins):
     return services
 
 
+def _collect_generic_blob_services(system_path, max_candidates=None):
+    """
+    Fallback collector for firmware bundles that do not expose a classic
+    rootfs layout. Treat interesting blobs as analysis targets and let the
+    string-based analyzer rank them.
+    """
+    exts = {".bin", ".img", ".so", ".elf", ".fw", ".cgi", ".apk"}
+    if max_candidates is None:
+        root_lower = os.path.abspath(system_path).lower()
+        max_candidates = 40 if "_iot_extract" in root_lower or "rc520" in root_lower or "dji" in root_lower else 200
+    services = []
+    seen = set()
+    noisy_tokens = (
+        "libxul", "opencv", "mapbox", "mozav", "ffmpeg", "qnnhtp",
+        "xnnpack", "ijkplayer", "freebl3", "nss3", "nssckbi",
+        "crashlytics", "volc_log", "megazord", "glean", "plugin-container",
+        "libc++_shared", "libjnidispatch", "libsoftokn3", "libgraphics-core",
+    )
+
+    for dirpath, dirnames, filenames in os.walk(system_path):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        rel_dir = os.path.relpath(dirpath, system_path).replace("\\", "/").lower()
+        for name in sorted(filenames):
+            lower = name.lower()
+            ext = os.path.splitext(lower)[1]
+            if ext not in exts:
+                continue
+
+            full = os.path.join(dirpath, name)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            if size < 4096:
+                continue
+            if ext == ".so":
+                if any(tok in lower for tok in noisy_tokens):
+                    continue
+                if size > 25 * 1024 * 1024:
+                    continue
+            if ext == ".apk":
+                continue
+
+            exec_path = "/" + os.path.relpath(full, system_path)
+            if exec_path in seen:
+                continue
+            seen.add(exec_path)
+
+            service_name = os.path.basename(name)
+            if rel_dir not in (".", ""):
+                service_name = f"{os.path.basename(dirpath)}::{service_name}"
+
+            services.append({
+                "name": service_name,
+                "exec": exec_path,
+                "user": "root",
+                "socket": [],
+                "source": "bundle",
+            })
+
+    def priority(service):
+        exec_path = service["exec"].lower()
+        score = 0
+        if exec_path.endswith(".so"):
+            score -= 50
+        if "/lib/" in exec_path:
+            score -= 30
+        if exec_path.endswith(".apk"):
+            score += 40
+        if exec_path.endswith(("decompressed.bin", "payload.bin")):
+            score += 80
+        if os.path.basename(exec_path).startswith("v01.00."):
+            score += 120
+        try:
+            size = os.path.getsize(os.path.join(system_path, service["exec"].lstrip("/")))
+        except OSError:
+            size = 0
+        if size > 50 * 1024 * 1024:
+            score += 40
+        elif 64 * 1024 <= size <= 20 * 1024 * 1024:
+            score -= 10
+        return (score, exec_path)
+
+    services.sort(key=priority)
+    return services[:max_candidates]
+
+
 def _relevel(score, confidence):
     """Re-classify level after a score adjustment."""
     flow_for_high   = confidence in ("HIGH", "MEDIUM")   # proxy for flow_score ≥ 6
@@ -1327,9 +1414,59 @@ def run_android_analysis(show_all=False):
 
 
 def run_general_analysis(show_all=False):
-    print("\n[*] General mode fallback uses the standard service analysis path.",
+    print("\n[*] General mode fallback uses generic firmware blob analysis.",
           flush=True)
-    return run_android_analysis(show_all=show_all)
+
+    services = _collect_generic_blob_services(SYSTEM_PATH)
+    print(f"    {len(services)} blob candidates", flush=True)
+    if not services:
+        print("    no suitable blobs found under analysis root", flush=True)
+        return {
+            "mode": "general",
+            "remote_count": 0,
+            "results": [],
+            "cgi_files": [],
+            "exploit_candidates": [],
+            "summary": {"blob_candidates": 0, "candidates_found": 0},
+        }
+
+    print(f"[START] Vulnerability analysis", flush=True)
+    sys.stdout.flush()
+    results = analyze_services(services, SYSTEM_PATH)
+
+    high = [r for r in results if r["level"] == "HIGH"]
+    medium = [r for r in results if r["level"] == "MEDIUM"]
+    low = [r for r in results if r["level"] == "LOW"]
+
+    print(f"[DONE]  Analysis complete — {len(results)} candidate(s) found"
+          f"  (HIGH: {len(high)}  MEDIUM: {len(medium)}  LOW: {len(low)})",
+          flush=True)
+
+    print_section("HIGH RISK TARGETS", high)
+    print_section("MEDIUM RISK TARGETS", medium)
+    if show_all:
+        print_section("LOW RISK TARGETS", low)
+
+    _sec("SUMMARY")
+    print(f"  Blob candidates:   {len(services)}", flush=True)
+    print(f"  Candidates found:  {len(results)}"
+          f"  (HIGH: {len(high)}  MEDIUM: {len(medium)}  LOW: {len(low)})",
+          flush=True)
+    print(f"\n{'─' * _W}", flush=True)
+    return {
+        "mode": "general",
+        "remote_count": 0,
+        "results": results,
+        "cgi_files": [],
+        "exploit_candidates": [],
+        "summary": {
+            "blob_candidates": len(services),
+            "candidates_found": len(results),
+            "high": len(high),
+            "medium": len(medium),
+            "low": len(low),
+        },
+    }
 
 
 def run_analysis(show_all=False, output_path=None, dossier_dir=None):
@@ -1363,7 +1500,7 @@ def run_analysis(show_all=False, output_path=None, dossier_dir=None):
     else:
         result = run_general_analysis(show_all=show_all)
 
-    if result and result.get("remote_count", 0) == 0:
+    if result and mode != "general" and result.get("remote_count", 0) == 0:
         _sec("ANALYSIS RETRY")
         print("  selected mode: iot_web", flush=True)
         print("  reason: no remotely exploitable candidates found in initial analysis",

@@ -21,6 +21,7 @@ import argparse
 import time
 import tempfile
 import re
+import shlex
 import lzma
 import json
 import hashlib
@@ -69,6 +70,28 @@ _UBIREADER_FALLBACK_DIRS = (
 _PARTITION_INDICATORS = {"bin", "lib", "lib64", "etc", "app", "framework", "priv-app"}
 _SEARCH_SKIP = {"rootfs", ".git", "node_modules", "__pycache__"}
 _ARCHIVE_FIRMWARE_EXTS = (".bin", ".img", ".web", ".trx", ".w", ".pkgtb")
+_DJI_SKIP_SIG_EXTS = (".pro.fw.sig", ".cfg.sig")
+_DJI_PRIORITY_NAMES = (
+    "decompressed.bin",
+    "payload.bin",
+    "ap.img",
+    "system.img",
+    "vendor.img",
+    "system_ext.img",
+    "product.img",
+    "odm.img",
+    "vendor_boot.img",
+    "boot.img",
+    "dtbo.img",
+)
+_DJI_INTERNAL_NESTED_ALLOWLIST = {"decompressed.bin", "payload.bin", "ap.img"}
+_DJI_PRAK_PREFERRED_MODULES = {"0200", "0205"}
+_DJI_PRAK_EXCLUDED_MODULES = {"0206", "0207", "0600", "1302", "1400"}
+_DJI_PRAK_MAX_TARGETS = 2
+_DJI_PRAK_PAYLOAD_MAGICS = (
+    ("zip", b"PK\x03\x04"),
+    ("gzip", b"\x1f\x8b\x08"),
+)
 
 INPUT_ZIP     = "zip"
 INPUT_RAR     = "rar"
@@ -397,10 +420,25 @@ def ensure_dumper():
     Aborts the pipeline (sys.exit) if the binary cannot be made available.
     """
     if os.path.isfile(DUMPER) and os.access(DUMPER, os.X_OK):
-        _ok("payload-dumper-go")
-        return
+        try:
+            probe = subprocess.run(
+                [DUMPER],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            if probe.returncode in (0, 1, 2):
+                _ok("payload-dumper-go")
+                return
+        except subprocess.TimeoutExpired:
+            _ok("payload-dumper-go")
+            return
+        except OSError as exc:
+            _warn(f"payload-dumper-go is not runnable on this host: {exc}")
+        except Exception:
+            pass
 
-    _warn(f"payload-dumper-go not found: {DUMPER}")
+    _warn(f"payload-dumper-go not usable: {DUMPER}")
     _info("Attempting automatic build from source ...")
 
     os.makedirs(os.path.join(PROJECT_ROOT, "tools"), exist_ok=True)
@@ -418,6 +456,23 @@ def ensure_dumper():
             sys.exit(1)
     else:
         _info(f"source directory exists: {DUMPER_DIR}")
+        if not os.path.isfile(os.path.join(DUMPER_DIR, "go.mod")):
+            print("[FATAL] payload-dumper-go source files are missing.", flush=True)
+            print("[FATAL] Only a prebuilt binary is present, and it is not runnable here.",
+                  flush=True)
+            print("[FATAL] Replace it with a host-compatible binary or clone the source into:",
+                  flush=True)
+            print(f"        {DUMPER_DIR}", flush=True)
+            sys.exit(1)
+        go_bin = shutil.which("go")
+        if go_bin is None:
+            print("[FATAL] Go toolchain not found; cannot rebuild payload-dumper-go.",
+                  flush=True)
+            print("[FATAL] Current binary is not runnable on this host.", flush=True)
+            print("[FATAL] Install Go and rebuild from source, or replace the binary at:",
+                  flush=True)
+            print(f"        {DUMPER}", flush=True)
+            sys.exit(1)
 
     result = subprocess.run(
         f'cd "{DUMPER_DIR}" && go build -o payload-dumper-go .',
@@ -638,8 +693,8 @@ def clean(skip):
         return
 
     _info("cleaning .cache/build and .cache/rootfs/ ...")
-    shutil.rmtree(WORK_DIR, ignore_errors=True)
-    shutil.rmtree(ROOTFS_DIR, ignore_errors=True)
+    _reset_dir_fast(WORK_DIR)
+    _reset_dir_fast(ROOTFS_DIR)
 
     os.makedirs(WORK_DIR, exist_ok=True)
     os.makedirs(os.path.join(ROOTFS_DIR, "system"), exist_ok=True)
@@ -649,6 +704,40 @@ def clean(skip):
     os.makedirs(EXTRACTED_DIR, exist_ok=True)
     # ensure input dir exists for user guidance
     os.makedirs(FIRMWARE_DIR, exist_ok=True)
+
+
+def _reset_dir_fast(path):
+    """
+    Make a workspace directory immediately reusable, even when the previous tree
+    contains millions of files. Old contents are deleted in the background.
+    """
+    if not os.path.lexists(path):
+        return
+
+    parent = os.path.dirname(path)
+    base = os.path.basename(path.rstrip(os.sep))
+    quarantine = os.path.join(
+        parent,
+        f".__stale_{base}_{int(time.time())}_{os.getpid()}",
+    )
+
+    try:
+        os.replace(path, quarantine)
+    except FileNotFoundError:
+        return
+    except OSError:
+        shutil.rmtree(path, ignore_errors=True)
+        return
+
+    try:
+        subprocess.Popen(
+            ["rm", "-rf", quarantine],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        shutil.rmtree(quarantine, ignore_errors=True)
 
 
 # ── OTA unzip ─────────────────────────────────────────────────────────────────
@@ -679,7 +768,7 @@ def extract_payload(payload_path=None):
         return False
 
     run_critical_with_heartbeat(
-        f'"{DUMPER}" "{payload_path}" --out "{EXTRACTED_DIR}"',
+        f'"{DUMPER}" -o "{EXTRACTED_DIR}" "{payload_path}"',
         fatal_msg="payload-dumper-go failed — extracted partition set incomplete.",
         label="payload-dumper-go  (extracting partitions, this may take several minutes)",
         timeout=1800,   # 30 min; large OTAs can take 5–10 min
@@ -1351,32 +1440,140 @@ def _collect_ranked_rootfs_candidates(*base_dirs):
     return candidates
 
 
-def _find_fs_magic_offsets(path, max_hits=8):
+def _collect_ranked_bundle_candidates(*base_dirs):
+    candidates = []
+    seen = set()
+    for base_dir in base_dirs:
+        if not base_dir or not os.path.isdir(base_dir):
+            continue
+        for dirpath, _, filenames in os.walk(base_dir):
+            key = os.path.realpath(dirpath)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            bundle_files = []
+            for name in filenames:
+                lower = name.lower()
+                if lower.endswith(_DJI_SKIP_SIG_EXTS):
+                    continue
+                if lower.endswith((".img", ".bin", ".fw", ".sig")):
+                    bundle_files.append(name)
+            if len(bundle_files) < 5:
+                continue
+
+            score = len(bundle_files)
+            why = [f"bundle-files:{len(bundle_files)}"]
+            if any(name.lower() == "ap_version.txt" for name in filenames):
+                score += 4
+                why.append("ap-version")
+            subdirs = []
+            try:
+                subdirs = [
+                    d for d in os.listdir(dirpath)
+                    if os.path.isdir(os.path.join(dirpath, d))
+                ]
+            except Exception:
+                pass
+            if any(re.fullmatch(r"(universal|wa\d+)", d.lower()) for d in subdirs):
+                score += 4
+                why.append("module-variants")
+
+            candidates.append({
+                "path": dirpath,
+                "score": score,
+                "file_count": len(filenames),
+                "size_bytes": _dir_size_quiet(dirpath),
+                "core_dirs": [],
+                "why": why,
+                "bundle_files": len(bundle_files),
+            })
+
+    candidates.sort(
+        key=lambda x: (-x["score"], -x["bundle_files"], -x["size_bytes"], x["path"])
+    )
+    return candidates
+
+
+def _find_fs_magic_offsets(path, max_hits=8, chunk_size=8 * 1024 * 1024):
+    max_magic = max(len(magic) for _, magic in _FS_MAGIC_PATTERNS)
+    overlap = max_magic - 1
+    hits = []
+    seen = set()
+    offset = 0
+    tail = b""
+
     try:
-        data = open(path, "rb").read()
+        with open(path, "rb") as fh:
+            while len(hits) < max_hits:
+                chunk = fh.read(chunk_size)
+                if not chunk:
+                    break
+
+                window = tail + chunk
+                base_offset = offset - len(tail)
+
+                for fs_name, magic in _FS_MAGIC_PATTERNS:
+                    start = 0
+                    while True:
+                        idx = window.find(magic, start)
+                        if idx < 0:
+                            break
+                        abs_idx = base_offset + idx
+                        key = (fs_name, abs_idx)
+                        if key not in seen:
+                            hits.append((fs_name, abs_idx))
+                            seen.add(key)
+                            if len(hits) >= max_hits:
+                                return sorted(hits, key=lambda x: x[1])
+                        start = idx + 1
+
+                offset += len(chunk)
+                tail = window[-overlap:] if overlap > 0 else b""
     except Exception:
         return []
 
-    hits = []
-    seen = set()
-    for fs_name, magic in _FS_MAGIC_PATTERNS:
-        start = 0
-        while True:
-            idx = data.find(magic, start)
-            if idx < 0:
-                break
-            key = (fs_name, idx)
-            if key not in seen:
-                hits.append((fs_name, idx))
-                seen.add(key)
-            start = idx + 1
-            if len(hits) >= max_hits:
-                return sorted(hits, key=lambda x: x[1])
     return sorted(hits, key=lambda x: x[1])
 
 
+def _carve_from_offset_command(src_path, dst_path, offset):
+    # BSD dd with bs=1 becomes unusably slow on multi-GB inputs. tail -c +N
+    # skips directly to the byte offset and streams the remainder efficiently.
+    start = offset + 1
+    return (
+        f'tail -c +{start} {shlex.quote(src_path)} > {shlex.quote(dst_path)}'
+    )
+
+
 def _looks_like_nested_blob(path):
-    lower = path.lower()
+    lower = path.lower().replace("\\", "/")
+    base_lower = os.path.basename(lower)
+    noisy_markers = (
+        ".apk.extracted/",
+        ".jar.extracted/",
+        ".so.extracted/",
+        "/lib/",
+        "/lib64/",
+        "/framework/",
+        "/priv-app/",
+    )
+    if any(marker in lower for marker in noisy_markers):
+        return False
+    if ".pro.fw.sig.extracted/" in lower:
+        extracted_depth = lower.count(".extracted/")
+        if base_lower not in _DJI_INTERNAL_NESTED_ALLOWLIST:
+            return False
+        if base_lower in ("decompressed.bin", "payload.bin") and extracted_depth > 1:
+            return False
+        if base_lower == "ap.img":
+            if extracted_depth > 2:
+                return False
+            if re.search(r"/(universal|wa\d+)/", lower):
+                return False
+    if lower.endswith((".apk", ".jar", ".so", ".dex", ".odex", ".vdex")):
+        return False
+    if lower.endswith(_DJI_SKIP_SIG_EXTS):
+        return False
     if lower.endswith(_NESTED_BLOB_EXTS):
         return True
     for _, magic in _FS_MAGIC_PATTERNS:
@@ -1464,9 +1661,190 @@ def _decompress_lzma_blob(blob_path, out_path):
         return False
 
 
-def _binwalk_extract_command(blob_path, out_dir):
+def _binwalk_extract_command(blob_path, out_dir, recursive=True):
     # Binwalk 3.x rejects legacy -B usage; this form works on current CLI.
-    return f'binwalk -e -M -C "{out_dir}" "{blob_path}"'
+    cmd = ['binwalk', '-e', '-C', out_dir]
+    if recursive:
+        cmd.append('-M')
+    excludes = []
+    if shutil.which("unyaffs") is None:
+        excludes.append("yaffs")
+    if shutil.which("unrar") is None:
+        excludes.append("rar")
+    if shutil.which("tsk_recover") is None:
+        excludes.append("ext")
+    for name in excludes:
+        cmd.append(f"--exclude={name}")
+    cmd.extend(["--", blob_path])
+    return " ".join(shlex.quote(part) for part in cmd)
+
+
+def _is_dji_firmware_blob(path):
+    base = os.path.basename(path).lower()
+    if "dji" in base or "rc520" in base:
+        return True
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096)
+        return b"rc520_" in head or b"dji" in head.lower()
+    except Exception:
+        return False
+
+
+def _is_dji_prak_blob(path):
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(64)
+    except Exception:
+        return False
+    return b"PRAK" in head
+
+
+def _dji_module_id(path):
+    match = re.search(r"rc\d+_(\d{4})_", os.path.basename(path).lower())
+    return match.group(1) if match else None
+
+
+def _score_dji_prak_candidate(path):
+    module_id = _dji_module_id(path)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+
+    score = 0
+    why = []
+    if module_id in _DJI_PRAK_PREFERRED_MODULES:
+        score += 200
+        why.append(f"preferred-module:{module_id}")
+    elif module_id in _DJI_PRAK_EXCLUDED_MODULES:
+        score -= 200
+        why.append(f"excluded-module:{module_id}")
+
+    if size >= 512 * 1024 * 1024:
+        score += 80
+        why.append("very-large")
+    elif size >= 128 * 1024 * 1024:
+        score += 40
+        why.append("large")
+    elif size <= 16 * 1024 * 1024:
+        score -= 60
+        why.append("small")
+
+    if size == 0:
+        score -= 200
+        why.append("empty")
+
+    return score, why, size, module_id
+
+
+def _select_dji_prak_targets(paths, max_targets=_DJI_PRAK_MAX_TARGETS):
+    ranked = []
+    seen_modules = set()
+
+    for path in paths:
+        score, why, size, module_id = _score_dji_prak_candidate(path)
+        ranked.append((score, size, module_id, path, why))
+
+    ranked.sort(key=lambda item: (-item[0], -item[1], item[3]))
+
+    selected = []
+    for score, size, module_id, path, _why in ranked:
+        if score <= 0:
+            continue
+        key = module_id or os.path.basename(path).lower()
+        if key in seen_modules:
+            continue
+        seen_modules.add(key)
+        selected.append(path)
+        if len(selected) >= max_targets:
+            break
+
+    return selected
+
+
+def _find_dji_payload_offset(path, search_window=8192):
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(search_window)
+    except Exception:
+        return None, None
+
+    best = None
+    for kind, magic in _DJI_PRAK_PAYLOAD_MAGICS:
+        idx = head.find(magic)
+        if idx < 0:
+            continue
+        if best is None or idx < best[1]:
+            best = (kind, idx)
+    return best if best else (None, None)
+
+
+def _extract_dji_prak_blob(blob_path, out_dir):
+    payload_kind, payload_offset = _find_dji_payload_offset(blob_path)
+    if payload_offset is None:
+        return False
+
+    payload_name = f"_payload.{ 'zip' if payload_kind == 'zip' else 'gz' }"
+    payload_path = os.path.join(out_dir, payload_name)
+    run_critical(
+        _carve_from_offset_command(blob_path, payload_path, payload_offset),
+        fatal_msg=f"failed to carve DJI payload at 0x{payload_offset:x}",
+        label=f"dji carve  {os.path.basename(blob_path)} @ 0x{payload_offset:x}",
+        quiet=True,
+    )
+
+    if payload_kind == "zip":
+        extract_dir = os.path.join(out_dir, "_prak")
+        os.makedirs(extract_dir, exist_ok=True)
+        proc = run(
+            f'7z x "{payload_path}" -o"{extract_dir}" -y',
+            label=f"dji unzip   {os.path.basename(blob_path)}",
+            quiet=True,
+        )
+        return proc.returncode == 0 and any(os.scandir(extract_dir))
+
+    decoded = os.path.join(out_dir, "decompressed.bin")
+    return _decompress_lzma_blob(payload_path, decoded) or (
+        run(
+            f'7z x "{payload_path}" -o"{out_dir}" -y',
+            label=f"dji gunzip  {os.path.basename(blob_path)}",
+            quiet=True,
+        ).returncode == 0
+    )
+
+
+def _find_dji_android_payload(base_dir):
+    payloads = []
+    for dirpath, dirnames, filenames in os.walk(base_dir):
+        for filename in filenames:
+            if filename.lower() != "payload.bin":
+                continue
+            full = os.path.join(dirpath, filename)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            payloads.append((size, full))
+
+    if not payloads:
+        return None
+    payloads.sort(reverse=True)
+    return payloads[0][1]
+
+
+def _is_relevant_dji_nested_target(path):
+    lower = os.path.basename(path).lower()
+    if lower in _DJI_PRIORITY_NAMES:
+        return True
+    if lower.endswith(".pro.fw.sig"):
+        module_id = _dji_module_id(path)
+        return module_id in _DJI_PRAK_PREFERRED_MODULES
+    if lower.endswith(".cfg.sig"):
+        return False
+    if _is_dji_prak_blob(path):
+        return False
+    return lower.endswith((".img", ".fw", ".raw"))
 
 
 def _unpack_nested_blob(blob_path, out_dir):
@@ -1474,13 +1852,17 @@ def _unpack_nested_blob(blob_path, out_dir):
     os.makedirs(out_dir, exist_ok=True)
 
     extracted = False
-    run(
-        _binwalk_extract_command(blob_path, out_dir),
-        label=f"binwalk nested  {os.path.basename(blob_path)}",
-        quiet=True,
-    )
-    if any(os.scandir(out_dir)):
-        extracted = True
+    is_dji_sig = blob_path.lower().endswith(".pro.fw.sig")
+    if is_dji_sig:
+        return _extract_dji_prak_blob(blob_path, out_dir)
+    if not is_dji_sig:
+        run(
+            _binwalk_extract_command(blob_path, out_dir),
+            label=f"binwalk nested  {os.path.basename(blob_path)}",
+            quiet=True,
+        )
+        if any(os.scandir(out_dir)):
+            extracted = True
 
     raw_dir = os.path.join(out_dir, "_raw")
     os.makedirs(raw_dir, exist_ok=True)
@@ -1497,6 +1879,46 @@ def _unpack_nested_blob(blob_path, out_dir):
         extracted = True
 
     return extracted
+
+
+def _expand_dji_bundles(base_dir, max_files=24):
+    targets = []
+    prak_targets = []
+    seen = set()
+
+    for dirpath, dirnames, filenames in os.walk(base_dir):
+        dirnames[:] = [d for d in dirnames if not d.startswith("_nested_")]
+        for filename in filenames:
+            full = os.path.join(dirpath, filename)
+            key = (filename.lower(), os.path.getsize(full) if os.path.exists(full) else -1)
+            if key in seen:
+                continue
+            seen.add(key)
+            if filename.lower().endswith(".pro.fw.sig"):
+                prak_targets.append(full)
+                continue
+            if _is_relevant_dji_nested_target(full):
+                targets.append(full)
+
+    targets.extend(_select_dji_prak_targets(prak_targets))
+
+    def _priority(path):
+        name = os.path.basename(path).lower()
+        if name.endswith(".pro.fw.sig"):
+            return (-1, len(path), path)
+        try:
+            rank = _DJI_PRIORITY_NAMES.index(name)
+        except ValueError:
+            rank = len(_DJI_PRIORITY_NAMES)
+        return (rank, len(path), path)
+
+    targets.sort(key=_priority)
+    for blob_path in targets[:max_files]:
+        nested_dir = os.path.join(
+            os.path.dirname(blob_path),
+            f"_nested_{os.path.basename(blob_path)}",
+        )
+        _unpack_nested_blob(blob_path, nested_dir)
 
 
 def _expand_nested_iot_blobs(base_dir, max_depth=3):
@@ -1528,12 +1950,16 @@ def _try_extract_iot_blob(blob_path, out_dir, label):
     if _has_ubi_magic(blob_path):
         return _extract_ubi_blob(blob_path, os.path.join(out_dir, "_ubi_extract"))
 
+    dji_fast = _is_dji_firmware_blob(blob_path)
     run(
-        _binwalk_extract_command(blob_path, out_dir),
+        _binwalk_extract_command(blob_path, out_dir, recursive=not dji_fast),
         label=label,
         quiet=True,
     )
-    _expand_nested_iot_blobs(out_dir)
+    if dji_fast:
+        _expand_dji_bundles(out_dir)
+    else:
+        _expand_nested_iot_blobs(out_dir)
 
     ubi_blobs = _find_ubi_blobs(out_dir)
     if ubi_blobs:
@@ -1545,6 +1971,9 @@ def _try_extract_iot_blob(blob_path, out_dir, label):
     if sqfs:
         return sqfs
 
+    if dji_fast:
+        return None
+
     inner = os.path.join(out_dir, "_raw_fs")
     os.makedirs(inner, exist_ok=True)
     proc = run(
@@ -1553,7 +1982,10 @@ def _try_extract_iot_blob(blob_path, out_dir, label):
         quiet=True,
     )
     if proc.returncode == 0 or os.listdir(inner):
-        _expand_nested_iot_blobs(inner)
+        if dji_fast:
+            _expand_dji_bundles(inner)
+        else:
+            _expand_nested_iot_blobs(inner)
         ubi_blobs = _find_ubi_blobs(inner)
         if ubi_blobs:
             sqfs = _extract_ubi_blob(ubi_blobs[0], os.path.join(inner, "_ubi_extract"))
@@ -1657,18 +2089,20 @@ def extract_iot_firmware(bin_path):
     out_dir = os.path.join(WORK_DIR, "_iot_extract")
     os.makedirs(out_dir, exist_ok=True)
 
+    is_dji_blob = _is_dji_firmware_blob(bin_path)
+
     _try_extract_iot_blob(
         bin_path, out_dir, f"binwalk  {os.path.basename(bin_path)}"
     )
 
     candidates = _collect_ranked_rootfs_candidates(out_dir)
 
-    if not candidates:
+    if not candidates and not is_dji_blob:
         _warn("binwalk did not locate a filesystem root; scanning raw offsets")
         for fs_name, offset in _find_fs_magic_offsets(bin_path):
             carved = os.path.join(WORK_DIR, f"_carve_{fs_name}_{offset:x}.bin")
             run_critical(
-                f'dd if="{bin_path}" of="{carved}" bs=1 skip={offset} status=none',
+                _carve_from_offset_command(bin_path, carved, offset),
                 fatal_msg=f"dd carve failed at offset {offset} for {fs_name}",
                 label=f"dd carve  {fs_name} @ 0x{offset:x}",
                 quiet=True,
@@ -1678,12 +2112,39 @@ def extract_iot_firmware(bin_path):
                 carved, carve_out, f"binwalk raw  {fs_name} @ 0x{offset:x}"
             )
             candidates = _collect_ranked_rootfs_candidates(out_dir, carve_out)
+    elif not candidates and is_dji_blob:
+        _warn("DJI package detected; skipping raw filesystem carving and deep recursive unpacking")
 
     if not candidates:
+        if is_dji_blob:
+            payload_path = _find_dji_android_payload(out_dir)
+            if payload_path:
+                _info(f"DJI Android payload: {os.path.relpath(payload_path, PROJECT_ROOT)}")
+                ensure_dumper()
+                extract_payload(payload_path=payload_path)
+                collect_images()
+                build_rootfs()
+                _ok(f"system     → {os.path.relpath(os.path.join(ROOTFS_DIR, 'system'), PROJECT_ROOT)}")
+                return os.path.join(ROOTFS_DIR, "system")
+
+        bundle_candidates = _collect_ranked_bundle_candidates(out_dir)
+        if bundle_candidates:
+            selected = bundle_candidates[0]
+            _warn("no classic rootfs found; using generic firmware bundle fallback")
+            _ok(f"bundle hint: {os.path.relpath(selected['path'], PROJECT_ROOT)}")
+            _ok(f"analysis root: {os.path.relpath(out_dir, PROJECT_ROOT)}")
+            _ok(f"selected score: {selected['score']}  ({', '.join(selected['why'])})")
+            return out_dir
+        if is_dji_blob and _count_files(out_dir) > 0:
+            _warn("no rootfs found in DJI package; using extracted bundle directory for focused triage")
+            _ok(f"analysis root: {os.path.relpath(out_dir, PROJECT_ROOT)}")
+            return out_dir
+
         print("[FATAL] binwalk ran but no squashfs/cramfs/ubifs root was found.",
               flush=True)
         print(f"        Searched: {out_dir}", flush=True)
-        print("        Checked extracted output and raw filesystem magic offsets.", flush=True)
+        print("        Checked extracted output, raw filesystem magic offsets, and generic bundle candidates.",
+              flush=True)
         sys.exit(1)
 
     rejected = {}
@@ -2149,12 +2610,13 @@ def main():
     if args.dry_run:
         print(flush=True)
         _info("DRY RUN — validating prerequisites only, nothing will execute")
-        ensure_dumper()
         path, input_type = preflight_path, preflight_type
         if path is None:
             path, input_type = resolve_input(args.input, args.type)
         if path is None:
             sys.exit(1)
+        if input_type != INPUT_IOT:
+            ensure_dumper()
         manifest["input"]["resolved"] = _manifest_input_entry(path, input_type)
         manifest["status"] = "dry_run_complete"
         manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
@@ -2212,6 +2674,8 @@ def main():
             handle_img_input(path)
         elif input_type == INPUT_IOT:
             analysis_system_path = handle_iot_input(path)
+            if analysis_system_path == os.path.join(ROOTFS_DIR, "system"):
+                analysis_vendor_path = os.path.join(ROOTFS_DIR, "vendor")
         else:
             print(f"\n[!] Cannot determine file type for: {os.path.basename(path)}",
                   flush=True)

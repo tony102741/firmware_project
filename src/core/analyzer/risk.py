@@ -219,7 +219,7 @@ def analyze_services(services, root_path):
         seen_exec.add(svc["exec"])
 
         path = resolve_path(svc["exec"], root_path)
-        if not os.path.exists(path) or not is_elf(path):
+        if not os.path.exists(path):
             continue
 
         scanned += 1
@@ -282,7 +282,17 @@ def analyze_services(services, root_path):
         taint_confidence = 0.3   # default: string-based
 
         if imports:
-            cg = build_call_graph(path)
+            try:
+                file_size = os.path.getsize(path)
+            except OSError:
+                file_size = 0
+
+            skip_graph = (
+                file_size > 8 * 1024 * 1024 or
+                path.lower().endswith(".so")
+            )
+
+            cg = None if skip_graph else build_call_graph(path)
             if cg:
                 flow_score, flow_type, path_len, taint_confidence = \
                     analyze_dataflow_with_graph(cg, binary_path=path)
