@@ -1,4 +1,5 @@
 import os
+import re as _re
 import time
 
 from .strings_analyzer import extract_strings, filter_keywords
@@ -45,6 +46,137 @@ def is_elf(path):
             return f.read(4) == b"\x7fELF"
     except Exception:
         return False
+
+
+# ── Shell script detection ──────────────────────────────────────────────────
+
+def is_shell_script(path):
+    """Return True if file starts with a Unix shebang (#!)."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"#!"
+    except Exception:
+        return False
+
+
+# Tier 3: direct code execution or firewall rule injection — highest risk
+# Tier 2: network fetch / filesystem destructive ops — medium risk
+# Tier 1: config write / informational — lowest risk
+# Findings are collected highest-tier-first so sinks report the most
+# dangerous command context rather than whichever matched first.
+_SHELL_CMD_TIERS = [
+    (3, _re.compile(
+        r'(?:^|[;|&`({\s])(?:eval|iptables|ip6tables|ebtables|nft|iwpriv)'
+        r'[^#\n"\']*\$(?!\{|\()\w+',
+        _re.IGNORECASE | _re.MULTILINE,
+    )),
+    (2, _re.compile(
+        r'(?:^|[;|&`({\s])(?:curl|wget|rm\s|chmod|chown|popen|system)'
+        r'[^#\n"\']*\$(?!\{|\()\w+',
+        _re.IGNORECASE | _re.MULTILINE,
+    )),
+    (1, _re.compile(
+        r'(?:^|[;|&`({\s])(?:ifconfig|uci\s|nvram\s|ping\s|echo\s|printf\s)'
+        r'[^#\n"\']*\$(?!\{|\()\w+',
+        _re.IGNORECASE | _re.MULTILINE,
+    )),
+]
+
+_SHELL_SKIP_VARS = {
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    '@', '#', '?', '!', '-', '_',
+    'PATH', 'HOME', 'USER', 'SHELL', 'IFS', 'PWD', 'OPTARG', 'OPTIND',
+    # Single-letter loop iterators ($a, $f, $i, $j, $n, $x, etc.)
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+    'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+}
+
+# Temp/internal path variable suffixes: vars like $TMP_FILE, $CA_PATH,
+# $EASYRSA_PKI are set from hardcoded internal paths, not user input.
+# In a tier-2 rm context these produce false positives; exclude from scoring.
+_SHELL_INTERNAL_PATH_SUFFIXES = (
+    '_file', '_filename', '_path', '_dir', '_tmp', '_log', '_pid', '_lock',
+    '_cert', '_key', '_pki', '_crt', '_root', '_base', '_sdkroot',
+)
+
+
+def _is_internal_path_var(var_name):
+    vl = var_name.lower()
+    if vl.startswith('tmp') or vl.startswith('rand'):
+        return True
+    if len(vl) > 4 and vl.endswith('file'):   # e.g. RANDFILE, LOCKFILE
+        return True
+    return any(vl.endswith(s) for s in _SHELL_INTERNAL_PATH_SUFFIXES)
+
+_SHELL_EXTERNAL_PATTERNS = [
+    'ubus', 'uci get', 'nvram get', 'config_get',
+    'http', 'param', 'stdin', 'read ',
+]
+
+
+def _analyze_shell_script(path, svc):
+    """Detect unquoted $var injection in dangerous shell command contexts.
+
+    Collects findings per danger tier (3=highest, 1=lowest) so that the
+    reported sinks and score reflect the worst-case exploitation context,
+    not the first regex match.
+    """
+    try:
+        with open(path, 'r', errors='replace') as f:
+            content = f.read()
+    except Exception:
+        return None
+
+    findings_by_tier = {3: [], 2: [], 1: []}
+    seen_by_tier = {3: set(), 2: set(), 1: set()}
+
+    for tier, regex in _SHELL_CMD_TIERS:
+        for m in regex.finditer(content):
+            line = m.group().strip()
+            for var_m in _re.finditer(r'\$(?!\{|\()(\w+)', line):
+                var_name = var_m.group(1)
+                if var_name in _SHELL_SKIP_VARS:
+                    continue
+                if var_name not in seen_by_tier[tier]:
+                    findings_by_tier[tier].append(
+                        {'var': var_name, 'line': line[:120], 'tier': tier})
+                    seen_by_tier[tier].add(var_name)
+
+    # Merge highest-tier first so sinks list prioritises most dangerous context
+    all_findings = findings_by_tier[3] + findings_by_tier[2] + findings_by_tier[1]
+    if not all_findings:
+        return None
+
+    # Score: base 6, +4 per unique tier-3 var (cap 2), +2 per tier-2 var (cap 2)
+    # Tier-1 only → score stays 6 → LOW level → excluded from visible output
+    # Tier-2 rm/chmod of internal temp-path vars ($TMP_FILE, $CA_PATH, etc.)
+    # are excluded from scoring — these are cleanup ops on hardcoded paths.
+    n3 = len(set(f['var'] for f in findings_by_tier[3]))
+    n2 = len(set(
+        f['var'] for f in findings_by_tier[2]
+        if not _is_internal_path_var(f['var'])
+    ))
+    flow_score = 6 + min(8, n3 * 4) + min(4, n2 * 2)
+
+    content_lower = content.lower()
+    has_external = any(p in content_lower for p in _SHELL_EXTERNAL_PATTERNS)
+    if n3 > 0:
+        taint_confidence = 0.55 if has_external else 0.45
+    elif n2 > 0:
+        taint_confidence = 0.50 if has_external else 0.38
+    else:
+        taint_confidence = 0.35 if has_external else 0.30
+
+    return {
+        'findings':         all_findings,
+        'var_names':        [f['var'] for f in all_findings[:10]],
+        'templates':        [f['line'] for f in all_findings[:5]],
+        'all_sinks':        [f"unquoted ${f['var']} in: {f['line'][:60]}"
+                             for f in all_findings[:3]],
+        'taint_confidence': taint_confidence,
+        'flow_type':        'shell_var_injection',
+        'flow_score':       flow_score,
+    }
 
 
 # ── Path resolution ─────────────────────────────────────────────────────────
@@ -236,6 +368,7 @@ def _flow_confidence(flow_score, flow_type=None, sinks=None):
 def analyze_services(services, root_path):
     results = []
     seen_exec = set()
+    seen_real = set()   # resolved physical paths — deduplicates busybox symlinks
     total = len(services)
     scanned = 0
     last_print_time = 0.0   # throttle progress output to ~100ms intervals
@@ -257,6 +390,13 @@ def analyze_services(services, root_path):
         if not os.path.exists(path):
             continue
 
+        # Resolve symlinks so busybox multi-call applets (adduser, awk, ping…)
+        # that all point to the same binary are only analysed once.
+        real = os.path.realpath(path)
+        if real in seen_real:
+            continue
+        seen_real.add(real)
+
         scanned += 1
         now = time.time()
         if now - last_print_time >= 0.1:   # at most 10 redraws/second
@@ -264,6 +404,66 @@ def analyze_services(services, root_path):
             pct = scanned * 100 // total if total else 0
             print(f"\r  [SCAN] {scanned}/{total} ({pct:3d}%)  {svc['name']:<40}",
                   end="", flush=True)
+
+        # ── Shell script fast path ────────────────────────────────────────────
+        # Route shell scripts through a dedicated unquoted-var analyzer instead
+        # of the ELF import pipeline, which produces false sinks (shebang lines,
+        # error-log templates) and fixed taint_confidence for these files.
+
+        if is_shell_script(path):
+            shell = _analyze_shell_script(path, svc)
+            if shell is None:
+                continue
+            svc_source = svc.get("source", "system")
+            sh_score = shell['flow_score']
+            if sh_score >= 15:
+                sh_level = "HIGH"
+            elif sh_score >= 8:
+                sh_level = "MEDIUM"
+            else:
+                sh_level = "LOW"
+            _token_map[path] = {'write': set(), 'read': set(shell['var_names']),
+                                 'has_sink': True, 'has_frontend': False}
+            result = {
+                "name":               svc["name"],
+                "exec":               svc["exec"],
+                "binary_path":        path,
+                "source":             svc_source,
+                "input_type":         "http",
+                "priv":               svc.get("user", "root"),
+                "flow_type":          shell['flow_type'],
+                "confidence":         "LOW",
+                "taint_confidence":   round(shell['taint_confidence'], 2),
+                "sinks":              shell['all_sinks'][:2],
+                "all_sinks":          shell['all_sinks'],
+                "attack_surface":     [],
+                "fuzzing_hints":      [],
+                "evidence":           shell['var_names'][:3],
+                "score":              sh_score,
+                "level":              sh_level,
+                "controllability":    "HIGH",
+                "memory_impact":      "NONE",
+                "validation_penalty": 0.0,
+                "parser_patterns":    0,
+                "parser_hits":        [],
+                "cross_chain":        None,
+                "hardening":          {},
+                "injection_templates": shell['templates'][:2],
+                "endpoints":          [],
+                "handler_symbols":    [],
+                "auth_bypass":        "UNKNOWN",
+                "config_keys":        shell['var_names'][:15],
+                "toctou_risk":        False,
+                "actionability_bonus": 0,
+                "missing_links":      [],
+                "plausibility_bonus": 0,
+                "vuln_summary": (
+                    f"Shell script unquoted variable injection via "
+                    f"{', '.join(shell['var_names'][:3])}"
+                ),
+            }
+            results.append(result)
+            continue
 
         # ── Stage 1: ELF import-based fast filter ────────────────────────────
         # Parse the import table first. This is cheap (pure struct unpacking)

@@ -281,8 +281,9 @@ def run(cmd, env=None, timeout=None, label=None, quiet=False):
 
     label — human-readable description printed before the command runs.
             If omitted and quiet=False, the raw command is printed.
-    quiet — suppress the tool's own stdout.
-            stderr is always passed through so real errors remain visible.
+    quiet — suppress both stdout and stderr of the tool.
+            Use for extraction tools (binwalk, ubireader, 7z) whose
+            warnings/progress output would pollute the pipeline log.
 
     sys.stdout is flushed before the subprocess starts to prevent Python's
     output buffer from appearing after the subprocess's direct fd writes.
@@ -296,6 +297,7 @@ def run(cmd, env=None, timeout=None, label=None, quiet=False):
         return subprocess.run(
             cmd, shell=True, env=env, timeout=timeout,
             stdout=subprocess.DEVNULL if quiet else None,
+            stderr=subprocess.DEVNULL if quiet else None,
         )
     except subprocess.TimeoutExpired:
         print(f"\n[FATAL] Command timed out after {timeout}s", flush=True)

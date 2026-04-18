@@ -78,11 +78,20 @@ def detect_sinks_from_imports(imports_dict):
     return results
 
 
+_ERR_LOG_INDICATORS = (
+    ': err:', 'err:', ': error:', 'error:', 'failed:', 'failed in ',
+    'cannot ', 'unable to', '(unexpected)', 'unexpected:',
+)
+
+
 def is_valid_sink(s, tier):
     """
     Filter out common false-positive sink strings.
 
     Rules:
+    - Reject shebang lines (#!/bin/sh) — init script headers, not sinks.
+    - Reject error-log format strings — sink keyword is in the error message
+      template, not the actual call site.
     - Reject C++ mangled symbols (_Z prefix, destructor patterns).
     - Reject long strings (> 100 chars) — typically log/debug messages.
     - Reject plain prose (spaces present but no parenthesis) unless it
@@ -91,6 +100,25 @@ def is_valid_sink(s, tier):
       in dataflow.py; always return False here to defer that decision.
     """
     l = s.lower()
+
+    # Shebang lines are init script headers, never sinks
+    if s.startswith('#!'):
+        return False
+
+    # Passwd-file login shell entries: "-/bin/sh", ":/bin/sh", "/bin/false"
+    # These are user account definitions, not command execution sinks.
+    if s in ('-/bin/sh', ':/bin/sh', '/bin/false', '/bin/nologin',
+             '/sbin/nologin', '/dev/null'):
+        return False
+    if s.startswith('-/') or s.startswith(':/'):
+        return False
+
+    # Error-log format strings: sink keyword appears inside a log message
+    # template (e.g. "%s: ERR: [%s] execvp(%s): %s"). The sink name is
+    # mentioned as a format argument in an error path, not as a direct call.
+    if ' ' in s and '%' in s and len(s) > 15:
+        if any(p in l for p in _ERR_LOG_INDICATORS):
+            return False
 
     if len(l) > 100:
         return False

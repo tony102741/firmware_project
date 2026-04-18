@@ -4,7 +4,7 @@ import re
 import argparse
 import json
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Ensure src/core/ is on sys.path so that 'from parser.init_parser import ...'
 # resolves to src/core/parser/init_parser.py regardless of how this script is
@@ -1597,7 +1597,7 @@ def _emit_analysis_bundle(mode, mode_reason, result, *, output_path=None, dossie
             print(f"  ▸ {t['name']:<28}  {t['dest']}", flush=True)
 
     bundle = {
-        "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "run_id": _RUN_ID,
         "run_dir": _safe_relpath(_RUN_DIR),
         "input": {

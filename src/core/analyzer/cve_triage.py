@@ -75,6 +75,15 @@ _REAL_EXEC_SINKS = frozenset({
     "/bin/sh", "sh -c", "do_system", "twsystem",
 })
 
+# Memory-corruption / format-string sinks — real sinks for buffer_overflow /
+# format_string flow types.  fscanf/sprintf/strcpy are not exec calls but they
+# ARE dangerous operations when attacker-controlled data reaches them.
+_REAL_MEMORY_SINKS = frozenset({
+    "fscanf", "scanf(", "sscanf(", "gets(",
+    "sprintf(", "vsprintf(", "strcpy(", "strcat(",
+    "snprintf() failed",   # explicit snprintf overflow indicator string
+})
+
 # ── High-value endpoint fingerprints ─────────────────────────────────────────
 
 # Endpoint substrings that confirm a specific, named HTTP attack surface.
@@ -166,10 +175,20 @@ def is_busybox_noise(candidate):
 
 
 def _has_real_sink(candidate):
-    """Return True if any sink is a genuinely dangerous operation."""
+    """Return True if any sink is a genuinely dangerous operation.
+
+    Covers both exec-class sinks (command injection / RCE) and
+    memory-class sinks (buffer overflow / format string).  The latter
+    are valid only when the candidate's flow_type confirms the context.
+    """
+    flow = (candidate.get("flow_type") or "").lower()
+    is_mem_flow = flow in ("buffer_overflow", "format_string", "heap_overflow")
+
     for s in (candidate.get("all_sinks") or []):
         sl = s.lower()
         if any(h in sl for h in _REAL_EXEC_SINKS):
+            return True
+        if is_mem_flow and any(h in sl for h in _REAL_MEMORY_SINKS):
             return True
     return False
 
