@@ -3,6 +3,7 @@ import sys
 import re
 import argparse
 import json
+import shutil
 from datetime import datetime
 
 # Ensure src/core/ is on sys.path so that 'from parser.init_parser import ...'
@@ -21,6 +22,7 @@ from scanner.scan_web import scan_web_surface
 from analyzer.verify_flow import verify_exploitable_flows
 from analyzer.reach_check import analyze_reachability
 from analyzer.strings_analyzer import extract_strings
+from analyzer.cve_triage import select_cve_candidates, explain_triage
 
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -296,7 +298,19 @@ def _is_iot_firmware(system_path):
     return True
 
 
-def _collect_iot_services(system_path, web_bins):
+def _is_openwrt_web_script(exec_path):
+    lower = (exec_path or "").lower()
+    return (
+        lower.startswith("/www/cgi-bin/")
+        or "/usr/lib/lua/luci/controller/" in lower
+        or "/usr/lib/lua/luci/apprpc/" in lower
+        or "/usr/lib/lua/luci/jsonrpcbind/" in lower
+        or lower.endswith("/luci/sgi/uhttpd.lua")
+        or "/usr/libexec/rpcd/" in lower
+    )
+
+
+def _collect_iot_services(system_path, web_bins, cgi_files=None):
     """
     Synthesize service entries for ELF executables in standard IoT binary
     directories.  Web-exposed binaries get a world-accessible socket marker
@@ -308,6 +322,7 @@ def _collect_iot_services(system_path, web_bins):
         os.path.join("usr", "sbin"),
     ]
     web_set  = {os.path.normpath(p) for p in web_bins}
+    cgi_files = cgi_files or []
     services = []
     seen     = set()
 
@@ -343,6 +358,25 @@ def _collect_iot_services(system_path, web_bins):
         seen.add(exec_path)
         services.append({
             "name":   os.path.basename(wb),
+            "exec":   exec_path,
+            "user":   "root",
+            "socket": [{"perm": "666"}],
+            "source": "vendor",
+        })
+
+    # OpenWrt/LuCI firmware frequently routes HTTP requests through Lua
+    # controllers or rpcd helpers rather than standalone CGI ELF binaries.
+    # Model those scripts as web-reachable service entries so the risk analyzer
+    # can score them instead of silently dropping the entire web stack.
+    for script_path in sorted({os.path.normpath(p) for p in cgi_files}):
+        if not os.path.isfile(script_path):
+            continue
+        exec_path = "/" + os.path.relpath(script_path, system_path)
+        if exec_path in seen or not _is_openwrt_web_script(exec_path):
+            continue
+        seen.add(exec_path)
+        services.append({
+            "name":   os.path.basename(script_path),
             "exec":   exec_path,
             "user":   "root",
             "socket": [{"perm": "666"}],
@@ -963,25 +997,147 @@ def _result_path(result):
 
 
 def _next_steps_for_result(result, review=None, exploit_paths=None):
-    path = _result_path(result)
-    steps = [
-        f"Open {path} in Ghidra and inspect the path into {', '.join((result.get('all_sinks') or result.get('sinks') or ['?'])[:2])}.",
-    ]
+    """
+    Generate Ghidra-specific, ordered analysis steps for Stage-2 review.
 
-    if review and review.get("frontend"):
+    Priority:
+      1. Confirmed function VA / handler symbol → "decompile this exact function"
+      2. Config key tracing → "trace nvram_get('wan_ip') to sink"
+      3. Injection template → "search string in Ghidra"
+      4. Hardening context → exploitation difficulty notes
+      5. Cross-binary chain → "verify writer + reader binary pair"
+      6. Entry point / PoC sketch
+    """
+    steps  = []
+    path   = _result_path(result)
+    sinks  = list((result.get('all_sinks') or result.get('sinks') or []))[:2]
+    sink_s = ', '.join(sinks) if sinks else 'dangerous function'
+
+    # ── 1. Start point in Ghidra ──────────────────────────────────────────────
+    verified     = result.get('verified_flows') or []
+    confirmed    = [f for f in verified if f.get('verdict') in ('CONFIRMED', 'LIKELY')]
+    handler_syms = result.get('handler_symbols') or []
+    templates    = result.get('injection_templates') or []
+
+    if confirmed:
+        f   = confirmed[0]
+        va  = f'0x{f["func_va"]:x}' if isinstance(f.get('func_va'), int) else None
+        sym = f.get('func_sym')
+        ref = sym or va
+        verdict = 'CONFIRMED' if f.get('verdict') == 'CONFIRMED' else 'LIKELY'
+        if ref:
+            steps.append(
+                f"Decompile `{ref}` in Ghidra "
+                f"[{verdict} → {f.get('sink_sym', sink_s)}]. "
+                f"This is the confirmed vulnerable function."
+            )
+    elif handler_syms:
         steps.append(
-            f"Trace request entry from {review['frontend'][0]} into {os.path.basename(path or result.get('name', 'binary'))}."
+            f"In Ghidra search Functions → `{handler_syms[0]}`. "
+            f"Decompile and trace the call chain to {sink_s}."
         )
-    if review and review.get("params"):
-        steps.append(f"Check whether parameters {', '.join(review['params'][:3])} reach argv/env parsing.")
-    if exploit_paths:
-        ep = exploit_paths[0].get("endpoint") or "(unknown endpoint)"
-        steps.append(f"Validate the reachable endpoint {ep} against the reported flow.")
-    elif result.get("web_exposed"):
-        steps.append("Confirm handler routing and auth checks from the web entrypoint before sink reachability review.")
+    elif templates:
+        short = templates[0][:55].rstrip()
+        steps.append(
+            f"In Ghidra search Strings for `{short}`. "
+            f"The function referencing it leads to {sink_s}."
+        )
     else:
-        steps.append("Verify whether the candidate is actually externally reachable before spending time on deep taint review.")
-    return steps[:4]
+        steps.append(
+            f"Load `{os.path.basename(path or '')}` in Ghidra. "
+            f"Search Imports for {sink_s} and trace all callers."
+        )
+
+    # ── 2. Config key tracing ─────────────────────────────────────────────────
+    config_keys = result.get('config_keys') or []
+    if config_keys:
+        key_sample = ', '.join(f'"{k}"' for k in config_keys[:3])
+        steps.append(
+            f"Trace `nvram_get`/`mib_get` calls with keys {key_sample}. "
+            f"Confirm the returned value reaches {sink_s} without sanitisation."
+        )
+
+    # ── 3. HTTP parameter / exploit entry point ───────────────────────────────
+    if exploit_paths:
+        ep    = exploit_paths[0].get('endpoint', '?')
+        param = exploit_paths[0].get('input_param', '?')
+        auth  = exploit_paths[0].get('auth_required')
+        auth_s = 'UNAUTHENTICATED' if auth is False else 'requires auth'
+        steps.append(
+            f"Craft PoC: `{ep}` [{auth_s}] — "
+            f"inject payload in `{param}` parameter."
+        )
+    elif review and review.get('params'):
+        params = ', '.join(review['params'][:3])
+        steps.append(
+            f"HTTP params `{params}` are attacker-controlled. "
+            f"Confirm they reach {sink_s} without sanitisation."
+        )
+    elif result.get('web_exposed'):
+        steps.append(
+            "Confirm HTTP handler routing and auth enforcement "
+            "before tracing to sink."
+        )
+
+    # ── 4. Hardening exploitation notes ──────────────────────────────────────
+    h = result.get('hardening') or {}
+    if h:
+        notes = []
+        if not h.get('canary') and not h.get('pie'):
+            notes.append('no canary + no PIE → overflow → ROP at fixed addresses')
+        elif not h.get('canary'):
+            notes.append('no stack canary → overflows not detected at runtime')
+        elif not h.get('pie'):
+            notes.append('no PIE → static addresses ease ROP')
+        if not h.get('relro'):
+            notes.append('no RELRO → GOT overwrite viable')
+        if notes:
+            steps.append('Exploitation: ' + '; '.join(notes) + '.')
+
+    # ── 5. Cross-binary chain ─────────────────────────────────────────────────
+    cc = result.get('cross_chain')
+    if cc and cc.get('writer') and cc.get('shared_keys'):
+        writer = os.path.basename(cc['writer'])
+        keys   = ', '.join(f'"{k}"' for k in cc['shared_keys'][:3])
+        steps.append(
+            f"Cross-binary chain: `{writer}` writes {keys}; "
+            f"this binary reads and passes to {sink_s}. "
+            f"Verify the writer binary in Ghidra too."
+        )
+
+    # ── 6. Missing-link targeted steps ────────────────────────────────────────
+    # For each unconfirmed chain element, generate a specific investigation step.
+    # These map directly to the review_checklist gates so analysts know exactly
+    # what evidence would upgrade this candidate to CONFIRMED.
+    for link in (result.get('missing_links') or []):
+        if len(steps) >= 5:
+            break
+        if link == "exact_input_unknown":
+            steps.append(
+                "Identify the specific form parameter that reaches the sink. "
+                "Check the HTML frontend for field names; search those names in "
+                "Ghidra to confirm they appear in the same function as the sink call."
+            )
+        elif link == "auth_boundary_unknown":
+            steps.append(
+                "Confirm auth requirement: locate the session/cookie check before "
+                "the vulnerable handler in Ghidra. If absent, the path may be "
+                "pre-auth; if present, test whether the check is bypassable."
+            )
+        elif link == "dispatch_unknown":
+            steps.append(
+                "Verify how this binary is invoked from the web stack. "
+                "Search CGI scripts and web configs for the binary name, or trace "
+                "the HTTP dispatcher's handler table in Ghidra."
+            )
+        elif link == "chain_gap_unknown":
+            steps.append(
+                "Identify the intermediate hop between input and sink. "
+                "Look for nvram_get/mib_get/config_get calls immediately before "
+                "the sink; confirm the key was written with attacker-controlled data."
+            )
+
+    return steps[:5]
 
 
 def _build_result_snapshot(result, cgi_files=None, exploit_paths=None):
@@ -1015,6 +1171,41 @@ def _build_result_snapshot(result, cgi_files=None, exploit_paths=None):
         "manual_review": _json_safe(review),
         "verified_flows": _json_safe(verified),
         "exploit_paths": _json_safe(exploit_paths or []),
+
+        # ── Gap 1–6 exploit-context fields ───────────────────────────────────
+        "vuln_summary":        result.get("vuln_summary") or "",
+        "hardening":           _json_safe(result.get("hardening") or {}),
+        "endpoints":           list(result.get("endpoints") or []),
+        "injection_templates": list(result.get("injection_templates") or []),
+        "config_keys":         list(result.get("config_keys") or []),
+        "handler_symbols":     list(result.get("handler_symbols") or []),
+        "auth_bypass":         result.get("auth_bypass", "required"),
+        "toctou_risk":         bool(result.get("toctou_risk", False)),
+        "cross_chain":         _json_safe(result.get("cross_chain")),
+
+        # Actionability and missing-link assessment.
+        "actionability_bonus": result.get("actionability_bonus", 0),
+        "missing_links":       list(result.get("missing_links") or []),
+        "plausibility_bonus":  result.get("plausibility_bonus", 0),
+
+        # CVE triage score — mirrors bundle["cve_candidates"] ranking key.
+        "triage_score": explain_triage(result)[0],
+
+        # Structured Ghidra hints — ready for direct MCP tool call construction.
+        "ghidra_hints": {
+            "binary_path":     _result_path(result),
+            "search_functions": list(result.get("handler_symbols") or [])[:3],
+            "search_strings":  list(result.get("injection_templates") or [])[:2],
+            "nvram_keys":      list(result.get("config_keys") or [])[:5],
+            "sink_imports":    list((result.get("all_sinks") or []))[:3],
+            "confirmed_vas": [
+                hex(f["func_va"]) if isinstance(f.get("func_va"), int) else f.get("func_sym")
+                for f in (result.get("verified_flows") or [])
+                if f.get("verdict") in ("CONFIRMED", "LIKELY")
+                   and (f.get("func_va") or f.get("func_sym"))
+            ][:3],
+        },
+
         "next_steps": _next_steps_for_result(result, review=review, exploit_paths=exploit_paths),
     }
 
@@ -1074,44 +1265,233 @@ def _write_candidate_dossiers(results, output_dir, cgi_files=None, exploit_candi
         if not _is_actionable_dossier_candidate(snapshot):
             continue
         md_path = os.path.join(output_dir, f"{snapshot['id']}.md")
+        # ── Header ───────────────────────────────────────────────────────────
+        vuln_sum = snapshot.get('vuln_summary') or ''
         lines = [
             f"# {snapshot['name']}",
             "",
-            f"- id: `{snapshot['id']}`",
-            f"- level: `{snapshot['level']}`",
-            f"- score: `{snapshot['score']}`",
-            f"- binary: `{snapshot['binary_path']}`",
-            f"- flow: `{snapshot['flow_type'] or 'none'}`",
-            f"- sinks: `{', '.join(snapshot['all_sinks']) if snapshot['all_sinks'] else 'none'}`",
+            f"> {vuln_sum}" if vuln_sum else "",
+            "",
+            f"- **id**: `{snapshot['id']}`",
+            f"- **level**: `{snapshot['level']}`  score: `{snapshot['score']}`",
+            f"- **binary**: `{snapshot['binary_path']}`",
+            f"- **flow**: `{snapshot['flow_type'] or 'none'}`  "
+            f"confidence: `{snapshot.get('confidence', '?')}`  "
+            f"taint: `{snapshot.get('taint_confidence', 0):.2f}`",
+            f"- **sinks**: `{', '.join(snapshot['all_sinks']) if snapshot['all_sinks'] else 'none'}`",
+            f"- **controllability**: `{snapshot.get('controllability', '?')}`  "
+            f"memory impact: `{snapshot.get('memory_impact', '?')}`",
         ]
+        lines = [l for l in lines if l != ""]   # drop blank conditional lines
+
+        # ── Ghidra Analysis Brief ────────────────────────────────────────────
+        # This section is the ready-to-paste context for Claude Code + Ghidra.
+        h = snapshot.get('hardening') or {}
+        hard_parts = []
+        if not h.get('canary'): hard_parts.append('no canary')
+        if not h.get('pie'):    hard_parts.append('no PIE')
+        if not h.get('relro'):  hard_parts.append('no RELRO')
+        hard_str = ' · '.join(hard_parts) + ' → unprotected binary' if hard_parts else 'hardened'
+
+        auth_val = snapshot.get('auth_bypass', 'required')
+        auth_str = {
+            'none':       'UNAUTHENTICATED (no auth guard)',
+            'bypassable': 'BYPASSABLE (HNAP/no-auth hint)',
+            'required':   'authenticated required',
+        }.get(auth_val, auth_val)
+
+        ep_list      = snapshot.get('endpoints') or []
+        tmpl_list    = snapshot.get('injection_templates') or []
+        key_list     = snapshot.get('config_keys') or []
+        sym_list     = snapshot.get('handler_symbols') or []
+        hints        = snapshot.get('ghidra_hints') or {}
+        conf_vas     = hints.get('confirmed_vas') or []
+        search_fns   = hints.get('search_functions') or []
+        search_strs  = hints.get('search_strings') or []
+
+        start_hint = (
+            f"decompile `{conf_vas[0]}` (confirmed function)" if conf_vas else
+            f"search Functions → `{search_fns[0]}`"          if search_fns else
+            f"search Strings → `{search_strs[0][:45]}`"      if search_strs else
+            f"find {', '.join((snapshot.get('all_sinks') or [])[:1])} in Imports, trace callers"
+        )
+        exploit_paths_snap = snapshot.get('exploit_paths') or []
+        entry_str = '(unknown)'
+        if exploit_paths_snap:
+            ep0    = exploit_paths_snap[0]
+            ep_url = ep0.get('endpoint', '?')
+            ep_aut = 'UNAUTHENTICATED' if ep0.get('auth_required') is False else 'auth'
+            ep_par = ep0.get('input_param', '?')
+            entry_str = f"{ep_url} [{ep_aut}] param `{ep_par}`"
+        elif ep_list:
+            entry_str = ep_list[0]
+
+        chain_hint = ''
+        review_snap = snapshot.get('manual_review') or {}
+        params = review_snap.get('params') or []
+        if params and key_list:
+            chain_hint = (
+                f"HTTP `{params[0]}` → nvram_set(`{key_list[0]}`) "
+                f"→ [restart] → nvram_get(`{key_list[0]}`) "
+                f"→ {(snapshot.get('all_sinks') or ['sink'])[0]}"
+            )
+        elif key_list:
+            chain_hint = (
+                f"nvram_get(`{key_list[0]}`) "
+                f"→ {(snapshot.get('all_sinks') or ['sink'])[0]}"
+            )
+
+        lines += [
+            "",
+            "## Ghidra Analysis Brief",
+            f"- **Vulnerability**: {vuln_sum}",
+            f"- **Start**: {start_hint}",
+        ]
+        if chain_hint:
+            lines.append(f"- **Trace**: {chain_hint}")
+        lines += [
+            f"- **Protections**: {hard_str}",
+            f"- **Entry**: {entry_str}",
+        ]
+
+        # ── Triage Notes ─────────────────────────────────────────────────────
+        # Explains why this candidate ranked here and what is still unknown.
+        # Matches the information a human / Claude analyst wants immediately.
+        act_bonus   = snapshot.get('actionability_bonus', 0)
+        miss_links  = snapshot.get('missing_links') or []
+        plaus_bonus = snapshot.get('plausibility_bonus', 0)
+
+        _ACT_REASON = []
+        if act_bonus >= 8:
+            _ACT_REASON.append("named function visible in strings (concrete Ghidra target)")
+        if act_bonus >= 14:
+            _ACT_REASON.append("high-information sink artifact (reveals exact operation)")
+        elif act_bonus >= 6:
+            _ACT_REASON.append("explicit sink string carries operation detail")
+        _specific_ep_tokens = ("/boafrm/", "/goform/", "cstecgi", "/hnap1/")
+        if any(tok in (ep or "").lower()
+               for ep in ep_list
+               for tok in _specific_ep_tokens):
+            _ACT_REASON.append("specific form-handler endpoint named")
+        if act_bonus > 0 and not _ACT_REASON:
+            _ACT_REASON.append(f"actionability signals present (bonus={act_bonus})")
+
+        _MISS_LABEL = {
+            "exact_input_unknown":   "exact input field not yet mapped to sink",
+            "auth_boundary_unknown": "auth boundary not yet confirmed",
+            "dispatch_unknown":      "dispatch path not yet confirmed",
+            "chain_gap_unknown":     "intermediate hop still inferred only",
+            "too_many_unknowns":     "multiple chain elements unconfirmed (score penalised)",
+        }
+
+        # Plausibility note: explain what the plausibility adjustment reflects.
+        if plaus_bonus >= 3:
+            _plaus_note = f"+{plaus_bonus} (direct-path templates; tightly coupled evidence)"
+        elif plaus_bonus > 0:
+            _plaus_note = f"+{plaus_bonus} (some direct-path evidence)"
+        elif plaus_bonus == 0:
+            _plaus_note = "0 (neutral — no strong evidence either way)"
+        elif plaus_bonus >= -3:
+            _plaus_note = f"{plaus_bonus} (error/crash-path evidence; uncertain execution path)"
+        else:
+            _plaus_note = f"{plaus_bonus} (evidence largely from error handlers; sanitization likely)"
+
+        triage_lines = ["", "## Triage Notes"]
+        if _ACT_REASON:
+            triage_lines.append(f"- **Why interesting**: {'; '.join(_ACT_REASON)}")
+        else:
+            triage_lines.append("- **Why interesting**: structural signals only (no named-function evidence)")
+        if miss_links:
+            visible = [l for l in miss_links if l != "too_many_unknowns"]
+            labels  = [_MISS_LABEL.get(l, l) for l in visible]
+            triage_lines.append(f"- **Missing links**: {'; '.join(labels) if labels else 'none'}")
+            if "too_many_unknowns" in miss_links:
+                triage_lines.append("- **Score penalty**: −25% applied (too many unconfirmed links)")
+        else:
+            triage_lines.append("- **Missing links**: none identified")
+        triage_lines.append(f"- **Plausibility**: {_plaus_note}")
+        lines += triage_lines
+
+        # ── Exploit Context ──────────────────────────────────────────────────
+        lines += [
+            "",
+            "## Exploit Context",
+            f"- **Hardening**: {hard_str}",
+            f"- **Auth**: {auth_str}",
+        ]
+        if ep_list:
+            lines.append(f"- **Endpoints**: {', '.join(ep_list[:4])}")
+        if tmpl_list:
+            lines.append(f"- **Injection template**: `{tmpl_list[0][:80]}`")
+            for t in tmpl_list[1:2]:
+                lines.append(f"- **Injection template**: `{t[:80]}`")
+        if key_list:
+            lines.append(f"- **Config keys**: {', '.join(key_list[:8])}")
+        if sym_list:
+            lines.append(f"- **Handler symbols**: {', '.join(sym_list[:5])}")
+        if snapshot.get('toctou_risk'):
+            lines.append("- **TOCTOU risk**: check-then-use race condition pattern detected")
+
+        # ── Manual Review ────────────────────────────────────────────────────
         review = snapshot.get("manual_review") or {}
         if review:
             lines.extend([
                 "",
                 "## Manual Review",
-                f"- frontend: `{', '.join(review.get('frontend') or []) or 'none'}`",
-                f"- params: `{', '.join(review.get('params') or []) or 'none'}`",
-                f"- auth hints: `{', '.join(review.get('auth') or []) or 'none'}`",
-                f"- control: `{review.get('control') or 'unknown'}`",
+                f"- **frontend**: `{', '.join(review.get('frontend') or []) or 'none'}`",
+                f"- **params**: `{', '.join(review.get('params') or []) or 'none'}`",
+                f"- **auth hints**: `{', '.join(review.get('auth') or []) or 'none'}`",
+                f"- **control**: `{review.get('control') or 'unknown'}`",
             ])
+
+        # ── Verified Flows ───────────────────────────────────────────────────
         if snapshot["verified_flows"]:
             lines.append("")
             lines.append("## Verified Flows")
             for flow in snapshot["verified_flows"][:5]:
+                va_str = f" @ {hex(flow['func_va'])}" if isinstance(flow.get('func_va'), int) else ""
                 lines.append(
-                    f"- `{flow.get('verdict')}` {flow.get('func_sym') or '(heuristic)'} -> {flow.get('sink_sym')} :: {flow.get('flow_str')}"
+                    f"- `{flow.get('verdict')}` "
+                    f"{flow.get('func_sym') or '(heuristic)'}{va_str}"
+                    f" → {flow.get('sink_sym')} :: {flow.get('flow_str')}"
                 )
+
+        # ── Reachability ─────────────────────────────────────────────────────
         if snapshot["exploit_paths"]:
             lines.append("")
             lines.append("## Reachability")
             for exploit in snapshot["exploit_paths"][:5]:
-                lines.append(
-                    f"- `{exploit.get('verdict')}` endpoint `{exploit.get('endpoint') or '?'}` param `{exploit.get('input_param') or '?'}` auth `{exploit.get('auth_required')}`"
+                auth_lbl = (
+                    'UNAUTHENTICATED' if exploit.get('auth_required') is False
+                    else 'auth-required' if exploit.get('auth_required')
+                    else 'auth-unknown'
                 )
+                lines.append(
+                    f"- `{exploit.get('verdict')}` "
+                    f"endpoint `{exploit.get('endpoint') or '?'}` "
+                    f"param `{exploit.get('input_param') or '?'}` "
+                    f"[{auth_lbl}]"
+                )
+
+        # ── Cross-Binary Chain ───────────────────────────────────────────────
+        cc = snapshot.get('cross_chain')
+        if cc and cc.get('writer'):
+            writer_name = os.path.basename(cc['writer'])
+            shared      = cc.get('shared_keys') or []
+            lines += [
+                "",
+                "## Cross-Binary Chain",
+                f"- **Writer**: `{writer_name}` — writes {', '.join(repr(k) for k in shared[:3])} via nvram_set",
+                f"- **Reader**: `{snapshot['name']}` (this binary) — reads and passes to sink",
+                f"- **Shared keys**: {', '.join(shared[:5])}",
+                f"- **Action**: verify both binaries in Ghidra to confirm the full chain",
+            ]
+
+        # ── Next Steps ───────────────────────────────────────────────────────
         lines.append("")
         lines.append("## Next Steps")
-        for step in snapshot["next_steps"]:
-            lines.append(f"- {step}")
+        for i, step in enumerate(snapshot["next_steps"], 1):
+            lines.append(f"{i}. {step}")
         with open(md_path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")
         dossiers.append({
@@ -1133,6 +1513,57 @@ def _write_output_bundle(output_path, bundle):
     print(f"\n[OK] Wrote structured results: {output_path}", flush=True)
 
 
+def _export_ghidra_targets(cve_top, run_dir):
+    """
+    Copy each CVE-candidate binary into <run_dir>/ghidra_targets/ so the
+    analyst can drag-and-drop the folder straight into Ghidra.
+
+    Deduplicates by resolved source path (one copy even if the same binary
+    appears under multiple candidate names).
+
+    Returns a list of dicts:
+      {"name": str, "src": str, "dest": str}  — paths relative to project root
+    """
+    if not run_dir or not cve_top:
+        return []
+
+    target_dir = os.path.join(run_dir, "ghidra_targets")
+    os.makedirs(target_dir, exist_ok=True)
+
+    copied = []
+    seen_src = set()
+
+    for c in cve_top:
+        rel = c.get("binary_path") or ""
+        if not rel:
+            continue
+
+        # binary_path is relative to project root
+        abs_src = os.path.join(_PROJECT_ROOT, rel)
+        abs_src = os.path.normpath(abs_src)
+
+        if not os.path.isfile(abs_src):
+            continue
+        if abs_src in seen_src:
+            continue
+        seen_src.add(abs_src)
+
+        dest_name = os.path.basename(abs_src)
+        abs_dest  = os.path.join(target_dir, dest_name)
+
+        # Avoid redundant copies on re-runs
+        if not os.path.exists(abs_dest) or os.path.getsize(abs_dest) != os.path.getsize(abs_src):
+            shutil.copy2(abs_src, abs_dest)
+
+        copied.append({
+            "name": c.get("name", dest_name),
+            "src":  rel,
+            "dest": _safe_relpath(abs_dest),
+        })
+
+    return copied
+
+
 def _emit_analysis_bundle(mode, mode_reason, result, *, output_path=None, dossier_dir=None, cgi_files=None):
     all_results = result.get("results") or []
     exploit_candidates = result.get("exploit_candidates") or []
@@ -1150,6 +1581,20 @@ def _emit_analysis_bundle(mode, mode_reason, result, *, output_path=None, dossie
         cgi_files=cgi_files,
         exploit_candidates=exploit_candidates,
     )
+
+    # ── CVE triage: pick Top-N from all snapshots ─────────────────────────────
+    # Uses the same logic a human/LLM researcher applies when reading the
+    # candidate list.  Noise-suppressed, auth-quality-weighted, and
+    # web-exposure-gated.  Stored separately so the full candidate list is
+    # preserved alongside the filtered CVE shortlist.
+    cve_top = select_cve_candidates(snapshots, top_n=3)
+
+    # ── Export CVE-candidate binaries for immediate Ghidra loading ────────────
+    ghidra_targets = _export_ghidra_targets(cve_top, _RUN_DIR)
+    if ghidra_targets:
+        _sec("GHIDRA TARGETS  (ready to load)")
+        for t in ghidra_targets:
+            print(f"  ▸ {t['name']:<28}  {t['dest']}", flush=True)
 
     bundle = {
         "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -1173,11 +1618,52 @@ def _emit_analysis_bundle(mode, mode_reason, result, *, output_path=None, dossie
         },
         "summary": _json_safe(result.get("summary") or {}),
         "candidates": snapshots,
+        "cve_candidates": _json_safe([
+            {
+                "name":          c.get("name"),
+                "binary_path":   c.get("binary_path"),
+                "vuln_summary":  c.get("vuln_summary") or "",
+                "triage_score":  c.get("triage_score", 0),
+                "score":         c.get("score", 0),
+                "auth_bypass":   c.get("auth_bypass"),
+                "confidence":    c.get("confidence"),
+                "web_exposed":   c.get("web_exposed"),
+                "handler_surface": c.get("handler_surface"),
+                "endpoints":     c.get("endpoints") or [],
+                "all_sinks":     c.get("all_sinks") or [],
+                "missing_links": c.get("missing_links") or [],
+            }
+            for c in cve_top
+        ]),
         "exploit_candidates": [
             _build_exploit_snapshot(entry) for entry in exploit_candidates
         ],
         "dossiers": dossiers,
+        "ghidra_targets": ghidra_targets,
     }
+
+    # ── Print CVE shortlist to console ────────────────────────────────────────
+    _sec(f"CVE CANDIDATES  (top {len(cve_top)})")
+    if cve_top:
+        for idx, c in enumerate(cve_top, 1):
+            auth_tag = {
+                "none":       "PRE-AUTH",
+                "bypassable": "AUTH-BYPASS",
+                "required":   "POST-AUTH",
+            }.get(c.get("auth_bypass") or "required", "?")
+            print(f"\n  #{idx}  [{auth_tag}]  {c['name']}  "
+                  f"triage={c.get('triage_score', 0)}  score={c.get('score', 0)}",
+                  flush=True)
+            print(f"       {c.get('vuln_summary') or ''}", flush=True)
+            eps = c.get("endpoints") or []
+            if eps:
+                print(f"       endpoints: {', '.join(eps[:3])}", flush=True)
+            _, explain_lines = explain_triage(c)
+            for line in explain_lines[1:6]:   # skip "triage_score = N" header
+                print(f"         {line}", flush=True)
+    else:
+        print("  (none passed CVE triage filter)", flush=True)
+
     _write_output_bundle(output_path, bundle)
     return bundle
 
@@ -1206,7 +1692,7 @@ def run_iot_analysis(show_all=False):
         if len(cgi_files) > 8:
             print(f"      … and {len(cgi_files) - 8} more", flush=True)
 
-    services = _collect_iot_services(SYSTEM_PATH, web_bins)
+    services = _collect_iot_services(SYSTEM_PATH, web_bins, cgi_files)
     print(f"\n    {len(services)} service candidates", flush=True)
     print(f"[START] Vulnerability analysis", flush=True)
     sys.stdout.flush()

@@ -7,6 +7,7 @@
 CRITICAL_SINKS = [
     # Command / shell execution
     "system(", "popen(", "execl(", "execv(", "execve(", "execvp(",
+    "os.execute", "io.popen", "luci.sys.call", "luci.sys.exec", "nixio.exec",
     "/bin/sh", "sh -c",
     # Dynamic library loading — code execution if path is controllable
     "dlopen(", "dlsym(",

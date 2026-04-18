@@ -3,6 +3,21 @@
 
 _NETLINK_KEYWORDS = {"netlink", "af_netlink", "nl_socket", "rtnetlink", "nlmsg"}
 
+_WEB_INPUT_HINTS = {
+    "luci.http.formvalue",
+    "luci.http.content",
+    "luci.http.getenv",
+    "luci.dispatcher",
+    "query_string",
+    "request_method",
+    "content_length",
+    "content_type",
+    "cgi-bin",
+    "uhttpd",
+    "rpcd",
+    "ubus",
+}
+
 # File input is inferred from fopen/fopen64 usage combined with a recognisable
 # config / data path or extension.
 _FILE_EXT_HINTS  = {".conf", ".json", ".xml", ".cfg", ".ini", ".prop", ".yaml"}
@@ -24,6 +39,8 @@ def classify_input(strings):
         l = s.lower()
         if "ontransact" in l:
             return "binder"
+        if any(k in l for k in _WEB_INPUT_HINTS):
+            return "socket"
         if "recvfrom" in l or "recvmsg" in l or "accept(" in l:
             return "socket"
         if "recv" in l or "accept" in l:
@@ -58,6 +75,7 @@ def has_input_handler(strings):
         or "accept(" in s.lower()
         or "fopen" in s.lower()
         or "netlink" in s.lower()
+        or any(k in s.lower() for k in _WEB_INPUT_HINTS)
         for s in strings
     )
 
@@ -82,6 +100,8 @@ def classify_input_from_imports(imports_dict):
     if names & {"SSL_read", "recvfrom", "recvmsg", "recvmmsg", "accept", "accept4"}:
         return "socket"
     if names & {"recv"}:
+        return "socket"
+    if names & {"cgi_main", "uh_cgi_request", "rpc_handle_request"}:
         return "socket"
 
     # Netlink: raw read() with netlink strings is handled by the string path;

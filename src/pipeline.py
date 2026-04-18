@@ -1632,6 +1632,30 @@ def _extract_ubi_blob(blob_path, out_dir):
         label=f"ubireader files   {os.path.basename(blob_path)}",
         quiet=True,
     )
+
+    rootfs = find_squashfs_root(out_dir)
+    if rootfs:
+        return rootfs
+
+    # ubireader often emits filesystem volumes as files (for example a
+    # rootfs.ubifs payload that is itself SquashFS) instead of unpacked dirs.
+    for dirpath, _, filenames in os.walk(out_dir):
+        for filename in sorted(filenames):
+            candidate = os.path.join(dirpath, filename)
+            lower = filename.lower()
+            if lower.endswith(".ubi"):
+                continue
+            if not _looks_like_nested_blob(candidate):
+                continue
+            nested_out = os.path.join(dirpath, f"_nested_{filename}")
+            nested_rootfs = _try_extract_iot_blob(
+                candidate,
+                nested_out,
+                f"ubi nested  {os.path.basename(candidate)}",
+            )
+            if nested_rootfs:
+                return nested_rootfs
+
     return find_squashfs_root(out_dir)
 
 
@@ -1675,7 +1699,7 @@ def _binwalk_extract_command(blob_path, out_dir, recursive=True):
         excludes.append("ext")
     for name in excludes:
         cmd.append(f"--exclude={name}")
-    cmd.extend(["--", blob_path])
+    cmd.append(blob_path)
     return " ".join(shlex.quote(part) for part in cmd)
 
 

@@ -10,10 +10,31 @@ from .dataflow import (analyze_dataflow, analyze_dataflow_with_graph,
                        upgrade_taint_confidence,
                        has_dangerous_memcpy_context,
                        has_dlopen_usage, is_parsing_heavy,
-                       detect_validation_signals)
-from .scoring import score_sinks, calc_score
+                       detect_validation_signals,
+                       count_validation_messages)
+from .scoring import (score_sinks, calc_score,
+                      calc_feature_chain_adjustment,
+                      calc_chain_consistency_adjustment,
+                      extract_config_key_tokens,
+                      has_frontend_linkage,
+                      build_config_key_index,
+                      calc_cross_binary_bonus,
+                      detect_injection_templates,
+                      extract_endpoints,
+                      assess_auth_bypass,
+                      calc_exploit_context_bonus,
+                      detect_toctou_risk,
+                      generate_vuln_summary,
+                      calc_vendor_pattern_bonus,
+                      is_logging_only_sink,
+                      detect_heap_overflow_risk,
+                      has_named_function_evidence,
+                      calc_candidate_actionability_bonus,
+                      assess_missing_links,
+                      calc_exploitability_plausibility)
 from .surface_detector import detect_surface, build_fuzzing_hints
-from .elf_analyzer import get_imports, build_call_graph, detect_parser_patterns
+from .elf_analyzer import (get_imports, build_call_graph, detect_parser_patterns,
+                            detect_hardening, get_internal_symbols)
 
 
 # ── ELF check ──────────────────────────────────────────────────────────────
@@ -79,6 +100,16 @@ def is_noise_binary(name, exec_path):
 def _has_external_network_surface(surface):
     sockets = surface.get("sockets", []) if surface else []
     return any(s.startswith("port:") for s in sockets)
+
+
+def _is_web_routed_exec(exec_path):
+    lower = (exec_path or "").lower()
+    return (
+        lower.startswith("/www/cgi-bin/")
+        or "/usr/lib/lua/luci/" in lower
+        or "/usr/libexec/rpcd/" in lower
+        or lower.endswith("/uhttpd")
+    )
 
 
 # ── Controllability classification ─────────────────────────────────────────
@@ -209,6 +240,10 @@ def analyze_services(services, root_path):
     scanned = 0
     last_print_time = 0.0   # throttle progress output to ~100ms intervals
 
+    # Accumulates per-binary token fingerprints for the cross-binary correlation
+    # pass that runs after all binaries have been individually scored.
+    _token_map = {}   # binary_path → {write, read, has_sink, has_frontend}
+
     for svc in services:
         if is_noise_service(svc["name"]):
             continue
@@ -236,6 +271,14 @@ def analyze_services(services, root_path):
 
         strings = None   # populated lazily; always defined before result assembly
         imports = get_imports(path)   # {sym_name: plt_stub_va}
+
+        # Gap 1: hardening flags (PIE/canary/RELRO/NX) — cheap ELF header parse.
+        # Reuses already-read imports to avoid a second PLT scan.
+        hardening = detect_hardening(path, imports=imports)
+
+        # Gap 4: internal function symbol names from .symtab (best-effort;
+        # empty set for fully stripped binaries — never blocks the pipeline).
+        symbols = get_internal_symbols(path)
 
         if imports:
             input_type = classify_input_from_imports(imports)
@@ -371,6 +414,16 @@ def analyze_services(services, root_path):
         else:
             validation_penalty = 0.0
 
+        # Secondary sanitization signal: validation error message density.
+        # Strings like "invalid IP address" or "value out of range" indicate the
+        # developer actively handles bad input, even when import evidence is weak.
+        if strings is not None:
+            val_msg_count = count_validation_messages(strings)
+            if val_msg_count >= 5:
+                validation_penalty = min(0.40, validation_penalty + 0.10)
+            elif val_msg_count >= 2:
+                validation_penalty = min(0.40, validation_penalty + 0.05)
+
         # ── Controllability ───────────────────────────────────────────────────
 
         controllability = _classify_controllability(
@@ -381,6 +434,86 @@ def analyze_services(services, root_path):
         memory_impact = _classify_memory_impact(filtered, flow_score, taint_confidence)
 
         # ── Scoring ───────────────────────────────────────────────────────────
+
+        # Materialise strings here so feature-chain scoring can use them even
+        # on the import-based fast path where strings were deferred until now.
+        if strings is None:
+            strings = extract_strings(path)
+
+        # Collect config-key token fingerprint for the cross-binary correlation
+        # pass that runs after all binaries have been scored.  Strings are always
+        # materialised by this point so extraction is safe here.
+        w_toks, r_toks = extract_config_key_tokens(strings)
+        _token_map[path] = {
+            'write':        w_toks,
+            'read':         r_toks,
+            'has_sink':     bool(all_sinks),
+            'has_frontend': has_frontend_linkage(strings),
+        }
+
+        # Feature-chain adjustment: rewards frontend→config→restart chains and
+        # penalises generic daemon internals (boa, malformed-packet handlers).
+        feature_adj = calc_feature_chain_adjustment(strings, svc.get("exec", ""))
+
+        # Chain consistency adjustment: validates that write and sink share data
+        # (proximate config-read, shared key tokens) rather than just co-existing.
+        consistency_adj = calc_chain_consistency_adjustment(strings)
+
+        # ── Exploit context signals (Gaps 2, 3, 5) ───────────────────────────
+        # Gap 2: injection templates — shell command strings with %s/%d
+        templates = detect_injection_templates(strings)
+
+        # Gap 3: named endpoints — /goform/, /cgi-bin/, /HNAP1/ URLs in strings
+        endpoints = extract_endpoints(strings)
+
+        # Gap 5: auth bypass — frontend with no auth guard = unauthenticated path
+        has_fe = has_frontend_linkage(strings)
+        auth_status, auth_bonus = assess_auth_bypass(strings, has_fe)
+
+        # TOCTOU: check-then-use pattern on /tmp or user-controlled paths
+        toctou = detect_toctou_risk(strings)
+
+        # Vendor-specific API patterns (less-audited, historically vulnerable)
+        vendor_bonus = calc_vendor_pattern_bonus(strings)
+
+        # Integer overflow → heap overflow risk: malloc + ntohl without size check
+        heap_overflow = detect_heap_overflow_risk(strings,
+                                                   imports if imports else None)
+
+        # Aggregate Gaps 1–5 + TOCTOU + vendor patterns + heap-overflow into one bonus
+        exploit_adj = (
+            calc_exploit_context_bonus(
+                hardening, symbols, templates, endpoints, auth_bonus,
+                has_toctou=toctou)
+            + vendor_bonus
+            + (3 if heap_overflow else 0)  # integer→heap overflow: significant risk
+        )
+
+        # ── Actionability bonus ───────────────────────────────────────────────
+        # Rewards candidates that are easy for Claude / human analysts to triage:
+        # named functions visible in strings, high-info sink artifacts, specific
+        # form handlers, named shell scripts.  Applied alongside exploit_adj so
+        # concrete candidates rank above generic "suspicious" daemons.
+        actionability_bonus = calc_candidate_actionability_bonus(
+            strings, endpoints, all_sinks, symbols if symbols else [])
+        exploit_adj += actionability_bonus
+
+        # ── Missing-link assessment ───────────────────────────────────────────
+        # Identifies which chain elements are still unconfirmed.  Used both as a
+        # score penalty (too_many_unknowns → −25%) and as next-step generation
+        # hints in the dossier.
+        _named_fn_flag = has_named_function_evidence(strings, all_sinks)
+        _config_keys_list = sorted(
+            _token_map.get(path, {}).get('write', set()) |
+            _token_map.get(path, {}).get('read', set())
+        )[:15]
+        missing_links = assess_missing_links(
+            all_sinks, endpoints, templates,
+            _config_keys_list,
+            auth_status, taint_confidence,
+            handler_symbols=symbols if symbols else [],
+            has_named_fn=_named_fn_flag,
+        )
 
         sink_score = score_sinks(filtered)
         score = calc_score(
@@ -394,7 +527,35 @@ def analyze_services(services, root_path):
             flow_confidence=flow_confidence,
             memory_impact=memory_impact,
             flow_type=flow_type,
+            feature_chain_bonus=feature_adj,
+            chain_consistency_bonus=consistency_adj,
+            exploit_signal_bonus=exploit_adj,
         )
+
+        # ── Post-scoring penalties ────────────────────────────────────────────
+
+        # Logging-only sink penalty: printf/syslog-only binaries have a narrower
+        # attack surface (format-string bugs only); deprioritise vs exec/memory.
+        if is_logging_only_sink(all_sinks):
+            score = max(1, int(round(score * 0.5)))
+
+        # Missing-link penalty: a candidate with 3+ unconfirmed chain elements
+        # is too vague to outrank a concrete, specific finding.  −25% prevents
+        # generic daemon noise from floating to the top of the ranked list.
+        if "too_many_unknowns" in missing_links:
+            score = max(1, int(round(score * 0.75)))
+
+        # ── Exploitability plausibility adjustment ────────────────────────────
+        # Balances actionability: a candidate with high actionability but all
+        # evidence in error/crash paths should not outrank one with tightly
+        # coupled, direct-execution-path evidence.  Applied after penalties so
+        # it operates on the already-penalised score.
+        plausibility_bonus = calc_exploitability_plausibility(
+            strings, all_sinks,
+            imports if imports else None,
+            endpoints, templates, missing_links,
+        )
+        score = max(0, score + plausibility_bonus)
 
         # ── Level classification ──────────────────────────────────────────────
         # Hard discard only for truly no-signal cases (score < 2).
@@ -419,7 +580,11 @@ def analyze_services(services, root_path):
 
         surface = detect_surface(strings)
 
-        if input_type in ("socket", "netlink") and not _has_external_network_surface(surface):
+        if (
+            input_type in ("socket", "netlink")
+            and not _has_external_network_surface(surface)
+            and not _is_web_routed_exec(svc.get("exec", ""))
+        ):
             continue
 
         # ── Fuzzing hints ─────────────────────────────────────────────────────
@@ -487,8 +652,88 @@ def analyze_services(services, root_path):
             # Parser pattern evidence (TLV/ASN.1/LPF/SEQOF)
             "parser_patterns": len(parser_hits),
             "parser_hits":     top_parser,
+
+            # Cross-binary chain: filled in by the post-loop correlation pass.
+            # None unless this binary is the reader+sink in a write→read→sink
+            # chain that spans two separate firmware components.
+            "cross_chain":     None,
+
+            # Gap 1: binary hardening — absent mitigations boost exploitability.
+            "hardening":            hardening,
+
+            # Gap 2: shell command templates with user-controlled placeholders.
+            "injection_templates":  templates[:2],
+
+            # Gap 3: named HTTP endpoint paths extracted from binary strings.
+            "endpoints":            endpoints,
+
+            # Gap 4: internal symbol-based feature detection (empty if stripped).
+            "handler_symbols":      sorted(
+                n for n in symbols
+                if any(h in n for h in (
+                    "handle_", "apply_", "set_wan", "set_ddns", "set_wlan",
+                    "set_vpn", "do_system", "exec_cmd", "run_cmd",
+                ))
+            )[:5],
+
+            # Gap 5: authentication requirement assessment for frontend handlers.
+            "auth_bypass":          auth_status,
+
+            # Gap 6: config key tokens (write + read) — nvram/MIB key names
+            # controlled by the attacker or reused in sink arguments.
+            "config_keys":          sorted(
+                _token_map.get(path, {}).get('write', set()) |
+                _token_map.get(path, {}).get('read', set())
+            )[:15],
+
+            # TOCTOU race condition signal.
+            "toctou_risk":          toctou,
+
+            # Actionability: how concrete / named / traceable is the evidence.
+            # Higher = easier for Claude/human analysts to start reversing.
+            "actionability_bonus":  actionability_bonus,
+
+            # Missing links: which chain elements are still unconfirmed.
+            # Used for dossier "what is still missing" and next-step generation.
+            "missing_links":        missing_links,
+
+            # Exploitability plausibility: realistic input-to-sink coupling.
+            # Negative = evidence from error paths / sanitization present.
+            # Positive = direct-path templates with coupled token evidence.
+            "plausibility_bonus":   plausibility_bonus,
+
+            # One-line CVE-style vulnerability summary (pre-populated for dossier).
+            # auth_bypass is set after scoring so we forward it via a sentinel;
+            # generate_vuln_summary reads it from the result dict lazily in main.py.
+            "vuln_summary":         None,   # filled post-auth_status assignment below
         })
+
+        # Back-fill vuln_summary now that auth_bypass is in the result dict.
+        results[-1]["auth_bypass"]   = auth_status
+        results[-1]["vuln_summary"]  = generate_vuln_summary(results[-1])
 
     pct = scanned * 100 // total if total else 0
     print(f"\r  [SCAN] {scanned}/{total} ({pct:3d}%)  complete{' ' * 32}", flush=True)
+
+    # ── Cross-binary chain correlation ────────────────────────────────────────
+    # Build a global config-key token index then boost binaries that act as
+    # the reader+sink end of a cross-component write→read→sink chain.
+    #
+    # Pattern:
+    #   Binary A (writer):  nvram_set("wan_ip", form_input)
+    #   Binary B (reader):  nvram_get("wan_ip") → system(cmd)
+    #
+    # The two binaries share the token "wan_ip" in their respective
+    # config-write / config-read string contexts.  Binary B earns +6 (or +9
+    # when A has frontend linkage) on top of its existing single-binary score.
+
+    key_index = build_config_key_index(_token_map)
+
+    for r in results:
+        bonus, chain_info = calc_cross_binary_bonus(
+            r['binary_path'], _token_map, key_index)
+        if bonus > 0:
+            r['score']       += bonus
+            r['cross_chain']  = chain_info
+
     return sorted(results, key=lambda x: x["score"], reverse=True)

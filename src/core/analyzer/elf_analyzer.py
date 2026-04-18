@@ -157,6 +157,9 @@ SINK_IMPORTS = {
     "strong": frozenset({
         "strcpy", "strcat", "sprintf", "vsprintf",
         "gets", "scanf", "sscanf",
+        # Format-string sinks: dangerous when called with user-controlled first arg
+        # and no intervening format literal (e.g. syslog(priority, user_input)).
+        "printf", "fprintf", "dprintf", "syslog", "vsyslog",
     }),
     "weak": frozenset({
         "memcpy", "memmove",
@@ -862,3 +865,128 @@ def detect_parser_patterns(path, cg=None, max_funcs=2000, max_insns=200):
             results[fs] = {'pattern': pattern, 'score': score, 'evidence': evidence}
 
     return results
+
+
+def detect_hardening(path, imports=None):
+    """
+    Detect presence/absence of compile-time security mitigations.
+
+    Reads the ELF e_type (PIE), program headers (RELRO, NX), and the PLT
+    import table (canary).  When `imports` is supplied from a prior
+    get_imports() call the import re-parse is skipped.
+
+    Returns:
+      {
+        'canary': bool,   # __stack_chk_fail present  → overflow detection
+        'pie':    bool,   # ET_DYN (e_type=3)         → ASLR-compatible
+        'relro':  bool,   # PT_GNU_RELRO present      → GOT read-only after init
+        'nx':     bool,   # PT_GNU_STACK is not +X    → stack non-executable
+      }
+
+    All False on any parse error — fail-open so unknowns do not penalise good
+    candidates.  Absent mitigations are scored in calc_hardening_bonus().
+    """
+    _NONE = {'canary': False, 'pie': False, 'relro': False, 'nx': False}
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+    except OSError:
+        return _NONE
+
+    hdr = _read_header(data)
+    if hdr is None:
+        return _NONE
+    _, e_phoff, e_phnum, _, _, _ = hdr
+
+    # PIE: e_type at ELF header offset 16; ET_DYN = 3 means position-independent.
+    e_type = struct.unpack_from('<H', data, 16)[0]
+    pie    = (e_type == 3)
+
+    # Canary: __stack_chk_fail or __stack_chk_guard must appear in PLT imports.
+    if imports is None:
+        imports = get_imports(path)
+    canary = ('__stack_chk_fail' in imports or '__stack_chk_guard' in imports)
+
+    # Scan program headers for RELRO and NX (PT_GNU_* extension segments).
+    PT_GNU_RELRO = 0x6474e552
+    PT_GNU_STACK = 0x6474e551
+    PF_X         = 0x1         # execute bit in Elf64_Phdr.p_flags
+    relro        = False
+    nx           = True        # assume NX unless PT_GNU_STACK declares +X
+
+    for i in range(e_phnum):
+        base = e_phoff + i * 56    # Elf64_Phdr is 56 bytes
+        if base + 8 > len(data):
+            break
+        p_type = struct.unpack_from('<I', data, base)[0]
+        if p_type == PT_GNU_RELRO:
+            relro = True
+        elif p_type == PT_GNU_STACK:
+            p_flags = struct.unpack_from('<I', data, base + 4)[0]
+            nx      = not bool(p_flags & PF_X)
+
+    return {'canary': canary, 'pie': pie, 'relro': relro, 'nx': nx}
+
+
+def get_internal_symbols(path, max_syms=2000):
+    """
+    Read .symtab for internal function symbol names (non-imported, defined).
+
+    Many firmware binaries are not fully stripped and retain partial .symtab
+    entries.  Names like handle_wan_setting() or do_system_cmd() identify the
+    attack surface with far higher precision than string heuristics.
+
+    Returns set of lowercase symbol names.
+    Empty set on stripped binary (.symtab absent) or parse error — callers
+    treat an empty set as "no symbol intelligence available".
+
+    Only STT_FUNC (type=2) and STT_NOTYPE (type=0) symbols with a defined
+    section index (shndx ≠ SHN_UNDEF=0) are included.  AArch64 mapping
+    symbols ($x, $d) are excluded.
+    """
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+    except OSError:
+        return set()
+
+    hdr = _read_header(data)
+    if hdr is None:
+        return set()
+    _, _, _, e_shoff, e_shnum, e_shstrndx = hdr
+
+    sections = _parse_sections(data, e_shoff, e_shnum, e_shstrndx)
+    if '.symtab' not in sections or '.strtab' not in sections:
+        return set()
+
+    _, _, symtab_off, symtab_sz, symtab_ent = sections['.symtab']
+    _, _, strtab_off, strtab_sz, _          = sections['.strtab']
+
+    ent   = max(int(symtab_ent), 24)   # Elf64_Sym is 24 bytes
+    names = set()
+
+    for i in range(min(symtab_sz // ent, max_syms)):
+        base     = symtab_off + i * ent
+        if base + 18 > len(data):
+            break
+        name_off = struct.unpack_from('<I', data, base)[0]
+        st_info  = data[base + 4]
+        st_shndx = struct.unpack_from('<H', data, base + 6)[0]
+
+        sym_type = st_info & 0xF           # lower nibble
+        if sym_type not in (0, 2):         # STT_NOTYPE=0, STT_FUNC=2
+            continue
+        if st_shndx == 0:                  # SHN_UNDEF: imported/external
+            continue
+        if name_off == 0 or name_off >= strtab_sz:
+            continue
+
+        end = data.find(b'\x00', strtab_off + name_off,
+                        strtab_off + name_off + 128)
+        if end < 0:
+            continue
+        name = data[strtab_off + name_off: end].decode('ascii', 'replace')
+        if name and not name.startswith('$'):   # skip $x/$d mapping symbols
+            names.add(name.lower())
+
+    return names

@@ -3,13 +3,21 @@
 
 # ── Existing pattern sets (preserved) ────────────────────────────────────────
 
-_NET_INPUT = {"recv", "recvfrom", "recvmsg", "recvmmsg", "accept(", "read("}
+_NET_INPUT = {
+    "recv", "recvfrom", "recvmsg", "recvmmsg", "accept(", "read(",
+    "luci.http.formvalue", "luci.http.content", "luci.http.getenv",
+    "query_string", "request_method", "content_length",
+    "cgi-bin", "uhttpd", "rpcd", "ubus",
+}
 _PARSE_OPS = {"sscanf", "strtol", "strtoul", "atoi", "atol",
               "json", "xml", "parse", "packet", "deserializ", "decode"}
 _COPY_OPS  = {"strcpy", "strcat", "sprintf", "vsprintf", "memcpy",
               "__strcpy_chk", "__memcpy_chk"}
-_CMD_OPS   = {"system(", "popen(", "exec(", "execl(", "execv(",
-              "/bin/sh", "sh -c", "sh\""}
+_CMD_OPS   = {
+    "system(", "popen(", "exec(", "execl(", "execv(",
+    "os.execute", "io.popen", "luci.sys.call", "luci.sys.exec", "nixio.exec",
+    "/bin/sh", "sh -c", "sh\"",
+}
 _NTOH_OPS  = {"ntohl", "ntohs", "htonl", "htons"}
 
 # ── New pattern sets ──────────────────────────────────────────────────────────
@@ -226,6 +234,33 @@ def analyze_dataflow_with_graph(cg, binary_path=None):
     return flow_score, flow_type, path_len, taint_conf
 
 
+def count_validation_messages(strings):
+    """
+    Count strings that look like input validation error messages.
+
+    Patterns like "invalid IP address", "value out of range", or "bad parameter"
+    indicate the binary actively validates inputs before processing them.
+    High counts are a secondary sanitization signal used to boost the validation
+    penalty in risk.py — they show the developer was thinking about bad input.
+
+    Returns an int count of distinct validation message strings found.
+    """
+    _VALIDATION_MSG_HINTS = {
+        "invalid", "out of range", "bad value", "illegal",
+        "not valid", "must be", "too long", "too short",
+        "out of bound", "exceeds", "check fail", "validation fail",
+        "invalid input", "invalid param", "invalid value", "invalid format",
+        "invalid ip", "invalid address", "address format",
+        "parameter error", "param error", "bad param", "wrong format",
+    }
+    count = 0
+    for s in strings:
+        l = s.lower()
+        if any(h in l for h in _VALIDATION_MSG_HINTS):
+            count += 1
+    return count
+
+
 def detect_validation_signals(imports_or_strings, use_imports=True):
     """
     Detect bounds-checking / validation discipline.
@@ -244,6 +279,9 @@ def detect_validation_signals(imports_or_strings, use_imports=True):
 
     Mixed (both safe and unsafe present) → partial credit (+0.08 / +0.05).
 
+    IP/network validation imports (inet_aton/inet_pton/regcomp) present
+    → binary validates IP addresses or applies regex checks (+0.10).
+
     Presence of gets() WITHOUT any fgets() → no validation, subtract 0.05
     so penalty cannot accidentally inflate on obviously dangerous binaries.
 
@@ -260,6 +298,10 @@ def detect_validation_signals(imports_or_strings, use_imports=True):
         has_unsafe_fmt  = bool(names & {"sprintf", "vsprintf"})
         has_safe_read   = bool(names & {"fgets", "__fgets_chk"})
         has_unsafe_read = bool(names & {"gets"})
+        # IP/network/regex validation imports — developer is checking values
+        has_ip_valid    = bool(names & {"inet_aton", "inet_pton", "inet_addr",
+                                        "regcomp", "regexec", "fnmatch",
+                                        "getaddrinfo", "inet_ntop"})
     else:
         lower = [s.lower() for s in imports_or_strings]
         has_safe_copy   = any("strncpy" in l or "strncat" in l for l in lower)
@@ -268,6 +310,11 @@ def detect_validation_signals(imports_or_strings, use_imports=True):
         has_unsafe_fmt  = any("sprintf(" in l or "vsprintf(" in l for l in lower)
         has_safe_read   = any("fgets" in l for l in lower)
         has_unsafe_read = any("gets(" in l for l in lower)
+        has_ip_valid    = any(
+            k in l for l in lower
+            for k in ("inet_aton", "inet_pton", "regcomp", "fnmatch",
+                      "getaddrinfo", "inet_ntop")
+        )
 
     penalty = 0.0
 
@@ -280,6 +327,11 @@ def detect_validation_signals(imports_or_strings, use_imports=True):
         penalty += 0.15
     elif has_safe_fmt and has_unsafe_fmt:
         penalty += 0.05
+
+    # IP/address validation functions indicate input sanitization for network data.
+    # Only credit if not offset by clearly unsafe copy/format patterns.
+    if has_ip_valid and not (has_unsafe_copy and has_unsafe_fmt):
+        penalty += 0.10
 
     if has_unsafe_read and not has_safe_read:
         penalty -= 0.05   # gets() present: actively dangerous, reduce penalty
