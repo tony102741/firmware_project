@@ -1,14 +1,15 @@
 """
 Firmware analysis pipeline.
 
-Supports four input formats, detected automatically:
+Supports five input formats, detected automatically:
   - OTA zip (.zip)       → unzip → payload-dumper-go → rootfs
+  - tar bundle (.tar)    → untar → nested firmware/rootfs
   - payload.bin          → payload-dumper-go → rootfs
   - raw partition (.img) → 7z unpack → rootfs
   - IoT firmware (.bin)  → binwalk extract → squashfs-root → rootfs
 
 Run from the project root:
-  python3 src/pipeline.py [--input FILE] [--type auto|zip|payload|img|iot] [--skip]
+  python3 src/pipeline.py [--input FILE] [--type auto|zip|tar|payload|img|iot] [--skip]
   python3 src/pipeline.py --dry-run          # validate tools and input only
   python3 src/pipeline.py --output out.json  # save results as JSON
 """
@@ -25,20 +26,22 @@ import shlex
 import lzma
 import json
 import hashlib
+import atexit
 from datetime import datetime
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
-BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
 
-INPUTS_DIR    = os.path.join(PROJECT_ROOT, "inputs")
-CACHE_DIR     = os.path.join(PROJECT_ROOT, ".cache")
+INPUTS_DIR = os.environ.get("FIRMWARE_INPUTS_DIR", os.path.join(PROJECT_ROOT, "inputs"))
+CACHE_DIR = os.environ.get("FIRMWARE_CACHE_DIR", os.path.join(PROJECT_ROOT, ".cache"))
 FIRMWARE_DIR  = INPUTS_DIR
 WORK_DIR      = os.path.join(CACHE_DIR, "build")
 ROOTFS_DIR    = os.path.join(CACHE_DIR, "rootfs")
 EXTRACTED_DIR = os.path.join(CACHE_DIR, "extracted")
-RUNS_DIR      = os.path.join(PROJECT_ROOT, "runs")
+TEMP_INPUTS_DIR = os.path.join(CACHE_DIR, "tmp_inputs")
+RUNS_DIR = os.environ.get("FIRMWARE_RUNS_DIR", os.path.join(PROJECT_ROOT, "runs"))
 
 DUMPER      = os.path.join(PROJECT_ROOT, "tools/payload-dumper-go/payload-dumper-go")
 DUMPER_DIR  = os.path.dirname(DUMPER)
@@ -53,6 +56,7 @@ _MAGIC_PAYLOAD = b"CrAU"
 _MAGIC_SPARSE  = b"\x3a\xff\x26\xed"
 _MAGIC_EXT4    = b"\x53\xef"       # at offset 0x438 in ext4 superblock
 _MAGIC_EROFS   = b"\xe2\xe1\xf5\xe0"
+_MAGIC_TAR     = b"ustar"
 _FS_MAGIC_PATTERNS = (
     ("squashfs", b"hsqs"),
     ("squashfs", b"sqsh"),
@@ -61,7 +65,7 @@ _FS_MAGIC_PATTERNS = (
     ("cramfs",   b"\x45\x3d\xcd\x28"),
     ("ubifs",    b"UBI#"),
 )
-_NESTED_BLOB_EXTS = (".xz", ".lzma", ".bin", ".img", ".raw", ".fs", ".blob")
+_NESTED_BLOB_EXTS = (".xz", ".lzma", ".7z", ".bin", ".img", ".raw", ".fs", ".blob")
 _UBIREADER_FALLBACK_DIRS = (
     os.path.expanduser("~/.venvs/ubireader/bin"),
     os.path.expanduser("~/.local/bin"),
@@ -70,6 +74,12 @@ _UBIREADER_FALLBACK_DIRS = (
 _PARTITION_INDICATORS = {"bin", "lib", "lib64", "etc", "app", "framework", "priv-app"}
 _SEARCH_SKIP = {"rootfs", ".git", "node_modules", "__pycache__"}
 _ARCHIVE_FIRMWARE_EXTS = (".bin", ".img", ".web", ".trx", ".w", ".pkgtb")
+_ARCHIVE_NOISE_EXTS = (
+    ".txt", ".pdf", ".doc", ".docx", ".rtf",
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".ico",
+    ".html", ".htm", ".css", ".js",
+    ".md", ".csv", ".xml",
+)
 _DJI_SKIP_SIG_EXTS = (".pro.fw.sig", ".cfg.sig")
 _DJI_PRIORITY_NAMES = (
     "decompressed.bin",
@@ -95,12 +105,17 @@ _DJI_PRAK_PAYLOAD_MAGICS = (
 
 INPUT_ZIP     = "zip"
 INPUT_RAR     = "rar"
+INPUT_TAR     = "tar"
 INPUT_PAYLOAD = "payload"
 INPUT_IMG     = "img"
 INPUT_IOT     = "iot"
 INPUT_UNKNOWN = "unknown"
 
 _W = 65  # output width
+_EXTRACTED_ACTIVE = False
+_TEMP_INPUT_DIRS = []
+_PATH_INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+_ZONE_SUFFIX = ":Zone.Identifier"
 
 
 # ── Output helpers ─────────────────────────────────────────────────────────────
@@ -136,6 +151,12 @@ def _slugify(text):
     return (text or "run").lower()
 
 
+def _path_label(text):
+    text = _PATH_INVALID_CHARS.sub("-", (text or "").strip())
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" .-") or "UNKNOWN"
+
+
 def _short_run_label(input_path=None, max_len=24):
     if not input_path:
         return "run"
@@ -164,6 +185,44 @@ def _short_run_label(input_path=None, max_len=24):
     return slug[:max_len]
 
 
+def _iter_input_files(base_dir):
+    if not os.path.isdir(base_dir):
+        return []
+
+    files = []
+    for root, dirs, names in os.walk(base_dir):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for name in sorted(names):
+            if name.endswith(_ZONE_SUFFIX):
+                continue
+            full = os.path.join(root, name)
+            if os.path.isfile(full):
+                files.append(full)
+    return sorted(files)
+
+
+def _derive_run_labels(input_path=None):
+    product_label = os.environ.get("FIRMWARE_PRODUCT_LABEL", "").strip()
+    version_label = os.environ.get("FIRMWARE_VERSION_LABEL", "").strip()
+    if product_label and version_label:
+        return _path_label(product_label), _path_label(version_label)
+
+    if input_path:
+        abs_input = os.path.abspath(input_path)
+        stem = os.path.splitext(os.path.basename(abs_input))[0]
+        try:
+            rel = os.path.relpath(abs_input, INPUTS_DIR)
+        except ValueError:
+            rel = None
+        if rel and not rel.startswith(".."):
+            parts = rel.split(os.sep)
+            if len(parts) >= 2:
+                return _path_label(parts[0]), _path_label(stem)
+        return _path_label(_short_run_label(stem, max_len=48)), _path_label(stem)
+
+    return "UNKNOWN", "run"
+
+
 def _json_dump(path, payload):
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
@@ -182,6 +241,17 @@ def _sha256_file(path, chunk_size=1024 * 1024):
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _iot_extract_dir_for(bin_path):
+    """
+    Give each firmware blob its own extraction directory so nested extraction
+    results from previous runs cannot contaminate rootfs selection.
+    """
+    stem = os.path.splitext(os.path.basename(bin_path))[0]
+    slug = _short_run_label(stem, max_len=32)
+    digest = _sha256_file(bin_path)[:8]
+    return os.path.join(WORK_DIR, f"_iot_extract_{slug}_{digest}")
 
 
 def _dir_size_bytes(path):
@@ -226,10 +296,13 @@ def _prepare_run_artifacts(input_path=None):
     os.makedirs(RUNS_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     suffix = _short_run_label(input_path)
-    run_dir = os.path.join(RUNS_DIR, f"run_{ts}_{suffix}")
+    product_label, version_label = _derive_run_labels(input_path)
+    base_dir = os.path.join(RUNS_DIR, product_label, version_label)
+    os.makedirs(base_dir, exist_ok=True)
+    run_dir = os.path.join(base_dir, f"run_{ts}_{suffix}")
     os.makedirs(run_dir, exist_ok=True)
     return {
-        "run_id": os.path.basename(run_dir),
+        "run_id": os.path.relpath(run_dir, RUNS_DIR),
         "run_dir": run_dir,
         "log_path": os.path.join(run_dir, "run.log"),
         "result_path": os.path.join(run_dir, "results.json"),
@@ -390,6 +463,8 @@ _REQUIRED_TOOLS = {
     "7z":      "p7zip-full (apt install p7zip-full)",
 }
 
+_RAR_FALLBACK_TOOLS = ("unrar", "unar", "bsdtar")
+
 
 def _check_required_tools():
     """
@@ -513,7 +588,7 @@ def detect_input_type(path):
     """
     Detect input file type using extension first, magic bytes as fallback.
 
-    Returns one of: INPUT_ZIP, INPUT_RAR, INPUT_PAYLOAD, INPUT_IMG, INPUT_UNKNOWN
+    Returns one of: INPUT_ZIP, INPUT_RAR, INPUT_TAR, INPUT_PAYLOAD, INPUT_IMG, INPUT_UNKNOWN
     """
     ext  = os.path.splitext(path)[1].lower()
     name = os.path.basename(path).lower()
@@ -523,6 +598,8 @@ def detect_input_type(path):
         return INPUT_ZIP
     if ext == ".rar":
         return INPUT_RAR
+    if ext == ".tar":
+        return INPUT_TAR
     if ext in (".w", ".trx", ".web"):
         return INPUT_IOT
     if "pureubi" in name or "pureubi" in path_lower:
@@ -531,8 +608,6 @@ def detect_input_type(path):
         return INPUT_PAYLOAD
     if ext == ".img":
         return INPUT_IMG
-    if ext == ".bin":
-        return INPUT_IOT
 
     magic4 = _read_magic(path, 4)
 
@@ -540,6 +615,8 @@ def detect_input_type(path):
         return INPUT_ZIP
     if magic4 == _MAGIC_RAR4 or _read_magic(path, 7) == _MAGIC_RAR5:
         return INPUT_RAR
+    if _read_magic(path, len(_MAGIC_TAR), offset=257) == _MAGIC_TAR:
+        return INPUT_TAR
     if magic4 == _MAGIC_PAYLOAD:
         return INPUT_PAYLOAD
     if magic4 == _MAGIC_SPARSE:
@@ -548,6 +625,11 @@ def detect_input_type(path):
         return INPUT_IMG
     if _read_magic(path, 2, offset=0x438) == _MAGIC_EXT4:
         return INPUT_IMG
+    for _, magic in _FS_MAGIC_PATTERNS:
+        if magic4 == magic:
+            return INPUT_IOT
+    if ext == ".bin":
+        return INPUT_IOT
 
     return INPUT_UNKNOWN
 
@@ -582,6 +664,35 @@ def _find_largest_firmware_file(base_dir):
     return best_path
 
 
+def _find_largest_extracted_blob(base_dir, min_size=32 * 1024):
+    """
+    Last-resort archive resolver fallback. If a vendor packages firmware under
+    an unexpected name, pick the largest non-obviously-document file so the
+    pipeline can still attempt analysis instead of aborting early.
+    """
+    best_path = None
+    best_size = -1
+
+    for dirpath, dirnames, filenames in os.walk(base_dir):
+        dirnames[:] = [d for d in dirnames if d not in _SEARCH_SKIP]
+        for name in filenames:
+            lower = name.lower()
+            if lower.endswith(_ARCHIVE_NOISE_EXTS):
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            if size < min_size:
+                continue
+            if size > best_size:
+                best_path = full
+                best_size = size
+
+    return best_path
+
+
 def _list_archive_members(archive_path):
     result = subprocess.run(
         f'7z l "{archive_path}"',
@@ -606,15 +717,95 @@ def _list_archive_members(archive_path):
     return members
 
 
+def _dir_has_entries(path):
+    try:
+        return os.path.isdir(path) and any(os.scandir(path))
+    except Exception:
+        return False
+
+
+def _available_rar_fallbacks():
+    return [tool for tool in _RAR_FALLBACK_TOOLS if shutil.which(tool)]
+
+
+def _try_extract_rar_with_fallbacks(rar_path, temp_dir, member=None):
+    """
+    Try optional RAR-capable backends when 7z cannot decode a sample.
+
+    member:
+      - None: extract the whole archive into temp_dir
+      - str : try to extract a single named member
+    """
+    for tool in _available_rar_fallbacks():
+        if tool == "unrar":
+            if member:
+                cmd = f'unrar e -y "{rar_path}" "{member}" "{temp_dir}/"'
+                label = f"unrar member  {os.path.basename(member)}"
+            else:
+                cmd = f'unrar x -y "{rar_path}" "{temp_dir}/"'
+                label = f"unrar archive  {os.path.basename(rar_path)}"
+        elif tool == "unar":
+            # unar does not reliably support single-member extraction on every build;
+            # use whole-archive extraction in that case.
+            cmd = f'unar -force-overwrite -output-directory "{temp_dir}" "{rar_path}"'
+            label = (
+                f"unar archive  {os.path.basename(rar_path)}"
+                if member is None else
+                f"unar archive  {os.path.basename(rar_path)}  (member fallback)"
+            )
+        else:  # bsdtar
+            if member:
+                cmd = f'bsdtar -x -f "{rar_path}" -C "{temp_dir}" "{member}"'
+                label = f"bsdtar member  {os.path.basename(member)}"
+            else:
+                cmd = f'bsdtar -x -f "{rar_path}" -C "{temp_dir}"'
+                label = f"bsdtar archive  {os.path.basename(rar_path)}"
+
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and _find_largest_firmware_file(temp_dir):
+            _info(f"{tool} fallback succeeded")
+            return True
+        if result.returncode == 0 and _dir_has_entries(temp_dir):
+            _info(f"{tool} fallback produced extracted files")
+            return True
+    return False
+
+
 def _extract_selected_archive_members(archive_path, temp_dir, members):
     for name in members:
-        result = run(
+        result = subprocess.run(
             f'7z e "{archive_path}" "{name}" -o"{temp_dir}" -y',
-            label=f"extract member  {os.path.basename(name)}",
-            quiet=True,
+            shell=True,
+            capture_output=True,
+            text=True,
         )
-        if result.returncode == 0:
+        _info(f"extract member  {os.path.basename(name)}")
+        extracted_path = os.path.join(temp_dir, os.path.basename(name))
+        if result.returncode == 0 and os.path.isfile(extracted_path):
             return True
+        if os.path.isfile(extracted_path) and os.path.getsize(extracted_path) > 0:
+            return True
+        stderr = (result.stderr or "") + (result.stdout or "")
+        if "Unsupported Method" in stderr:
+            _warn(
+                f"7z created {os.path.basename(name)} but could not decode the RAR compression method"
+            )
+            if _try_extract_rar_with_fallbacks(archive_path, temp_dir, member=name):
+                return True
+            continue
+        if os.path.isfile(extracted_path):
+            _warn(
+                f"7z extracted {os.path.basename(name)} with size {os.path.getsize(extracted_path)} bytes but returned {result.returncode}"
+            )
+            continue
+        _warn(
+            f"failed to extract {os.path.basename(name)} from RAR (exit {result.returncode})"
+        )
     return False
 
 
@@ -630,9 +821,23 @@ def _list_zip_members(zip_path):
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
+def _cleanup_registered_temp_inputs():
+    for path in reversed(_TEMP_INPUT_DIRS):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _make_temp_input_dir():
+    os.makedirs(TEMP_INPUTS_DIR, exist_ok=True)
+    temp_dir = tempfile.mkdtemp(prefix="fw_input_", dir=TEMP_INPUTS_DIR)
+    _TEMP_INPUT_DIRS.append(temp_dir)
+    return temp_dir
+
+
+atexit.register(_cleanup_registered_temp_inputs)
+
+
 def _resolve_zip_firmware(zip_path):
-    temp_parent = WORK_DIR if os.path.isdir(WORK_DIR) else PROJECT_ROOT
-    temp_dir = tempfile.mkdtemp(prefix="fw_input_", dir=temp_parent)
+    temp_dir = _make_temp_input_dir()
     run_critical(
         f'unzip -o "{zip_path}" -d "{temp_dir}"',
         fatal_msg=f"Failed to inspect ZIP input: {zip_path}",
@@ -642,9 +847,13 @@ def _resolve_zip_firmware(zip_path):
 
     resolved = _find_largest_firmware_file(temp_dir)
     if not resolved:
-        print("[FATAL] No payload.bin, .bin, .img, .web, .trx, .w, or .pkgtb found inside ZIP.", flush=True)
-        print(f"        ZIP: {zip_path}", flush=True)
-        sys.exit(1)
+        resolved = _find_largest_extracted_blob(temp_dir)
+        if resolved:
+            _warn("no known firmware extension found inside ZIP; using largest extracted blob fallback")
+        else:
+            print("[FATAL] No payload.bin, .bin, .img, .web, .trx, .w, or .pkgtb found inside ZIP.", flush=True)
+            print(f"        ZIP: {zip_path}", flush=True)
+            sys.exit(1)
 
     resolved_type = detect_input_type(resolved)
     _info(f"resolved firmware: {os.path.relpath(resolved, PROJECT_ROOT)}")
@@ -652,15 +861,25 @@ def _resolve_zip_firmware(zip_path):
 
 
 def _resolve_rar_firmware(rar_path):
-    temp_parent = WORK_DIR if os.path.isdir(WORK_DIR) else PROJECT_ROOT
-    temp_dir = tempfile.mkdtemp(prefix="fw_input_", dir=temp_parent)
-    result = run(
+    temp_dir = _make_temp_input_dir()
+    _info(f"inspect rar  {os.path.basename(rar_path)}")
+    result = subprocess.run(
         f'7z x "{rar_path}" -o"{temp_dir}" -y',
-        label=f"inspect rar  {os.path.basename(rar_path)}",
-        quiet=True,
+        shell=True,
+        capture_output=True,
+        text=True,
     )
 
-    if result.returncode != 0:
+    resolved = _find_largest_firmware_file(temp_dir)
+    if resolved and os.path.getsize(resolved) == 0:
+        resolved = None
+
+    if result.returncode != 0 and not resolved:
+        stderr = (result.stderr or "") + (result.stdout or "")
+        if "Unsupported Method" in stderr:
+            _warn("7z could list the RAR but could not decode at least one member compression method")
+            if _try_extract_rar_with_fallbacks(rar_path, temp_dir):
+                resolved = _find_largest_firmware_file(temp_dir)
         members = _list_archive_members(rar_path)
         preferred = []
         others = []
@@ -672,11 +891,27 @@ def _resolve_rar_firmware(rar_path):
                 others.append((size, name))
 
         selected = preferred + [name for _, name in sorted(others, reverse=True)]
-        if not selected or not _extract_selected_archive_members(rar_path, temp_dir, selected):
-            print(f"[FATAL] Failed to inspect RAR input: {rar_path}", flush=True)
+        if not resolved and (not selected or not _extract_selected_archive_members(rar_path, temp_dir, selected)):
+            print(
+                f"[FATAL] Failed to inspect RAR input: {rar_path}",
+                flush=True,
+            )
+            if "Unsupported Method" in stderr:
+                print(
+                    "[FATAL] 7z reported an unsupported RAR compression method and no optional fallback extractor succeeded. Install unrar/unar/bsdtar or handle this sample as BLOCKED.",
+                    flush=True,
+                )
             sys.exit(1)
 
-    resolved = _find_largest_firmware_file(temp_dir)
+    resolved = resolved or _find_largest_firmware_file(temp_dir)
+    resolved = resolved or _find_largest_extracted_blob(temp_dir)
+    if resolved and os.path.getsize(resolved) == 0:
+        print(f"[FATAL] Extracted firmware blob is empty after RAR unpack: {resolved}", flush=True)
+        print(
+            "[FATAL] The current extractor likely does not support this RAR compression method.",
+            flush=True,
+        )
+        sys.exit(1)
     if not resolved:
         print("[FATAL] No payload.bin, .bin, .img, .web, .trx, .w, or .pkgtb found inside RAR.", flush=True)
         print(f"        RAR: {rar_path}", flush=True)
@@ -687,9 +922,34 @@ def _resolve_rar_firmware(rar_path):
     return resolved, resolved_type
 
 
+def _resolve_tar_firmware(tar_path):
+    temp_dir = _make_temp_input_dir()
+    run_critical(
+        f'tar -xf "{tar_path}" -C "{temp_dir}"',
+        fatal_msg=f"Failed to inspect TAR input: {tar_path}",
+        label=f"inspect tar  {os.path.basename(tar_path)}",
+        quiet=True,
+    )
+
+    resolved = _find_largest_firmware_file(temp_dir)
+    if not resolved:
+        resolved = _find_largest_extracted_blob(temp_dir)
+        if resolved:
+            _warn("no known firmware extension found inside TAR; using largest extracted blob fallback")
+        else:
+            print("[FATAL] No payload.bin, .bin, .img, .web, .trx, .w, or .pkgtb found inside TAR.", flush=True)
+            print(f"        TAR: {tar_path}", flush=True)
+            sys.exit(1)
+
+    resolved_type = detect_input_type(resolved)
+    _info(f"resolved firmware: {os.path.relpath(resolved, PROJECT_ROOT)}")
+    return resolved, resolved_type
+
+
 # ── Clean ─────────────────────────────────────────────────────────────────────
 
 def clean(skip):
+    global _EXTRACTED_ACTIVE
     if skip:
         _info("reuse mode — skipping extraction")
         return
@@ -706,6 +966,7 @@ def clean(skip):
     os.makedirs(EXTRACTED_DIR, exist_ok=True)
     # ensure input dir exists for user guidance
     os.makedirs(FIRMWARE_DIR, exist_ok=True)
+    _EXTRACTED_ACTIVE = False
 
 
 def _reset_dir_fast(path):
@@ -759,8 +1020,7 @@ def extract_payload(payload_path=None):
     """
     Extract partitions from a payload.bin using payload-dumper-go.
 
-    Returns True on success, False if the file is missing.
-    Aborts on tool failure — a partial extraction leaves rootfs undefined.
+    Returns True on success, False on missing file or tool/extraction failure.
     """
     if payload_path is None:
         payload_path = os.path.join(WORK_DIR, "payload.bin")
@@ -769,13 +1029,25 @@ def extract_payload(payload_path=None):
         _warn(f"payload.bin not found: {payload_path}")
         return False
 
-    run_critical_with_heartbeat(
-        f'"{DUMPER}" -o "{EXTRACTED_DIR}" "{payload_path}"',
-        fatal_msg="payload-dumper-go failed — extracted partition set incomplete.",
-        label="payload-dumper-go  (extracting partitions, this may take several minutes)",
-        timeout=1800,   # 30 min; large OTAs can take 5–10 min
-        interval=10,    # heartbeat every 10s — avoids flooding for long extractions
-    )
+    try:
+        ensure_dumper()
+    except SystemExit:
+        _warn("payload-dumper-go unavailable; continuing without payload extraction")
+        return False
+
+    try:
+        run_critical_with_heartbeat(
+            f'"{DUMPER}" -o "{EXTRACTED_DIR}" "{payload_path}"',
+            fatal_msg="payload-dumper-go failed — extracted partition set incomplete.",
+            label="payload-dumper-go  (extracting partitions, this may take several minutes)",
+            timeout=1800,   # 30 min; large OTAs can take 5–10 min
+            interval=10,    # heartbeat every 10s — avoids flooding for long extractions
+        )
+    except SystemExit:
+        _warn("payload-dumper-go extraction failed; continuing with fallback analysis roots")
+        return False
+    global _EXTRACTED_ACTIVE
+    _EXTRACTED_ACTIVE = True
     return True
 
 
@@ -851,21 +1123,19 @@ def _validate_partition_images():
     system_dir = os.path.join(WORK_DIR, "system")
 
     if os.path.exists(system_img):
-        return
+        return True
     if os.path.isdir(system_dir) and os.listdir(system_dir):
-        return
+        return True
 
     found = _search_for_partition("system", EXTRACTED_DIR)
     if found:
-        return
+        return True
 
-    print("\n[FATAL] system partition not found after extraction.", flush=True)
-    print(f"        Searched: {system_img}", flush=True)
-    print(f"                  {system_dir}", flush=True)
-    print(f"                  {EXTRACTED_DIR} (recursive)", flush=True)
-    print("        Verify that payload-dumper-go produced output in .cache/extracted/",
-          flush=True)
-    sys.exit(1)
+    _warn("system partition not found after extraction; rootfs assembly will use fallback analysis roots")
+    _info(f"searched: {system_img}")
+    _info(f"          {system_dir}")
+    _info(f"          {EXTRACTED_DIR} (recursive)")
+    return False
 
 
 # ── Partition directory search ────────────────────────────────────────────────
@@ -1100,18 +1370,88 @@ def _validate_rootfs_structure():
     _ok("rootfs structure verified  (bin, lib, etc)")
 
 
+def _best_effort_analysis_root(*base_dirs):
+    """
+    Choose a non-empty directory to analyze when ideal rootfs assembly fails.
+    Prefer directories with more files and stronger web/system hints.
+    """
+    best = None
+    best_score = -1
+    for base_dir in base_dirs:
+        if not base_dir or not os.path.isdir(base_dir):
+            continue
+        for dirpath, dirnames, filenames in os.walk(base_dir):
+            dirnames[:] = [d for d in dirnames if d not in _SEARCH_SKIP and not d.startswith("_nested_")]
+            file_count = len(filenames)
+            if file_count == 0:
+                continue
+            score = file_count
+            lower = dirpath.lower()
+            if any(tok in lower for tok in ("/www", "/web", "/cgi-bin", "/htdocs", "/system", "/vendor", "/usr/lib/lua/luci")):
+                score += 100
+            if any(name in filenames for name in ("payload.bin", "ap.img", "system.img", "vendor.img")):
+                score += 50
+            if score > best_score:
+                best_score = score
+                best = dirpath
+    return best
+
+
+def _active_fallback_dirs():
+    dirs = [WORK_DIR]
+    if _EXTRACTED_ACTIVE:
+        dirs.append(EXTRACTED_DIR)
+    return dirs
+
+
+def _fallback_analysis_root_for_input(path=None):
+    """
+    Pick a survivable analysis root after extraction/assembly failure.
+    Preference order:
+      1. workspace build dir
+      2. extracted payload dir
+      3. directory containing the original input
+    """
+    candidate = _best_effort_analysis_root(*_active_fallback_dirs())
+    if candidate:
+        return candidate
+    if path:
+        parent = os.path.dirname(os.path.abspath(path))
+        if os.path.isdir(parent):
+            return parent
+    return None
+
+
 def build_rootfs():
     system_ok = build_rootfs_for_partition("system")
     build_rootfs_for_partition("vendor")
 
     if not system_ok:
+        fallback = _best_effort_analysis_root(*_active_fallback_dirs())
+        if fallback:
+            _warn("failed to populate .cache/rootfs/system; using best-effort extracted analysis root")
+            _ok(f"analysis root: {os.path.relpath(fallback, PROJECT_ROOT)}")
+            return fallback
         print("\n[FATAL] Failed to populate .cache/rootfs/system.", flush=True)
         print(f"        Expected: {os.path.join(ROOTFS_DIR, 'system')}", flush=True)
         print("        Verify extraction output in .cache/extracted/ and .cache/build",
               flush=True)
         sys.exit(1)
 
-    _validate_rootfs_structure()
+    try:
+        _validate_rootfs_structure()
+    except SystemExit:
+        fallback = _best_effort_analysis_root(
+            os.path.join(ROOTFS_DIR, "system"),
+            *_active_fallback_dirs(),
+        )
+        if fallback:
+            _warn("assembled rootfs is incomplete; using best-effort analysis root")
+            _ok(f"analysis root: {os.path.relpath(fallback, PROJECT_ROOT)}")
+            return fallback
+        raise
+
+    return os.path.join(ROOTFS_DIR, "system")
 
 
 # ── Extraction handlers (one per input type) ──────────────────────────────────
@@ -1121,23 +1461,21 @@ def handle_zip_input(zip_path):
 
     ok = extract_payload()
     if not ok:
-        print("[FATAL] payload.bin not found inside OTA zip.", flush=True)
-        print("        The archive may be incomplete or not a standard OTA package.",
-              flush=True)
-        sys.exit(1)
+        _warn("payload.bin not found inside OTA zip; continuing with extracted archive contents")
+        return False
 
     collect_images()
-    _validate_partition_images()
+    return _validate_partition_images()
 
 
 def handle_payload_input(payload_path):
     ok = extract_payload(payload_path=payload_path)
     if not ok:
-        print(f"[FATAL] payload.bin not found: {payload_path}", flush=True)
-        sys.exit(1)
+        _warn(f"payload.bin not found: {payload_path}; continuing with best-effort fallback")
+        return False
 
     collect_images()
-    _validate_partition_images()
+    return _validate_partition_images()
 
 
 def handle_img_input(img_path):
@@ -1374,6 +1712,8 @@ def _looks_like_rootfs_candidate(path):
         return True
     if core_count >= 2 and webish and info["file_count"] >= 200:
         return True
+    if core_count >= 1 and webish and info["size_bytes"] >= 1 * 1024 * 1024 and info["file_count"] >= 80:
+        return True
     return False
 
 
@@ -1381,6 +1721,10 @@ def _find_rootfs_candidates(base_dir):
     candidates = []
     seen = set()
     for dirpath, dirnames, _ in os.walk(base_dir):
+        current_real = os.path.realpath(dirpath)
+        if current_real not in seen and _looks_like_rootfs_candidate(dirpath):
+            seen.add(current_real)
+            candidates.append(_describe_rootfs_candidate(dirpath))
         for d in sorted(dirnames):
             candidate = os.path.join(dirpath, d)
             real_candidate = os.path.realpath(candidate)
@@ -1442,6 +1786,54 @@ def _collect_ranked_rootfs_candidates(*base_dirs):
     return candidates
 
 
+def _looks_like_segmented_bundle_dir(dirpath):
+    """
+    Detect firmware layouts that unpack into many large extensionless chunks
+    rather than a classic rootfs tree. TP-Link C80 images currently look like
+    this after binwalk/LZMA expansion.
+    """
+    try:
+        names = os.listdir(dirpath)
+    except OSError:
+        return False
+
+    large_chunks = 0
+    hexish_chunks = 0
+    total_large_bytes = 0
+    for name in names:
+        path = os.path.join(dirpath, name)
+        if not os.path.isfile(path):
+            continue
+        if "." in name:
+            continue
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if size < 128 * 1024:
+            continue
+        large_chunks += 1
+        total_large_bytes += size
+        if re.fullmatch(r"[0-9A-Fa-f]{2,}", name):
+            hexish_chunks += 1
+
+    return (
+        large_chunks >= 8
+        and hexish_chunks >= max(4, large_chunks // 3)
+        and total_large_bytes >= 8 * 1024 * 1024
+    )
+
+
+def _find_segmented_bundle_root(base_dir):
+    if not base_dir or not os.path.isdir(base_dir):
+        return None
+    for dirpath, dirnames, _ in os.walk(base_dir):
+        dirnames[:] = [d for d in dirnames if not d.startswith("_nested_")]
+        if _looks_like_segmented_bundle_dir(dirpath):
+            return dirpath
+    return None
+
+
 def _collect_ranked_bundle_candidates(*base_dirs):
     candidates = []
     seen = set()
@@ -1461,35 +1853,45 @@ def _collect_ranked_bundle_candidates(*base_dirs):
                     continue
                 if lower.endswith((".img", ".bin", ".fw", ".sig")):
                     bundle_files.append(name)
-            if len(bundle_files) < 5:
+            if len(bundle_files) >= 5:
+                score = len(bundle_files)
+                why = [f"bundle-files:{len(bundle_files)}"]
+                if any(name.lower() == "ap_version.txt" for name in filenames):
+                    score += 4
+                    why.append("ap-version")
+                subdirs = []
+                try:
+                    subdirs = [
+                        d for d in os.listdir(dirpath)
+                        if os.path.isdir(os.path.join(dirpath, d))
+                    ]
+                except Exception:
+                    pass
+                if any(re.fullmatch(r"(universal|wa\d+)", d.lower()) for d in subdirs):
+                    score += 4
+                    why.append("module-variants")
+
+                candidates.append({
+                    "path": dirpath,
+                    "score": score,
+                    "file_count": len(filenames),
+                    "size_bytes": _dir_size_quiet(dirpath),
+                    "core_dirs": [],
+                    "why": why,
+                    "bundle_files": len(bundle_files),
+                })
                 continue
 
-            score = len(bundle_files)
-            why = [f"bundle-files:{len(bundle_files)}"]
-            if any(name.lower() == "ap_version.txt" for name in filenames):
-                score += 4
-                why.append("ap-version")
-            subdirs = []
-            try:
-                subdirs = [
-                    d for d in os.listdir(dirpath)
-                    if os.path.isdir(os.path.join(dirpath, d))
-                ]
-            except Exception:
-                pass
-            if any(re.fullmatch(r"(universal|wa\d+)", d.lower()) for d in subdirs):
-                score += 4
-                why.append("module-variants")
-
-            candidates.append({
-                "path": dirpath,
-                "score": score,
-                "file_count": len(filenames),
-                "size_bytes": _dir_size_quiet(dirpath),
-                "core_dirs": [],
-                "why": why,
-                "bundle_files": len(bundle_files),
-            })
+            if _looks_like_segmented_bundle_dir(dirpath):
+                candidates.append({
+                    "path": dirpath,
+                    "score": 10,
+                    "file_count": len(filenames),
+                    "size_bytes": _dir_size_quiet(dirpath),
+                    "core_dirs": [],
+                    "why": ["segmented-bundle", "large-extensionless-chunks"],
+                    "bundle_files": 0,
+                })
 
     candidates.sort(
         key=lambda x: (-x["score"], -x["bundle_files"], -x["size_bytes"], x["path"])
@@ -1584,6 +1986,40 @@ def _looks_like_nested_blob(path):
     return False
 
 
+def _rank_nested_blob(path):
+    lower = path.lower().replace("\\", "/")
+    base = os.path.basename(lower)
+    score = 0
+
+    if base.endswith(".7z"):
+        score += 30
+    if base.endswith(".xz") or base.endswith(".lzma"):
+        score += 25
+    if base.endswith(".img"):
+        score += 20
+    if base.endswith(".bin"):
+        score += 10
+
+    for _, magic in _FS_MAGIC_PATTERNS:
+        if _read_magic(path, len(magic)) == magic:
+            score += 100
+            break
+
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    if size >= 8 * 1024 * 1024:
+        score += 20
+    elif size >= 1 * 1024 * 1024:
+        score += 10
+
+    if ".extracted/_decoded.bin" in lower:
+        score -= 10
+
+    return score, size, path
+
+
 def _has_ubi_magic(path):
     return _read_magic(path, 4) == b"UBI#"
 
@@ -1609,16 +2045,16 @@ def _resolve_ubireader_tools():
 
 
 def _fail_missing_ubireader(blob_path):
-    print("[FATAL] UBI/UBIFS firmware detected but ubireader tools are missing.", flush=True)
-    print("        Install: pip3 install ubireader  or  your distro's ubireader package", flush=True)
-    print(f"        Blob: {blob_path}", flush=True)
-    sys.exit(1)
+    _warn("UBI/UBIFS firmware detected but ubireader tools are missing")
+    _info("Install: pip3 install ubireader  or  your distro's ubireader package")
+    _info(f"Blob: {blob_path}")
+    return None
 
 
 def _extract_ubi_blob(blob_path, out_dir):
     tools = _resolve_ubireader_tools()
     if tools is None:
-        _fail_missing_ubireader(blob_path)
+        return _fail_missing_ubireader(blob_path)
     extract_files, extract_images = tools
 
     shutil.rmtree(out_dir, ignore_errors=True)
@@ -1676,15 +2112,31 @@ def _find_ubi_blobs(base_dir):
 
 
 def _decompress_lzma_blob(blob_path, out_path):
-    try:
-        with open(blob_path, "rb") as src:
-            data = src.read()
-        decoded = lzma.decompress(data)
-        with open(out_path, "wb") as dst:
-            dst.write(decoded)
-        return os.path.getsize(out_path) > 0
-    except Exception:
-        return False
+    formats = [lzma.FORMAT_AUTO, lzma.FORMAT_ALONE]
+    for fmt in formats:
+        try:
+            decompressor = lzma.LZMADecompressor(format=fmt)
+            wrote = False
+            with open(blob_path, "rb") as src, open(out_path, "wb") as dst:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    decoded = decompressor.decompress(chunk)
+                    if decoded:
+                        dst.write(decoded)
+                        wrote = True
+                    if decompressor.eof:
+                        break
+            if wrote and os.path.getsize(out_path) > 0:
+                return True
+        except Exception:
+            pass
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+    return False
 
 
 def _binwalk_extract_command(blob_path, out_dir, recursive=True):
@@ -1887,7 +2339,8 @@ def _unpack_nested_blob(blob_path, out_dir):
             label=f"binwalk nested  {os.path.basename(blob_path)}",
             quiet=True,
         )
-        if any(os.scandir(out_dir)):
+        os.makedirs(out_dir, exist_ok=True)
+        if _dir_has_entries(out_dir):
             extracted = True
 
     raw_dir = os.path.join(out_dir, "_raw")
@@ -1897,7 +2350,7 @@ def _unpack_nested_blob(blob_path, out_dir):
         label=f"7z nested  {os.path.basename(blob_path)}",
         quiet=True,
     )
-    if proc.returncode == 0 and any(os.scandir(raw_dir)):
+    if (proc.returncode == 0 or _dir_has_entries(raw_dir)) and _dir_has_entries(raw_dir):
         extracted = True
 
     decoded = os.path.join(out_dir, "_decoded.bin")
@@ -1947,7 +2400,7 @@ def _expand_dji_bundles(base_dir, max_files=24):
         _unpack_nested_blob(blob_path, nested_dir)
 
 
-def _expand_nested_iot_blobs(base_dir, max_depth=3):
+def _expand_nested_iot_blobs(base_dir, max_depth=3, max_blobs_per_dir=24):
     queue = [(base_dir, 0)]
     seen = set()
 
@@ -1955,18 +2408,69 @@ def _expand_nested_iot_blobs(base_dir, max_depth=3):
         current_dir, depth = queue.pop(0)
         if depth >= max_depth:
             continue
+        pending = []
         for dirpath, dirnames, filenames in os.walk(current_dir):
             dirnames[:] = [d for d in dirnames if not d.startswith("_nested_")]
             for filename in filenames:
                 blob_path = os.path.join(dirpath, filename)
                 if blob_path in seen or not _looks_like_nested_blob(blob_path):
                     continue
-                seen.add(blob_path)
-                nested_dir = os.path.join(
-                    dirpath, f"_nested_{os.path.basename(blob_path)}"
-                )
-                if _unpack_nested_blob(blob_path, nested_dir):
-                    queue.append((nested_dir, depth + 1))
+                pending.append(blob_path)
+
+        pending.sort(key=_rank_nested_blob, reverse=True)
+        for blob_path in pending[:max_blobs_per_dir]:
+            seen.add(blob_path)
+            nested_dir = os.path.join(
+                os.path.dirname(blob_path),
+                f"_nested_{os.path.basename(blob_path)}"
+            )
+            if _unpack_nested_blob(blob_path, nested_dir):
+                queue.append((nested_dir, depth + 1))
+
+
+def _decode_segmented_chunk(blob_path, out_dir):
+    shutil.rmtree(out_dir, ignore_errors=True)
+    os.makedirs(out_dir, exist_ok=True)
+
+    decoded = os.path.join(out_dir, "_decoded.bin")
+    if _decompress_lzma_blob(blob_path, decoded):
+        return out_dir
+
+    raw_dir = os.path.join(out_dir, "_raw")
+    os.makedirs(raw_dir, exist_ok=True)
+    proc = run(
+        f'7z x "{blob_path}" -o"{raw_dir}" -y',
+        label=f"7z segmented  {os.path.basename(blob_path)}",
+        quiet=True,
+    )
+    if (proc.returncode == 0 or _dir_has_entries(raw_dir)) and _dir_has_entries(raw_dir):
+        return out_dir
+    return None
+
+
+def _expand_segmented_bundle_chunks(base_dir, max_blobs=8):
+    pending = []
+    for dirpath, dirnames, filenames in os.walk(base_dir):
+        dirnames[:] = [d for d in dirnames if not d.startswith("_nested_")]
+        if not _looks_like_segmented_bundle_dir(dirpath):
+            continue
+        for filename in filenames:
+            blob_path = os.path.join(dirpath, filename)
+            if not _looks_like_nested_blob(blob_path):
+                continue
+            pending.append(blob_path)
+
+    pending.sort(key=_rank_nested_blob, reverse=True)
+    expanded = []
+    for blob_path in pending[:max_blobs]:
+        nested_dir = os.path.join(
+            os.path.dirname(blob_path),
+            f"_nested_{os.path.basename(blob_path)}"
+        )
+        expanded_dir = _decode_segmented_chunk(blob_path, nested_dir)
+        if expanded_dir:
+            expanded.append(expanded_dir)
+    return expanded
 
 
 def _try_extract_iot_blob(blob_path, out_dir, label):
@@ -1982,9 +2486,25 @@ def _try_extract_iot_blob(blob_path, out_dir, label):
         label=label,
         quiet=True,
     )
+    early_sqfs = find_squashfs_root(out_dir)
+    if early_sqfs:
+        return early_sqfs
+    segmented_root = _find_segmented_bundle_root(out_dir)
+    segmented_expanded = []
+    if segmented_root:
+        _info(
+            "segmented firmware bundle detected; probing top nested chunks "
+            f"({os.path.relpath(segmented_root, PROJECT_ROOT)})"
+        )
+        segmented_expanded = _expand_segmented_bundle_chunks(segmented_root)
+        for nested_dir in segmented_expanded:
+            _expand_nested_iot_blobs(nested_dir, max_depth=2, max_blobs_per_dir=8)
+        sqfs = find_squashfs_root(out_dir)
+        if sqfs:
+            return sqfs
     if dji_fast:
         _expand_dji_bundles(out_dir)
-    else:
+    elif not segmented_expanded:
         _expand_nested_iot_blobs(out_dir)
 
     ubi_blobs = _find_ubi_blobs(out_dir)
@@ -2008,6 +2528,9 @@ def _try_extract_iot_blob(blob_path, out_dir, label):
         quiet=True,
     )
     if proc.returncode == 0 or os.listdir(inner):
+        early_inner_sqfs = find_squashfs_root(inner)
+        if early_inner_sqfs:
+            return early_inner_sqfs
         if dji_fast:
             _expand_dji_bundles(inner)
         else:
@@ -2105,15 +2628,19 @@ def extract_iot_firmware(bin_path):
     """
     Extract an IoT firmware .bin with binwalk, locate the squashfs-root,
     and return that rootfs path for the analysis stage.
-    Aborts the pipeline if binwalk fails or squashfs-root is not found.
+    Falls back to weaker analysis roots when classic rootfs extraction fails.
     """
-    if shutil.which("binwalk") is None:
-        print("[FATAL] binwalk not found in PATH.", flush=True)
-        print("        Install: pip3 install binwalk  or  apt install binwalk", flush=True)
-        sys.exit(1)
-
-    out_dir = os.path.join(WORK_DIR, "_iot_extract")
+    out_dir = _iot_extract_dir_for(bin_path)
+    _reset_dir_fast(out_dir)
     os.makedirs(out_dir, exist_ok=True)
+
+    if shutil.which("binwalk") is None:
+        _warn("binwalk not found in PATH; using raw blob fallback analysis root")
+        raw_copy = os.path.join(out_dir, os.path.basename(bin_path))
+        if os.path.abspath(raw_copy) != os.path.abspath(bin_path):
+            shutil.copy2(bin_path, raw_copy)
+        _ok(f"analysis root: {os.path.relpath(out_dir, PROJECT_ROOT)}")
+        return out_dir
 
     is_dji_blob = _is_dji_firmware_blob(bin_path)
 
@@ -2161,17 +2688,21 @@ def extract_iot_firmware(bin_path):
             _ok(f"analysis root: {os.path.relpath(out_dir, PROJECT_ROOT)}")
             _ok(f"selected score: {selected['score']}  ({', '.join(selected['why'])})")
             return out_dir
+        if _count_files(out_dir) > 0:
+            _warn("no classic rootfs or bundle candidate found; using extracted directory fallback")
+            _ok(f"analysis root: {os.path.relpath(out_dir, PROJECT_ROOT)}")
+            return out_dir
         if is_dji_blob and _count_files(out_dir) > 0:
             _warn("no rootfs found in DJI package; using extracted bundle directory for focused triage")
             _ok(f"analysis root: {os.path.relpath(out_dir, PROJECT_ROOT)}")
             return out_dir
 
-        print("[FATAL] binwalk ran but no squashfs/cramfs/ubifs root was found.",
-              flush=True)
-        print(f"        Searched: {out_dir}", flush=True)
-        print("        Checked extracted output, raw filesystem magic offsets, and generic bundle candidates.",
-              flush=True)
-        sys.exit(1)
+        _warn("binwalk ran but no classic rootfs or bundle candidate was found; using raw blob fallback")
+        raw_copy = os.path.join(out_dir, os.path.basename(bin_path))
+        if os.path.abspath(raw_copy) != os.path.abspath(bin_path):
+            shutil.copy2(bin_path, raw_copy)
+        _ok(f"analysis root: {os.path.relpath(out_dir, PROJECT_ROOT)}")
+        return out_dir
 
     rejected = {}
     selected = None
@@ -2189,11 +2720,9 @@ def extract_iot_firmware(bin_path):
 
     if selected is None:
         best = candidates[0]
-        print("[FATAL] Extracted IoT rootfs is too small to trust.", flush=True)
-        print(f"        Best candidate: {best['path']}", flush=True)
-        print(f"        Found: {best['file_count']} files  (expected > 2000 for router firmware)",
-              flush=True)
-        sys.exit(1)
+        _warn("extracted IoT rootfs is weak; using best candidate anyway for fallback analysis")
+        _ok(f"analysis root: {os.path.relpath(best['path'], PROJECT_ROOT)}")
+        return best["path"]
 
     sqfs = selected["path"]
     count = selected["validated_file_count"]
@@ -2227,33 +2756,40 @@ def resolve_input(input_arg, type_arg):
             _warn(f"input file not found: {path}")
             return None, None
     else:
-        try:
-            candidates = sorted(
-                f for f in os.listdir(FIRMWARE_DIR)
-                if os.path.isfile(os.path.join(FIRMWARE_DIR, f))
-            )
-        except FileNotFoundError:
-            candidates = []
+        candidates = _iter_input_files(FIRMWARE_DIR)
 
         if not candidates:
             print("\n[FATAL] No input file found in inputs/", flush=True)
             print(f"        Expected: {FIRMWARE_DIR}", flush=True)
-            print("        Supported formats: .zip (OTA), payload.bin, .img", flush=True)
+            print("        Supported formats: .zip, .rar, .tar, payload.bin, .img, .bin", flush=True)
             sys.exit(1)
 
         if len(candidates) > 1:
             _warn("Multiple input files found:")
             for i, f in enumerate(candidates, 1):
-                print(f"        {i}. {f}", flush=True)
+                try:
+                    label = os.path.relpath(f, FIRMWARE_DIR)
+                except ValueError:
+                    label = f
+                print(f"        {i}. {label}", flush=True)
             print(flush=True)
             print("    Use --input <filename> to select one.", flush=True)
             sys.exit(1)
 
-        path = os.path.join(FIRMWARE_DIR, candidates[0])
+        path = candidates[0]
 
     if type_arg and type_arg != "auto":
         detected = type_arg
         _info(f"{os.path.basename(path)}  (type: {detected}, forced)")
+        if detected == INPUT_ZIP:
+            path, detected = _resolve_zip_firmware(path)
+            _info(f"{os.path.basename(path)}  (resolved type: {detected}, forced)")
+        elif detected == INPUT_RAR:
+            path, detected = _resolve_rar_firmware(path)
+            _info(f"{os.path.basename(path)}  (resolved type: {detected}, forced)")
+        elif detected == INPUT_TAR:
+            path, detected = _resolve_tar_firmware(path)
+            _info(f"{os.path.basename(path)}  (resolved type: {detected}, forced)")
     else:
         detected = detect_input_type(path)
         if detected == INPUT_ZIP:
@@ -2263,6 +2799,10 @@ def resolve_input(input_arg, type_arg):
         elif detected == INPUT_RAR:
             _info(f"{os.path.basename(path)}  (type: rar)")
             path, detected = _resolve_rar_firmware(path)
+            _info(f"{os.path.basename(path)}  (resolved type: {detected})")
+        elif detected == INPUT_TAR:
+            _info(f"{os.path.basename(path)}  (type: tar)")
+            path, detected = _resolve_tar_firmware(path)
             _info(f"{os.path.basename(path)}  (resolved type: {detected})")
         else:
             _info(f"{os.path.basename(path)}  (type: {detected})")
@@ -2426,9 +2966,8 @@ def _parse_batch_metrics(output):
 def run_batch_iot_triage():
     rows = []
     candidates = []
-    for name in sorted(os.listdir(FIRMWARE_DIR)):
-        path = os.path.join(FIRMWARE_DIR, name)
-        if os.path.isfile(path) and _is_iot_batch_candidate(path):
+    for path in _iter_input_files(FIRMWARE_DIR):
+        if _is_iot_batch_candidate(path):
             candidates.append(path)
 
     name_width = max(20, max((len(os.path.basename(p)) for p in candidates), default=0))
@@ -2495,13 +3034,13 @@ def main():
         help="reuse existing rootfs, skip all extraction stages")
     parser.add_argument(
         "--input", metavar="FILE",
-        help="path to input file (OTA zip / payload.bin / .img); "
+        help="path to input file (OTA zip / tar / payload.bin / .img / .bin); "
              "default: the single file found in inputs/")
     parser.add_argument(
         "--type", metavar="TYPE",
-        choices=["auto", "zip", "payload", "img", "iot"],
+        choices=["auto", "zip", "rar", "tar", "payload", "img", "iot"],
         default="auto",
-        help="force input type (auto|zip|payload|img|iot)  [default: auto]")
+        help="force input type (auto|zip|rar|tar|payload|img|iot)  [default: auto]")
     parser.add_argument(
         "--output", metavar="FILE",
         help="save analysis results as JSON  (e.g. results.json)")
@@ -2555,15 +3094,9 @@ def main():
     if args.input:
         original_input_path = os.path.abspath(args.input)
     elif not args.skip and not args.batch_iot and not args.ingest_dir:
-        try:
-            original_candidates = sorted(
-                f for f in os.listdir(FIRMWARE_DIR)
-                if os.path.isfile(os.path.join(FIRMWARE_DIR, f))
-            )
-        except FileNotFoundError:
-            original_candidates = []
+        original_candidates = _iter_input_files(FIRMWARE_DIR)
         if len(original_candidates) == 1:
-            original_input_path = os.path.join(FIRMWARE_DIR, original_candidates[0])
+            original_input_path = original_candidates[0]
 
     preflight_path = None
     preflight_type = None
@@ -2579,7 +3112,7 @@ def main():
             else:
                 original_input_type = preflight_type
 
-    run_artifacts = _prepare_run_artifacts(preflight_path)
+    run_artifacts = _prepare_run_artifacts(original_input_path or preflight_path)
     _log_fh = None
     if not args.batch_iot:
         _log_fh = open(run_artifacts["log_path"], "a", encoding="utf-8", errors="replace", buffering=1)
@@ -2669,6 +3202,7 @@ def main():
 
     analysis_system_path = None
     analysis_vendor_path = None
+    assembled_root = None
     input_type = preflight_type
 
     if not args.skip:
@@ -2689,34 +3223,67 @@ def main():
             os.environ["FIRMWARE_ORIGINAL_INPUT_PATH"] = os.path.abspath(original_input_path)
             os.environ["FIRMWARE_ORIGINAL_INPUT_TYPE"] = original_input_type or input_type
 
-        if input_type != INPUT_IOT:
-            ensure_dumper()
-
-        if input_type == INPUT_ZIP:
-            handle_zip_input(path)
-        elif input_type == INPUT_PAYLOAD:
-            handle_payload_input(path)
-        elif input_type == INPUT_IMG:
-            handle_img_input(path)
-        elif input_type == INPUT_IOT:
-            analysis_system_path = handle_iot_input(path)
-            if analysis_system_path == os.path.join(ROOTFS_DIR, "system"):
-                analysis_vendor_path = os.path.join(ROOTFS_DIR, "vendor")
-        else:
-            print(f"\n[!] Cannot determine file type for: {os.path.basename(path)}",
-                  flush=True)
-            print("    Use --type zip|payload|img|iot to specify it explicitly",
-                  flush=True)
-            sys.exit(1)
+        try:
+            if input_type == INPUT_ZIP:
+                handle_zip_input(path)
+            elif input_type == INPUT_PAYLOAD:
+                handle_payload_input(path)
+            elif input_type == INPUT_IMG:
+                handle_img_input(path)
+            elif input_type == INPUT_IOT:
+                analysis_system_path = handle_iot_input(path)
+                if analysis_system_path == os.path.join(ROOTFS_DIR, "system"):
+                    analysis_vendor_path = os.path.join(ROOTFS_DIR, "vendor")
+            else:
+                _warn(f"cannot determine file type for: {os.path.basename(path)}")
+                _warn("using best-effort fallback analysis root")
+                analysis_system_path = _fallback_analysis_root_for_input(path)
+                analysis_vendor_path = None
+                if not analysis_system_path:
+                    sys.exit(1)
+                _ok(f"analysis root: {os.path.relpath(analysis_system_path, PROJECT_ROOT)}")
+        except SystemExit as exc:
+            if input_type == INPUT_IOT:
+                fallback_root = _fallback_analysis_root_for_input(path)
+                if not fallback_root:
+                    raise
+                _warn(
+                    f"IoT extraction failed with exit {getattr(exc, 'code', 1)}; "
+                    "continuing with fallback analysis root"
+                )
+                _ok(f"analysis root: {os.path.relpath(fallback_root, PROJECT_ROOT)}")
+                analysis_system_path = fallback_root
+                analysis_vendor_path = None
+            else:
+                fallback_root = _fallback_analysis_root_for_input(path)
+                if not fallback_root:
+                    raise
+                _warn(
+                    f"extraction/assembly failed with exit {getattr(exc, 'code', 1)}; "
+                    "continuing with best-effort fallback analysis root"
+                )
+                _ok(f"analysis root: {os.path.relpath(fallback_root, PROJECT_ROOT)}")
+                analysis_system_path = fallback_root
+                analysis_vendor_path = None
 
         _ok(f"Extraction complete  ({_fmt_time(time.time() - t_ext)})")
 
         # ── [3] Rootfs assembly (skipped for IoT — done inside extraction) ────
-        if input_type != INPUT_IOT:
+        if input_type != INPUT_IOT and analysis_system_path is None:
             _stage(3, total, "Rootfs assembly")
             _info("Running...")
             t_rootfs = time.time()
-            build_rootfs()
+            try:
+                assembled_root = build_rootfs()
+            except SystemExit as exc:
+                assembled_root = _fallback_analysis_root_for_input(path)
+                if not assembled_root:
+                    raise
+                _warn(
+                    f"rootfs assembly failed with exit {getattr(exc, 'code', 1)}; "
+                    "continuing with fallback analysis root"
+                )
+                _ok(f"analysis root: {os.path.relpath(assembled_root, PROJECT_ROOT)}")
             _ok(f"Rootfs assembly complete  ({_fmt_time(time.time() - t_rootfs)})")
 
     # ── [N] Vulnerability analysis ────────────────────────────────────────────
@@ -2726,8 +3293,12 @@ def main():
         analysis_system_path = None
         analysis_vendor_path = None
     elif input_type != INPUT_IOT:
-        analysis_system_path = os.path.join(ROOTFS_DIR, "system")
-        analysis_vendor_path = os.path.join(ROOTFS_DIR, "vendor")
+        analysis_system_path = assembled_root or os.path.join(ROOTFS_DIR, "system")
+        analysis_vendor_path = (
+            os.path.join(ROOTFS_DIR, "vendor")
+            if analysis_system_path == os.path.join(ROOTFS_DIR, "system")
+            else None
+        )
 
     run_analysis(
         output_path=output_path,

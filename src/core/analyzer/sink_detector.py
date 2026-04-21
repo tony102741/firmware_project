@@ -80,6 +80,7 @@ def detect_sinks_from_imports(imports_dict):
 
 _ERR_LOG_INDICATORS = (
     ': err:', 'err:', ': error:', 'error:', 'failed:', 'failed in ',
+    ' failed', ': %m', ') : %',
     'cannot ', 'unable to', '(unexpected)', 'unexpected:',
 )
 
@@ -119,6 +120,11 @@ def is_valid_sink(s, tier):
     if ' ' in s and '%' in s and len(s) > 15:
         if any(p in l for p in _ERR_LOG_INDICATORS):
             return False
+
+    # Strings that start with a printf format specifier (%s:, %d:) are log
+    # prefixes, not real call sites (e.g. "%s: snprintf() failed").
+    if s.startswith('%s:') or s.startswith('%d:') or s.startswith('%s '):
+        return False
 
     if len(l) > 100:
         return False

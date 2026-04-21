@@ -1,6 +1,8 @@
 # Pattern sets for dataflow chain detection.
 # Each set contains lowercase substrings matched against strings(1) output.
 
+import re
+
 # ── Existing pattern sets (preserved) ────────────────────────────────────────
 
 _NET_INPUT = {
@@ -337,6 +339,73 @@ def detect_validation_signals(imports_or_strings, use_imports=True):
         penalty -= 0.05   # gets() present: actively dangerous, reduce penalty
 
     return max(0.0, min(0.40, penalty))
+
+
+def detect_arg_level_injection(strings):
+    """
+    Detect argument-level command injection evidence.
+
+    Returns a dict with:
+      detected       - bool: True if argument-level control confirmed
+      templates      - list of matching format strings (up to 3)
+      confidence     - float upgrade amount (0.0–0.25)
+
+    Argument-level means the attacker controls the actual value passed to
+    system()/popen(), not just that both are present in the same binary.
+
+    Patterns:
+      1. sprintf/snprintf format string with %s/%d adjacent to system/popen
+         (the format string constructs the command argument)
+      2. system/popen called with a buffer that was filled by sprintf
+         (inferred from: sprintf present + /bin/sh or shell metachar template)
+      3. iwpriv/iptables/nft template with %s parameter placeholder
+         (router-specific command injection pattern)
+    """
+    _CMD_TEMPLATE_RE = re.compile(
+        r'(?:sprintf|snprintf|printf)\s*\([^)]*%[sdi][^)]*\)',
+        re.IGNORECASE,
+    )
+    _ROUTER_CMD_TEMPLATE_RE = re.compile(
+        r'(?:iwpriv|iptables|ip6tables|nft|uci|nvram)\s[^\n]*%[sdi]',
+        re.IGNORECASE,
+    )
+    _SHELL_META_TEMPLATE_RE = re.compile(
+        r'(?:echo\s+%s|sh\s+-c\s+|system\s*\()\s*[^;\n]*%[sdi]',
+        re.IGNORECASE,
+    )
+
+    templates = []
+    seen = set()
+
+    for s in strings:
+        stripped = s.strip()
+        if not stripped or stripped in seen:
+            continue
+        # Look for format strings that will become command arguments
+        for pat in (_CMD_TEMPLATE_RE, _ROUTER_CMD_TEMPLATE_RE,
+                    _SHELL_META_TEMPLATE_RE):
+            if pat.search(stripped):
+                if len(stripped) <= 150:
+                    templates.append(stripped)
+                    seen.add(stripped)
+                break
+
+    if not templates:
+        return {"detected": False, "templates": [], "confidence": 0.0}
+
+    # Confidence upgrade based on template count and specificity
+    n = len(templates)
+    has_router_cmd = any(
+        any(k in t.lower() for k in ("iwpriv", "iptables", "nft ", "uci "))
+        for t in templates
+    )
+    conf_bump = min(0.25, 0.10 * n + (0.05 if has_router_cmd else 0.0))
+
+    return {
+        "detected": True,
+        "templates": templates[:3],
+        "confidence": conf_bump,
+    }
 
 
 def upgrade_taint_confidence(path, cg, binary_path):

@@ -12,7 +12,8 @@ from .dataflow import (analyze_dataflow, analyze_dataflow_with_graph,
                        has_dangerous_memcpy_context,
                        has_dlopen_usage, is_parsing_heavy,
                        detect_validation_signals,
-                       count_validation_messages)
+                       count_validation_messages,
+                       detect_arg_level_injection)
 from .scoring import (score_sinks, calc_score,
                       calc_feature_chain_adjustment,
                       calc_chain_consistency_adjustment,
@@ -22,6 +23,7 @@ from .scoring import (score_sinks, calc_score,
                       calc_cross_binary_bonus,
                       detect_injection_templates,
                       extract_endpoints,
+                      extract_script_handler_symbols,
                       assess_auth_bypass,
                       calc_exploit_context_bonus,
                       detect_toctou_risk,
@@ -142,8 +144,14 @@ def _analyze_shell_script(path, svc):
                         {'var': var_name, 'line': line[:120], 'tier': tier})
                     seen_by_tier[tier].add(var_name)
 
-    # Merge highest-tier first so sinks list prioritises most dangerous context
-    all_findings = findings_by_tier[3] + findings_by_tier[2] + findings_by_tier[1]
+    # Filter internal path/PID vars from tier-2 (cleanup ops on hardcoded paths)
+    tier2_clean = [f for f in findings_by_tier[2]
+                   if not _is_internal_path_var(f['var'])]
+
+    # Merge highest-tier first; suppress entirely if no tier-3 and no real tier-2
+    all_findings = findings_by_tier[3] + tier2_clean + findings_by_tier[1]
+    if not findings_by_tier[3] and not tier2_clean:
+        return None
     if not all_findings:
         return None
 
@@ -152,10 +160,7 @@ def _analyze_shell_script(path, svc):
     # Tier-2 rm/chmod of internal temp-path vars ($TMP_FILE, $CA_PATH, etc.)
     # are excluded from scoring — these are cleanup ops on hardcoded paths.
     n3 = len(set(f['var'] for f in findings_by_tier[3]))
-    n2 = len(set(
-        f['var'] for f in findings_by_tier[2]
-        if not _is_internal_path_var(f['var'])
-    ))
+    n2 = len(set(f['var'] for f in tier2_clean))
     flow_score = 6 + min(8, n3 * 4) + min(4, n2 * 2)
 
     content_lower = content.lower()
@@ -499,6 +504,8 @@ def analyze_services(services, root_path):
             if not has_input_handler(strings):
                 continue
             raw_sinks = detect_sinks(strings)
+            if not symbols:
+                symbols = extract_script_handler_symbols(strings)
 
         # ── Stage 2: sink validation ─────────────────────────────────────────
         # Import-sourced sinks need no is_valid_sink filter (they are exact
@@ -639,6 +646,17 @@ def analyze_services(services, root_path):
         # on the import-based fast path where strings were deferred until now.
         if strings is None:
             strings = extract_strings(path)
+
+        # ── Argument-level taint upgrade ──────────────────────────────────────
+        # If we can confirm the attacker controls the actual argument value
+        # passed to system()/popen() (not just that both are present), boost
+        # taint_confidence and record the confirming templates.
+        _arg_level = detect_arg_level_injection(strings)
+        if _arg_level["detected"] and flow_type in (
+            "cmd_injection", "file_cmd_injection", "file_path_injection"
+        ):
+            taint_confidence = min(1.0, taint_confidence + _arg_level["confidence"])
+            taint_for_score  = min(1.0, taint_for_score  + _arg_level["confidence"])
 
         # Collect config-key token fingerprint for the cross-binary correlation
         # pass that runs after all binaries have been scored.  Strings are always
@@ -862,7 +880,10 @@ def analyze_services(services, root_path):
             "hardening":            hardening,
 
             # Gap 2: shell command templates with user-controlled placeholders.
-            "injection_templates":  templates[:2],
+            # Merges scorer-detected templates with arg-level injection evidence.
+            "injection_templates":  (
+                (_arg_level.get("templates") or []) + templates
+            )[:4],
 
             # Gap 3: named HTTP endpoint paths extracted from binary strings.
             "endpoints":            endpoints,
@@ -873,8 +894,10 @@ def analyze_services(services, root_path):
                 if any(h in n for h in (
                     "handle_", "apply_", "set_wan", "set_ddns", "set_wlan",
                     "set_vpn", "do_system", "exec_cmd", "run_cmd",
+                    "submit_", "upload_", "apcli_", "ipsec_", "wps_",
+                    "connect", "disconnect", "site_survey", "dpp",
                 ))
-            )[:5],
+            )[:12],
 
             # Gap 5: authentication requirement assessment for frontend handlers.
             "auth_bypass":          auth_status,

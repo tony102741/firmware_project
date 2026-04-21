@@ -447,22 +447,38 @@ def _verify_aarch64(binary_path, cg):
 
 def _verify_heuristic(binary_path, imports, strings=None):
     """
-    Import + string based taint narrowing for non-AArch64 architectures.
-    Returns list of flow dicts.
+    Import + string-based taint narrowing for non-AArch64 architectures
+    (MIPS, ARM32, x86, etc.).
+
+    Verdict assignment (strict — prefer false-negatives over false-positives):
+
+      LIKELY    CGI env-var (QUERY_STRING etc.) + cmd sink + no sanitise,
+                OR getenv + sprintf/snprintf(%s) + cmd sink with no sanitise,
+                OR net-read + cmd sink + format template with %s
+      UNCERTAIN cmd sink + getenv/net-read present but no strong chain evidence
+                (sanitise present, or no CGI vars, or no format template)
+
+    Returns [] if the chain is too weak to report (cmd sink only, no input source).
     """
     results = []
     imp_set = set(imports.keys()) if imports else set()
 
     has_cmd_sink  = bool(imp_set & _CMD_SINKS)
     has_getenv    = 'getenv' in imp_set
-    has_net       = bool(imp_set & _INPUT_SYMS - {'getenv'})
+    has_net       = bool(imp_set & (_INPUT_SYMS - {'getenv'}))
     has_sanitise  = bool(imp_set & _SANITISE_SYMS)
     has_fmt       = bool(imp_set & _FMT_SYMS)
 
     if not has_cmd_sink:
         return []
 
-    # Detect CGI context from environment variable references in strings
+    # Require at least one external input source
+    if not has_getenv and not has_net:
+        return []
+
+    sink_sym = next(iter(imp_set & _CMD_SINKS))
+
+    # Scan strings for CGI env vars and command-template format strings
     cgi_vars = set()
     fmt_templates = []
     if strings:
@@ -471,13 +487,62 @@ def _verify_heuristic(binary_path, imports, strings=None):
             for v in _CGI_ENV_VARS:
                 if v in su:
                     cgi_vars.add(v)
-            # Collect strings that look like shell command templates
-            if ('%s' in s or '%d' in s) and any(
+            # Shell command template: contains %s/%d AND a path/flag separator
+            if ('%s' in s or '%d' in s) and len(s) >= 4 and any(
                     c in s for c in ('/', ' ', '-')):
-                fmt_templates.append(s)
+                fmt_templates.append(s[:120])
 
-    sink_sym = next(iter(imp_set & _CMD_SINKS))  # pick one representative
+    # ── Verdict decision ──────────────────────────────────────────────────
+    # Condition A: CGI env-var reference + cmd sink, no sanitisation
+    cond_cgi = bool(cgi_vars) and not has_sanitise
 
+    # Condition B: getenv + format template with %s + cmd sink
+    cond_fmt = has_getenv and has_fmt and bool(fmt_templates) and not has_sanitise
+
+    # Condition C: net-read + format template + cmd sink (non-CGI servers)
+    cond_net = has_net and bool(fmt_templates) and not has_sanitise
+
+    if cond_cgi or cond_fmt or cond_net:
+        verdict = 'LIKELY'
+        if cond_cgi:
+            origin   = f"CGI env ({', '.join(sorted(cgi_vars)[:3])})"
+            flow_str = f"getenv({next(iter(cgi_vars))}) → {sink_sym}()"
+            reason   = (f"Binary imports {sink_sym}() and references CGI env vars "
+                        f"({', '.join(sorted(cgi_vars)[:3])}) with no sanitisation imports")
+        elif cond_fmt:
+            tpl = fmt_templates[0] if fmt_templates else '%s'
+            origin   = "getenv → sprintf → cmd"
+            flow_str = f"getenv() → sprintf(\"{tpl[:60]}\") → {sink_sym}()"
+            reason   = (f"getenv + sprintf(%s) + {sink_sym} with no sanitisation; "
+                        f"format template: {tpl[:60]!r}")
+        else:
+            tpl = fmt_templates[0] if fmt_templates else '%s'
+            origin   = "network read → sprintf → cmd"
+            flow_str = f"recv/read() → sprintf(\"{tpl[:60]}\") → {sink_sym}()"
+            reason   = (f"Network input + sprintf(%s) + {sink_sym} with no sanitisation; "
+                        f"format template: {tpl[:60]!r}")
+    elif has_getenv or has_net:
+        verdict  = 'UNCERTAIN'
+        origin   = "getenv/net (sanitised or weak chain)"
+        flow_str = f"input() → {sink_sym}() [sanitisation present or chain unconfirmed]"
+        reason   = ("cmd sink + input source detected but sanitisation imports present "
+                    "or no direct chain evidence (MIPS/non-AArch64 heuristic)")
+    else:
+        return []
+
+    results.append({
+        'func_va':   None,
+        'func_sym':  '(heuristic)',
+        'sink_sym':  sink_sym,
+        'sink_va':   None,
+        'origin':    origin,
+        'sanitized': has_sanitise,
+        'flow_str':  flow_str,
+        'reason':    reason,
+        'verdict':   verdict,
+        'fmt_templates': fmt_templates[:3],
+        'cgi_vars':  sorted(cgi_vars),
+    })
     return results
 
 

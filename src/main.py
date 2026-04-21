@@ -4,7 +4,9 @@ import re
 import argparse
 import json
 import shutil
+import math
 from datetime import datetime, timezone
+from pathlib import Path
 
 # Ensure src/core/ is on sys.path so that 'from parser.init_parser import ...'
 # resolves to src/core/parser/init_parser.py regardless of how this script is
@@ -23,6 +25,8 @@ from analyzer.verify_flow import verify_exploitable_flows
 from analyzer.reach_check import analyze_reachability
 from analyzer.strings_analyzer import extract_strings
 from analyzer.cve_triage import select_cve_candidates, explain_triage
+from analyzer.crypto_scanner import scan_crypto_material
+from analyzer.upgrade_analyzer import scan_upgrade_scripts
 
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -63,6 +67,82 @@ def _sec(title):
     label = f"  {title}  "
     pad = max(0, _W - len(label) - 3)
     print(f"\n{'─' * 3}{label}{'─' * pad}", flush=True)
+
+
+def _score_candidate_label_token(token):
+    tl = (token or "").strip().lower()
+    if not tl:
+        return -999
+    score = 0
+    if tl.startswith("form") and "uploadconfig" not in tl:
+        score += 40
+    if tl.startswith("submit_"):
+        score += 12
+    if tl == "submit_dpp_uri" or tl.endswith("submit_dpp_uri"):
+        score += 20
+    if tl.startswith("apcli_"):
+        score += 10
+    if any(k in tl for k in (
+        "submit", "uploadfile", "connect", "disconnect", "dpp", "wps",
+        "site", "survey", "apcli", "pin", "repeater",
+    )):
+        score += 28
+    if any(k in tl for k in ("upload", "scan", "wizard", "easymesh", "vpn")):
+        score += 12
+    if "scan" in tl and "site" not in tl and "survey" not in tl:
+        score -= 10
+    if any(tl.startswith(p) for p in ("get_", "set_", "apply_", "trigger_", "validate_", "generate_", "retrieve_", "retrive_")):
+        score -= 12
+    if tl.startswith(("remove_", "delete_")) or tl.endswith("_status") or "status_" in tl:
+        score -= 10
+    if tl.startswith("start_"):
+        score -= 4
+    if "config" in tl and "uploadfile" not in tl:
+        score -= 10
+    if tl in {"main", "index", "init", "entry", "dispatch", "handler", "callback"}:
+        score -= 15
+    score += min(8, len(tl) // 5)
+    return score
+
+
+def _choose_candidate_label(raw_name, endpoints=None, handler_symbols=None):
+    """
+    Turn generic binary names into more analyst-friendly handler labels.
+
+    Examples:
+      boa -> boa/formWsc
+      mtkwifi.lua -> mtkwifi.lua/apcli_connect
+    """
+    raw = (raw_name or "").strip()
+    if not raw:
+        return raw_name
+
+    base = os.path.basename(raw)
+    candidates = []
+    for ep in endpoints or []:
+        token = os.path.basename((ep or "").rstrip("/"))
+        if token:
+            candidates.append(token)
+    for sym in handler_symbols or []:
+        if sym:
+            candidates.append(sym)
+
+    best = None
+    best_score = -999
+    for token in candidates:
+        score = _score_candidate_label_token(token)
+        if score > best_score:
+            best = token
+            best_score = score
+
+    generic = (
+        base in {"boa", "lighttpd", "uhttpd", "httpd", "mini_httpd"}
+        or base.endswith(".lua")
+        or base.endswith(".cgi")
+    )
+    if generic and best and best.lower() != base.lower() and best_score >= 10:
+        return f"{base}/{best}"
+    return raw_name
 
 
 # ── Result display ────────────────────────────────────────────────────────────
@@ -393,8 +473,9 @@ def _collect_generic_blob_services(system_path, max_candidates=None):
     string-based analyzer rank them.
     """
     exts = {".bin", ".img", ".so", ".elf", ".fw", ".cgi", ".apk"}
+    root_lower = os.path.abspath(system_path).lower()
+    allow_extensionless = "_iot_extract" in root_lower
     if max_candidates is None:
-        root_lower = os.path.abspath(system_path).lower()
         max_candidates = 40 if "_iot_extract" in root_lower or "rc520" in root_lower or "dji" in root_lower else 200
     services = []
     seen = set()
@@ -411,7 +492,12 @@ def _collect_generic_blob_services(system_path, max_candidates=None):
         for name in sorted(filenames):
             lower = name.lower()
             ext = os.path.splitext(lower)[1]
-            if ext not in exts:
+            is_extensionless_chunk = (
+                allow_extensionless
+                and not ext
+                and re.fullmatch(r"[0-9a-f]{2,}", lower)
+            )
+            if ext not in exts and not is_extensionless_chunk:
                 continue
 
             full = os.path.join(dirpath, name)
@@ -420,6 +506,8 @@ def _collect_generic_blob_services(system_path, max_candidates=None):
             except OSError:
                 continue
             if size < 4096:
+                continue
+            if is_extensionless_chunk and size < 64 * 1024:
                 continue
             if ext == ".so":
                 if any(tok in lower for tok in noisy_tokens):
@@ -453,6 +541,10 @@ def _collect_generic_blob_services(system_path, max_candidates=None):
             score -= 50
         if "/lib/" in exec_path:
             score -= 30
+        if exec_path.endswith("/_decoded.bin"):
+            score += 140
+        elif "/_nested_" in exec_path and exec_path.endswith(".bin"):
+            score += 80
         if exec_path.endswith(".apk"):
             score += 40
         if exec_path.endswith(("decompressed.bin", "payload.bin")):
@@ -469,8 +561,265 @@ def _collect_generic_blob_services(system_path, max_candidates=None):
             score -= 10
         return (score, exec_path)
 
-    services.sort(key=priority)
+    services.sort(key=priority, reverse=True)
     return services[:max_candidates]
+
+
+def _collect_blob_signal_findings(services, system_path, limit=5):
+    findings = []
+    web_terms = (
+        "http", "https", "login", "password", "portal", "cgi",
+        "httpd", "goform", "boafrm", "tp-link", "/cgi", "/www",
+    )
+    exec_terms = (
+        "system(", "popen(", "exec", "execute_cmd", "bootcmd",
+        "/bin/sh", "shell", "command",
+    )
+
+    for service in services[: min(len(services), 12)]:
+        rel_exec = service["exec"].lstrip("/")
+        path = os.path.join(system_path, rel_exec)
+        strings = extract_strings(path)
+        if not strings:
+            continue
+
+        joined = "\n".join(strings[:4000]).lower()
+        web_hits = sorted({term for term in web_terms if term in joined})
+        exec_hits = sorted({term for term in exec_terms if term in joined})
+        if len(web_hits) < 2 and not (web_hits and exec_hits):
+            continue
+
+        endpoints = []
+        for s in strings[:4000]:
+            if s.startswith(("GET /", "POST /")):
+                parts = s.split()
+                if len(parts) >= 2 and parts[1].startswith("/"):
+                    endpoints.append(parts[1])
+            elif s.startswith("/") and any(tok in s.lower() for tok in ("cgi", "login", "http", "portal")):
+                endpoints.append(s.strip())
+        endpoints = sorted(dict.fromkeys(endpoints))[:6]
+
+        score = 18 + min(12, len(web_hits) * 3) + min(8, len(exec_hits) * 4)
+        level = "MEDIUM" if exec_hits else "LOW"
+        summary_bits = []
+        if web_hits:
+            summary_bits.append(f"web/admin strings: {', '.join(web_hits[:4])}")
+        if exec_hits:
+            summary_bits.append(f"execution strings: {', '.join(exec_hits[:3])}")
+
+        findings.append({
+            "name": f"{service['name']}:blob-signal",
+            "exec": service["exec"],
+            "binary_path": path,
+            "level": level,
+            "score": score,
+            "confidence": "LOW",
+            "input_type": "blob",
+            "priv": "unknown",
+            "flow_type": "blob_signal",
+            "source": service.get("source", "bundle"),
+            "controllability": "UNKNOWN",
+            "memory_impact": "UNKNOWN",
+            "validation_penalty": 0.0,
+            "taint_confidence": 0.0,
+            "attack_surface": {"config_files": [], "env_vars": [], "ipc": [], "sockets": []},
+            "all_sinks": exec_hits,
+            "sinks": exec_hits,
+            "endpoints": endpoints,
+            "vuln_summary": "; ".join(summary_bits),
+            "next_steps": [
+                "Inspect the blob in Ghidra or binwalk for embedded partitions or packed web assets.",
+                "Correlate HTTP/login strings with nearby command or bootloader handlers.",
+            ],
+        })
+
+    findings.sort(key=lambda r: (r["level"] == "MEDIUM", r["score"]), reverse=True)
+    return findings[:limit]
+
+
+def _collect_container_signal_findings(services, system_path, limit=5):
+    findings = []
+
+    def detect_container_markers(path, rel_exec, strings, head):
+        markers = []
+        head_lower = head.lower()
+        haystack = "\n".join(strings[:2000]).lower()
+        payload_offset = None
+        ciphertext_offset = None
+        openssl_salt = None
+        crypto_profile = ""
+
+        salted_off = head_lower.find(b"salted__")
+        if salted_off >= 0:
+            payload_offset = salted_off
+            ciphertext_offset = salted_off + 16
+            openssl_salt = head[salted_off + 8:salted_off + 16].hex()
+            markers.append({
+                "kind": "openssl-salted",
+                "offset": salted_off,
+                "detail": "OpenSSL Salted__ header",
+            })
+
+        fw_type_match = re.search(r"fw-type:([a-z0-9_-]+)", haystack, re.I)
+        if fw_type_match:
+            markers.append({
+                "kind": "fw-type",
+                "offset": haystack.find("fw-type:"),
+                "detail": f"fw-type:{fw_type_match.group(1)}",
+            })
+
+        if "cloud" in haystack and "fw-type:" in haystack:
+            markers.append({
+                "kind": "cloud-tag",
+                "offset": haystack.find("cloud"),
+                "detail": "Cloud-tagged firmware bundle",
+            })
+
+        if "nosign" in rel_exec.lower() or "nosign" in haystack:
+            markers.append({
+                "kind": "nosign",
+                "offset": haystack.find("nosign"),
+                "detail": "unsigned/nosign build marker",
+            })
+
+        if any(tok in haystack for tok in ("signature", "encrypt", "encrypted", "aes")):
+            detail = next(
+                (tok for tok in ("signature", "encrypted", "encrypt", "aes") if tok in haystack),
+                "encryption/signature metadata",
+            )
+            markers.append({
+                "kind": "crypto-meta",
+                "offset": haystack.find(detail),
+                "detail": detail,
+            })
+
+        vendor_guess = ""
+        kinds = {m["kind"] for m in markers}
+        if "openssl-salted" in kinds and salted_off == 0x204:
+            vendor_guess = "Tenda-style encrypted firmware container"
+            crypto_profile = "openssl-enc-compatible salted payload"
+        elif "fw-type" in kinds and "cloud-tag" in kinds:
+            vendor_guess = "TP-Link/MERCUSYS cloud firmware container"
+        elif "fw-type" in kinds:
+            vendor_guess = "vendor-tagged firmware container"
+        elif "openssl-salted" in kinds:
+            vendor_guess = "OpenSSL-wrapped firmware payload"
+            crypto_profile = "openssl-enc-compatible salted payload"
+
+        if payload_offset is None and ("fw-type" in kinds or "cloud-tag" in kinds):
+            payload_offset = 0x200
+
+        return markers, vendor_guess, payload_offset, ciphertext_offset, openssl_salt, crypto_profile
+
+    def summarize_ciphertext(path, ciphertext_offset):
+        if not isinstance(ciphertext_offset, int) or ciphertext_offset < 0:
+            return {}
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(ciphertext_offset)
+                sample = fh.read(1 << 20)
+        except OSError:
+            return {}
+        if not sample:
+            return {}
+
+        freq = [0] * 256
+        for b in sample:
+            freq[b] += 1
+        entropy = -sum((c / len(sample)) * math.log2(c / len(sample)) for c in freq if c)
+
+        first4k = sample[:4096]
+        blocks = [first4k[i:i + 16] for i in range(0, len(first4k), 16) if len(first4k[i:i + 16]) == 16]
+        unique_blocks = len(set(blocks)) if blocks else 0
+        repeated_blocks = len(blocks) - unique_blocks if blocks else 0
+
+        likely_cipher = (
+            len(sample) % 16 == 0
+            and repeated_blocks == 0
+            and entropy >= 7.95
+        )
+        return {
+            "entropy_first_mib": round(entropy, 4),
+            "size_mod_16": len(sample) % 16,
+            "unique_16byte_blocks_first_4k": unique_blocks,
+            "repeated_16byte_blocks_first_4k": repeated_blocks,
+            "likely_block_ciphertext": likely_cipher,
+        }
+
+    for service in services[: min(len(services), 12)]:
+        rel_exec = service["exec"].lstrip("/")
+        path = os.path.join(system_path, rel_exec)
+        if not os.path.isfile(path):
+            continue
+
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(4096)
+        except OSError:
+            continue
+
+        strings = extract_strings(path)
+        markers, vendor_guess, payload_offset, ciphertext_offset, openssl_salt, crypto_profile = detect_container_markers(path, rel_exec, strings, head)
+        if not markers:
+            continue
+
+        score = 14 + min(10, len(markers) * 3)
+        marker_details = [m["detail"] for m in markers[:4]]
+        try:
+            payload_size = max(0, os.path.getsize(path) - (payload_offset or 0))
+        except OSError:
+            payload_size = None
+        try:
+            ciphertext_size = (
+                max(0, os.path.getsize(path) - ciphertext_offset)
+                if isinstance(ciphertext_offset, int)
+                else None
+            )
+        except OSError:
+            ciphertext_size = None
+        ciphertext_fingerprint = summarize_ciphertext(path, ciphertext_offset)
+        findings.append({
+            "name": f"{service['name']}:container-signal",
+            "exec": service["exec"],
+            "binary_path": path,
+            "level": "LOW",
+            "score": score,
+            "confidence": "LOW",
+            "input_type": "blob",
+            "priv": "unknown",
+            "flow_type": "container_signal",
+            "source": service.get("source", "bundle"),
+            "controllability": "UNKNOWN",
+            "memory_impact": "UNKNOWN",
+            "validation_penalty": 0.0,
+            "taint_confidence": 0.0,
+            "attack_surface": {"config_files": [], "env_vars": [], "ipc": [], "sockets": []},
+            "all_sinks": [],
+            "sinks": [],
+            "container_markers": markers,
+            "vendor_guess": vendor_guess,
+            "payload_offset": payload_offset,
+            "payload_size": payload_size,
+            "ciphertext_offset": ciphertext_offset,
+            "ciphertext_size": ciphertext_size,
+            "openssl_salt": openssl_salt,
+            "crypto_profile": crypto_profile,
+            "ciphertext_fingerprint": ciphertext_fingerprint,
+            "endpoints": [],
+            "vuln_summary": (
+                ("encrypted or signed vendor firmware container detected"
+                 + (f" ({vendor_guess})" if vendor_guess else ""))
+                + ": "
+                + "; ".join(marker_details)
+            ),
+            "next_steps": [
+                "Recover or identify the vendor decryption/signature scheme before expecting a classic rootfs.",
+                "Inspect the container header and update the extractor for this vendor-specific format.",
+            ],
+        })
+
+    findings.sort(key=lambda r: r["score"], reverse=True)
+    return findings[:limit]
 
 
 def _relevel(score, confidence):
@@ -526,6 +875,29 @@ def _retune_results(results, cgi_files=None, strict_high=False):
                 r["level"] = "MEDIUM"
 
     results.sort(key=lambda x: x["score"], reverse=True)
+
+
+_SYSTEM_SHELL_DIRS = frozenset({
+    "/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/",
+    "bin/", "sbin/", "usr/bin/", "usr/sbin/",
+})
+
+
+def _is_system_managed_shell_script(result):
+    """
+    Return True when a shell_var_injection result lives in a system utility
+    directory and is not directly in a CGI/web path.
+
+    These scripts (e.g. /sbin/wifi, /sbin/ipsec) are invoked by other system
+    components, not directly by HTTP handlers.  A basename keyword match in a
+    JS or Lua file (e.g. "wifi" in frame.js) is too weak to call them
+    web-exposed — it is usually a UI label, not a process invocation.
+    """
+    if result.get("flow_type") != "shell_var_injection":
+        return False
+    bp = result.get("binary_path", "")
+    rel = os.path.relpath(bp, SYSTEM_PATH).replace("\\", "/")
+    return any(rel.startswith(d) for d in _SYSTEM_SHELL_DIRS)
 
 
 def _is_generic_shell_utility(result):
@@ -631,7 +1003,9 @@ def _reprioritize_iot_results(results, web_bins, cgi_files):
         handler_ref = _has_handler_binary_ref(bp, cgi_files)
         r["web_exposed"] = (
             direct_web
-            or (handler_ref and not _is_generic_shell_utility(r))
+            or (handler_ref
+                and not _is_generic_shell_utility(r)
+                and not _is_system_managed_shell_script(r))
         )
         r["web_reachable"] = bp in web_reachable
         r["web_candidate"] = r["web_exposed"] or r["web_reachable"]
@@ -695,15 +1069,25 @@ def _has_handler_binary_ref(binary_path, cgi_files):
         "strings", "clear", "uptime", "pidof", "passwd",
     }
 
+    # Pattern: command execution context — os.execute, luci.sys, system(),
+    # popen(), io.popen(), or shell invocation string containing the binary.
+    exec_ctx_pat = re.compile(
+        r'(?:os\.execute|luci\.sys\.(?:call|exec)|io\.popen|popen|system)\s*\([^)]*'
+        + re.escape(base),
+        re.IGNORECASE,
+    )
+
     for script_path in cgi_files:
         try:
             content = open(script_path, "r", encoding="utf-8", errors="ignore").read()
         except Exception:
             continue
         lower = content.lower()
+        # Exact full-path reference always counts
         if any(ref in lower for ref in exact_refs):
             return True
-        if allow_basename and base_pat.search(content):
+        # Basename match only counts when found inside an exec/call context
+        if allow_basename and exec_ctx_pat.search(content):
             return True
     return False
 
@@ -712,6 +1096,16 @@ def _manual_review_hints(result, cgi_files):
     bp = result.get("binary_path", "")
     if not bp or not os.path.isfile(bp):
         return None
+    if result.get("flow_type") == "container_signal":
+        return {
+            "binary": os.path.relpath(bp, _PROJECT_ROOT),
+            "sink": "?",
+            "frontend": [],
+            "auth": [],
+            "paths": [],
+            "params": [],
+            "control": "container-only",
+        }
 
     sink = next(
         (s for s in (result.get("all_sinks") or [])
@@ -805,6 +1199,76 @@ def _print_iot_entry(r, cgi_files=None):
             print(f"    review control:  {review['control']}", flush=True)
 
 
+_SCRIPT_CMD_PATTERNS = re.compile(
+    r'\b(?:os\.execute|io\.popen|luci\.sys\.(?:call|exec)|nixio\.exec'
+    r'|os\.exec|subprocess\.call|subprocess\.Popen'
+    r'|system\s*\(|popen\s*\()\b',
+    re.IGNORECASE,
+)
+_SCRIPT_INPUT_PATTERNS = re.compile(
+    r'\b(?:luci\.http\.formvalue|luci\.http\.content|luci\.http\.getenv'
+    r'|http\.formvalue|QUERY_STRING|REQUEST_METHOD|CONTENT_LENGTH'
+    r'|getenv|argv|formvalue|getparam)\b',
+    re.IGNORECASE,
+)
+_SCRIPT_FMT_PATTERNS = re.compile(
+    r'(?:string\.format|%\s*\.\s*\w+|"%s"|"%d"|\.\.\s*\w+)',
+    re.IGNORECASE,
+)
+
+
+def _synthesize_script_flow(result, strings):
+    """
+    Produce a heuristic LIKELY verified_flow for Lua/shell scripts that
+    have no ELF imports.
+
+    Guards (all must pass — precision first):
+      1. flow_type is cmd_injection / file_path_injection / file_cmd_injection
+      2. web_exposed = True (already confirmed by surface scan)
+      3. String evidence of a command execution pattern in the script
+      4. String evidence of HTTP input (luci.http.formvalue, getenv, etc.)
+      5. taint_confidence >= 0.3
+
+    Returns [] when guards fail.
+    """
+    if not result.get("web_exposed"):
+        return []
+    if result.get("taint_confidence", 0.0) < 0.3:
+        return []
+
+    content = "\n".join(strings) if strings else ""
+    has_cmd    = bool(_SCRIPT_CMD_PATTERNS.search(content))
+    has_input  = bool(_SCRIPT_INPUT_PATTERNS.search(content))
+    has_fmt    = bool(_SCRIPT_FMT_PATTERNS.search(content))
+
+    if not has_cmd or not has_input:
+        return []
+
+    # Find a representative command pattern for the flow string
+    cmd_m = _SCRIPT_CMD_PATTERNS.search(content)
+    inp_m = _SCRIPT_INPUT_PATTERNS.search(content)
+    cmd_str = cmd_m.group(0) if cmd_m else "os.execute"
+    inp_str = inp_m.group(0) if inp_m else "formvalue"
+
+    verdict = 'LIKELY' if has_fmt else 'UNCERTAIN'
+
+    return [{
+        'func_va':   None,
+        'func_sym':  '(script-heuristic)',
+        'sink_sym':  cmd_str,
+        'sink_va':   None,
+        'origin':    f"HTTP input ({inp_str})",
+        'sanitized': False,
+        'flow_str':  f"{inp_str}() → {cmd_str}()",
+        'reason':    (f"Script-level: HTTP input ({inp_str}) reaches command sink "
+                      f"({cmd_str})"
+                      + (" via format string" if has_fmt else "")),
+        'verdict':   verdict,
+        'fmt_templates': [],
+        'cgi_vars':  [],
+    }]
+
+
 def _run_deep_verification(results, top_n=10):
     """
     Run verify_exploitable_flows() on the top-N HIGH/WEB candidates.
@@ -826,10 +1290,19 @@ def _run_deep_verification(results, top_n=10):
         try:
             cg      = build_call_graph(bp)
             imports = r.get("_imports")      # set by risk.py if available
-            strings = extract_strings(bp) if not imports else None
+            # Always extract strings for heuristic path — needed to detect
+            # CGI env vars and format templates on MIPS/ARM32/script files.
+            strings = extract_strings(bp)
             flows   = verify_exploitable_flows(bp, cg or {},
                                                imports=imports,
                                                strings=strings)
+
+            # Script fallback: Lua/shell with cmd_injection but no ELF imports
+            # → synthesise a LIKELY flow from string-level evidence.
+            if not flows and r.get("flow_type") in (
+                    "cmd_injection", "file_path_injection", "file_cmd_injection"):
+                flows = _synthesize_script_flow(r, strings)
+
             r["verified_flows"] = flows
         except Exception:
             r["verified_flows"] = []
@@ -1012,6 +1485,55 @@ def _next_steps_for_result(result, review=None, exploit_paths=None):
     path   = _result_path(result)
     sinks  = list((result.get('all_sinks') or result.get('sinks') or []))[:2]
     sink_s = ', '.join(sinks) if sinks else 'dangerous function'
+    if result.get("flow_type") == "container_signal":
+        marker_lines = []
+        for marker in (result.get("container_markers") or [])[:3]:
+            offset = marker.get("offset")
+            offset_text = f"0x{offset:x}" if isinstance(offset, int) and offset >= 0 else "unknown offset"
+            marker_lines.append(f"{marker.get('detail', marker.get('kind', 'marker'))} at {offset_text}")
+        payload_offset = result.get("payload_offset")
+        payload_offset_text = (
+            f"0x{payload_offset:x}"
+            if isinstance(payload_offset, int) and payload_offset >= 0
+            else "unknown"
+        )
+        ciphertext_offset = result.get("ciphertext_offset")
+        ciphertext_offset_text = (
+            f"0x{ciphertext_offset:x}"
+            if isinstance(ciphertext_offset, int) and ciphertext_offset >= 0
+            else None
+        )
+        steps.append(
+            f"Inspect the container header in `{os.path.basename(path or '')}` and confirm the detected markers: "
+            + (", ".join(marker_lines) if marker_lines else "vendor-specific crypto/signature metadata")
+            + "."
+        )
+        steps.append(
+            f"Carve the opaque payload starting at `{payload_offset_text}` before attempting decryption or signature bypass."
+        )
+        vendor_guess = result.get("vendor_guess")
+        if vendor_guess:
+            steps.append(
+                f"Treat this as `{vendor_guess}` and search the vendor GPL/update utility for the matching decrypt or verify routine."
+            )
+        if result.get("openssl_salt") and ciphertext_offset_text:
+            steps.append(
+                f"OpenSSL salted container detected: salt=`{result['openssl_salt']}` and ciphertext starts at `{ciphertext_offset_text}`."
+            )
+        if result.get("crypto_profile") == "openssl-enc-compatible salted payload":
+            steps.append(
+                "Treat the header as OpenSSL `enc`-style salt framing and start decryption probes with AES-CBC plus EVP_BytesToKey-style KDFs (commonly MD5 or SHA-256)."
+            )
+        fp = result.get("ciphertext_fingerprint") or {}
+        if fp.get("likely_block_ciphertext"):
+            steps.append(
+                f"Ciphertext fingerprint looks like block-cipher output "
+                f"(entropy≈{fp.get('entropy_first_mib')}, 16-byte aligned, no repeated 16-byte blocks in first 4 KiB)."
+            )
+        steps.append(
+            "Do not trace random HTTP params from string noise. First recover the payload format or decryption key schedule."
+        )
+        return steps[:5]
 
     # ── 1. Start point in Ghidra ──────────────────────────────────────────────
     verified     = result.get('verified_flows') or []
@@ -1146,9 +1668,16 @@ def _build_result_snapshot(result, cgi_files=None, exploit_paths=None):
         flow for flow in (result.get("verified_flows") or [])
         if flow.get("verdict") != "FALSE_POSITIVE"
     ]
+    raw_name = result.get("name")
+    display_name = _choose_candidate_label(
+        raw_name,
+        result.get("endpoints") or [],
+        result.get("handler_symbols") or [],
+    )
     return {
         "id": _candidate_id(result),
-        "name": result.get("name"),
+        "name": display_name,
+        "raw_name": raw_name,
         "level": result.get("level"),
         "score": result.get("score"),
         "binary_path": _result_path(result),
@@ -1166,6 +1695,15 @@ def _build_result_snapshot(result, cgi_files=None, exploit_paths=None):
         "web_candidate": result.get("web_candidate", False),
         "handler_surface": result.get("handler_surface", False),
         "all_sinks": list(result.get("all_sinks") or result.get("sinks") or []),
+        "container_markers": _json_safe(result.get("container_markers") or []),
+        "vendor_guess": result.get("vendor_guess") or "",
+        "payload_offset": result.get("payload_offset"),
+        "payload_size": result.get("payload_size"),
+        "ciphertext_offset": result.get("ciphertext_offset"),
+        "ciphertext_size": result.get("ciphertext_size"),
+        "openssl_salt": result.get("openssl_salt"),
+        "crypto_profile": result.get("crypto_profile") or "",
+        "ciphertext_fingerprint": _json_safe(result.get("ciphertext_fingerprint") or {}),
         "attack_surface": _json_safe(result.get("attack_surface", {})),
         "fuzzing_hints": list(result.get("fuzzing_hints") or []),
         "manual_review": _json_safe(review),
@@ -1564,6 +2102,288 @@ def _export_ghidra_targets(cve_top, run_dir):
     return copied
 
 
+def _export_container_targets(results, run_dir):
+    """
+    Carve opaque payload regions for container-signal candidates into
+    <run_dir>/container_targets/ so the next reverse-engineering step can work
+    on the payload directly instead of re-deriving offsets by hand.
+    """
+    if not run_dir or not results:
+        return []
+
+    target_dir = os.path.join(run_dir, "container_targets")
+    os.makedirs(target_dir, exist_ok=True)
+
+    def _target_stem(src_rel, abs_src):
+        rel = src_rel or os.path.basename(abs_src)
+        rel = rel.replace("\\", "/").strip("/")
+        if not rel:
+            rel = os.path.basename(abs_src)
+        stem = os.path.splitext(rel)[0]
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+        return stem[-120:] or os.path.splitext(os.path.basename(abs_src))[0]
+
+    def _candidate_passphrases(base_name, vendor_guess):
+        seeds = []
+        stem = os.path.splitext(base_name)[0]
+        seeds.extend(re.findall(r"[A-Za-z0-9]+", stem))
+        if vendor_guess:
+            seeds.extend(re.findall(r"[A-Za-z0-9]+", vendor_guess))
+        seeds.extend(["tenda", "Tenda", "TendaWiFi", "tendawifi", "tendawifi.com"])
+
+        out = []
+        seen_local = set()
+        for seed in seeds:
+            if len(seed) < 3:
+                continue
+            variants = {
+                seed,
+                seed.lower(),
+                seed.upper(),
+            }
+            for variant in variants:
+                if variant in seen_local:
+                    continue
+                seen_local.add(variant)
+                out.append(variant)
+
+        compact = "".join(ch for ch in stem if ch.isalnum())
+        if compact and compact not in seen_local:
+            out.append(compact)
+        return out[:48]
+
+    def _write_probe_bundle(target_dir, base_name, export_entry):
+        crypto_profile = export_entry.get("crypto_profile")
+        vendor_guess = export_entry.get("vendor_guess", "")
+        flow_type = export_entry.get("flow_type") or ""
+        if flow_type == "blob_signal":
+            payload_dest = export_entry.get("dest")
+            if not payload_dest:
+                return None
+            probe_dir = os.path.join(target_dir, f"{os.path.splitext(base_name)[0]}__probe")
+            os.makedirs(probe_dir, exist_ok=True)
+            payload_rel = os.path.relpath(
+                os.path.join(_PROJECT_ROOT, payload_dest),
+                probe_dir,
+            )
+            script_path = os.path.join(probe_dir, "segmented_probe.sh")
+            script = f"""#!/usr/bin/env bash
+set -euo pipefail
+
+PAYLOAD="{payload_rel}"
+OUTDIR="scan_out"
+mkdir -p "$OUTDIR"
+
+file "$PAYLOAD" | tee "$OUTDIR/file.txt"
+binwalk "$PAYLOAD" > "$OUTDIR/binwalk.txt" 2>&1 || true
+strings -a "$PAYLOAD" | head -n 400 > "$OUTDIR/strings_head.txt" || true
+strings -a "$PAYLOAD" | grep -E 'https?://|/[A-Za-z0-9._?&=%/-]+' | head -n 120 > "$OUTDIR/http_strings.txt" || true
+xxd -l 1024 "$PAYLOAD" > "$OUTDIR/header_xxd.txt" || true
+
+echo "scan outputs: $OUTDIR"
+"""
+            Path(script_path).write_text(script, encoding="utf-8")
+            os.chmod(script_path, 0o755)
+
+            meta_path = os.path.join(probe_dir, "probe_meta.json")
+            Path(meta_path).write_text(json.dumps({
+                "payload": export_entry.get("dest"),
+                "binary_path": export_entry.get("src"),
+                "payload_size": export_entry.get("payload_size"),
+                "flow_type": flow_type,
+                "source": export_entry.get("source"),
+                "top_sinks": export_entry.get("all_sinks") or [],
+                "sample_endpoints": export_entry.get("endpoints") or [],
+                "probe_type": "segmented-bundle-scan-probe",
+            }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+            return {
+                "probe_type": "segmented-bundle-scan-probe",
+                "probe_dir": _safe_relpath(probe_dir),
+                "script": _safe_relpath(script_path),
+                "meta": _safe_relpath(meta_path),
+                "candidate_count": 0,
+            }
+
+        if crypto_profile != "openssl-enc-compatible salted payload" and "cloud" not in vendor_guess.lower():
+            return None
+        ciphertext_dest = export_entry.get("ciphertext_dest")
+        if crypto_profile == "openssl-enc-compatible salted payload" and not ciphertext_dest:
+            return None
+
+        probe_dir = os.path.join(target_dir, f"{os.path.splitext(base_name)[0]}__probe")
+        os.makedirs(probe_dir, exist_ok=True)
+
+        if crypto_profile == "openssl-enc-compatible salted payload":
+            candidates = _candidate_passphrases(base_name, export_entry.get("vendor_guess", ""))
+            wordlist_path = os.path.join(probe_dir, "candidates.txt")
+            Path(wordlist_path).write_text("\n".join(candidates) + "\n", encoding="utf-8")
+
+            salt = export_entry.get("openssl_salt") or ""
+            ciphertext_rel = os.path.relpath(
+                os.path.join(_PROJECT_ROOT, ciphertext_dest),
+                probe_dir,
+            )
+            script_path = os.path.join(probe_dir, "openssl_probe.sh")
+            script = f"""#!/usr/bin/env bash
+set -euo pipefail
+
+CIPHERTEXT="{ciphertext_rel}"
+SALT="{salt}"
+OUTDIR="out"
+mkdir -p "$OUTDIR"
+
+while IFS= read -r pass; do
+  [ -n "$pass" ] || continue
+  safe="$(printf '%s' "$pass" | tr -c 'A-Za-z0-9._-' '_')"
+  for md in md5 sha256; do
+    for cipher in aes-128-cbc aes-192-cbc aes-256-cbc; do
+      openssl enc -d "-$cipher" -md "$md" -S "$SALT" -salt -pass "pass:$pass" \\
+        -in "$CIPHERTEXT" -out "$OUTDIR/${{safe}}_${{cipher}}_${{md}}.bin" 2>/dev/null || true
+    done
+  done
+done < candidates.txt
+
+echo "probe outputs: $OUTDIR"
+"""
+            Path(script_path).write_text(script, encoding="utf-8")
+            os.chmod(script_path, 0o755)
+
+            meta_path = os.path.join(probe_dir, "probe_meta.json")
+            Path(meta_path).write_text(json.dumps({
+                "ciphertext": export_entry.get("ciphertext_dest"),
+                "salt": salt,
+                "crypto_profile": export_entry.get("crypto_profile"),
+                "candidate_count": len(candidates),
+                "ciphers": ["aes-128-cbc", "aes-192-cbc", "aes-256-cbc"],
+                "digests": ["md5", "sha256"],
+            }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+            return {
+                "probe_type": "openssl-enc-probe",
+                "probe_dir": _safe_relpath(probe_dir),
+                "wordlist": _safe_relpath(wordlist_path),
+                "script": _safe_relpath(script_path),
+                "meta": _safe_relpath(meta_path),
+                "candidate_count": len(candidates),
+            }
+
+        payload_dest = export_entry.get("dest")
+        if not payload_dest:
+            return None
+        payload_rel = os.path.relpath(
+            os.path.join(_PROJECT_ROOT, payload_dest),
+            probe_dir,
+        )
+        script_path = os.path.join(probe_dir, "scan_probe.sh")
+        script = f"""#!/usr/bin/env bash
+set -euo pipefail
+
+PAYLOAD="{payload_rel}"
+OUTDIR="scan_out"
+mkdir -p "$OUTDIR"
+
+file "$PAYLOAD" | tee "$OUTDIR/file.txt"
+binwalk "$PAYLOAD" > "$OUTDIR/binwalk.txt" 2>&1 || true
+strings -a "$PAYLOAD" | head -n 200 > "$OUTDIR/strings_head.txt" || true
+xxd -l 512 "$PAYLOAD" > "$OUTDIR/header_xxd.txt" || true
+
+echo "scan outputs: $OUTDIR"
+"""
+        Path(script_path).write_text(script, encoding="utf-8")
+        os.chmod(script_path, 0o755)
+
+        meta_path = os.path.join(probe_dir, "probe_meta.json")
+        Path(meta_path).write_text(json.dumps({
+            "payload": export_entry.get("dest"),
+            "payload_offset": export_entry.get("payload_offset"),
+            "payload_size": export_entry.get("payload_size"),
+            "vendor_guess": vendor_guess,
+            "probe_type": "container-scan-probe",
+        }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        return {
+            "probe_type": "container-scan-probe",
+            "probe_dir": _safe_relpath(probe_dir),
+            "script": _safe_relpath(script_path),
+            "meta": _safe_relpath(meta_path),
+            "candidate_count": 0,
+        }
+
+    exported = []
+    seen = set()
+    for result in results:
+        flow_type = result.get("flow_type")
+        if flow_type not in {"container_signal", "blob_signal"}:
+            continue
+
+        src_rel = _result_path(result)
+        if not src_rel:
+            continue
+        abs_src = os.path.normpath(os.path.join(_PROJECT_ROOT, src_rel))
+        if not os.path.isfile(abs_src):
+            continue
+
+        payload_offset = result.get("payload_offset")
+        if flow_type == "blob_signal":
+            payload_offset = 0
+        if not isinstance(payload_offset, int) or payload_offset < 0:
+            continue
+
+        payload_size = result.get("payload_size")
+        key = (abs_src, payload_offset, payload_size)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        base = os.path.basename(abs_src)
+        stem = _target_stem(src_rel, abs_src)
+        carved_name = f"{stem}__payload_0x{payload_offset:x}.bin"
+        abs_dest = os.path.join(target_dir, carved_name)
+
+        with open(abs_src, "rb") as in_fh:
+            in_fh.seek(payload_offset)
+            data = in_fh.read()
+        with open(abs_dest, "wb") as out_fh:
+            out_fh.write(data)
+
+        export_entry = {
+            "name": result.get("name", base),
+            "src": src_rel,
+            "dest": _safe_relpath(abs_dest),
+            "payload_offset": payload_offset,
+            "payload_size": len(data),
+            "flow_type": flow_type,
+            "source": result.get("source") or "",
+            "vendor_guess": result.get("vendor_guess") or "",
+            "crypto_profile": result.get("crypto_profile") or "",
+            "all_sinks": result.get("all_sinks") or [],
+            "endpoints": result.get("endpoints") or [],
+        }
+
+        ciphertext_offset = result.get("ciphertext_offset")
+        if flow_type == "container_signal" and isinstance(ciphertext_offset, int) and ciphertext_offset >= 0:
+            ct_name = f"{stem}__ciphertext_0x{ciphertext_offset:x}.bin"
+            abs_ct_dest = os.path.join(target_dir, ct_name)
+            with open(abs_src, "rb") as in_fh:
+                in_fh.seek(ciphertext_offset)
+                ct_data = in_fh.read()
+            with open(abs_ct_dest, "wb") as out_fh:
+                out_fh.write(ct_data)
+            export_entry["ciphertext_dest"] = _safe_relpath(abs_ct_dest)
+            export_entry["ciphertext_offset"] = ciphertext_offset
+            export_entry["ciphertext_size"] = len(ct_data)
+            export_entry["openssl_salt"] = result.get("openssl_salt")
+
+        probe_bundle = _write_probe_bundle(target_dir, stem, export_entry)
+        if probe_bundle:
+            export_entry["probe_bundle"] = probe_bundle
+
+        exported.append(export_entry)
+
+    return exported
+
+
 def _emit_analysis_bundle(mode, mode_reason, result, *, output_path=None, dossier_dir=None, cgi_files=None):
     all_results = result.get("results") or []
     exploit_candidates = result.get("exploit_candidates") or []
@@ -1596,6 +2416,30 @@ def _emit_analysis_bundle(mode, mode_reason, result, *, output_path=None, dossie
         for t in ghidra_targets:
             print(f"  ▸ {t['name']:<28}  {t['dest']}", flush=True)
 
+    container_targets = _export_container_targets(all_results, _RUN_DIR)
+    if container_targets:
+        _sec("CONTAINER TARGETS  (carved payloads)")
+        for t in container_targets:
+            line = (
+                f"  ▸ {t['name']:<28}  {t['dest']}  "
+                f"(offset=0x{t['payload_offset']:x}, size={t['payload_size']})"
+            )
+            if t.get("ciphertext_dest"):
+                line += (
+                    f"\n    ciphertext → {t['ciphertext_dest']}  "
+                    f"(offset=0x{t['ciphertext_offset']:x}, size={t['ciphertext_size']})"
+                )
+                if t.get("openssl_salt"):
+                    line += f"  salt={t['openssl_salt']}"
+            if t.get("probe_bundle"):
+                line += (
+                    f"\n    probe → {t['probe_bundle']['script']}  "
+                    f"(type={t['probe_bundle']['probe_type']}"
+                    + (f", candidates={t['probe_bundle']['candidate_count']}" if t['probe_bundle'].get('candidate_count') else "")
+                    + ")"
+                )
+            print(line, flush=True)
+
     bundle = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "run_id": _RUN_ID,
@@ -1621,6 +2465,7 @@ def _emit_analysis_bundle(mode, mode_reason, result, *, output_path=None, dossie
         "cve_candidates": _json_safe([
             {
                 "name":          c.get("name"),
+                "raw_name":      c.get("raw_name"),
                 "binary_path":   c.get("binary_path"),
                 "vuln_summary":  c.get("vuln_summary") or "",
                 "triage_score":  c.get("triage_score", 0),
@@ -1630,6 +2475,7 @@ def _emit_analysis_bundle(mode, mode_reason, result, *, output_path=None, dossie
                 "web_exposed":   c.get("web_exposed"),
                 "handler_surface": c.get("handler_surface"),
                 "endpoints":     c.get("endpoints") or [],
+                "handler_symbols": c.get("handler_symbols") or [],
                 "all_sinks":     c.get("all_sinks") or [],
                 "missing_links": c.get("missing_links") or [],
             }
@@ -1640,6 +2486,9 @@ def _emit_analysis_bundle(mode, mode_reason, result, *, output_path=None, dossie
         ],
         "dossiers": dossiers,
         "ghidra_targets": ghidra_targets,
+        "container_targets": container_targets,
+        "crypto_findings": _json_safe(result.get("crypto_findings") or []),
+        "upgrade_findings": _json_safe(result.get("upgrade_findings") or []),
     }
 
     # ── Print CVE shortlist to console ────────────────────────────────────────
@@ -1779,6 +2628,37 @@ def run_iot_analysis(show_all=False):
             print(f"\n  Total exploit candidates : {len(exploit_candidates)}", flush=True)
             print(f"  Unauthenticated          : {unauth_count}", flush=True)
 
+    # ── Cryptographic material scan ───────────────────────────────────────────
+    crypto_findings = scan_crypto_material(SYSTEM_PATH)
+    upgrade_findings = scan_upgrade_scripts(SYSTEM_PATH)
+
+    if crypto_findings or upgrade_findings:
+        _sec(f"STATIC SECURITY FINDINGS  "
+             f"(crypto={len(crypto_findings)}  upgrade={len(upgrade_findings)})")
+        _SEV_MARK = {"CRITICAL": "!!", "HIGH": "! ", "MEDIUM": "~ ", "LOW": "  "}
+
+        if crypto_findings:
+            print("\n  ── Cryptographic Material ───────────────────────────────", flush=True)
+            for f in crypto_findings:
+                mark = _SEV_MARK.get(f.get("severity", "LOW"), "  ")
+                print(f"  [{mark}{f['severity']}]  {f['type']}", flush=True)
+                print(f"    path:     {f['path']}", flush=True)
+                print(f"    evidence: {f['evidence']}", flush=True)
+                if f.get("key_size_bits"):
+                    print(f"    key size: {f['key_size_bits']} bits", flush=True)
+                if f.get("gid"):
+                    print(f"    GID:      {f['gid']}  (static={f.get('gid_is_static')})", flush=True)
+                if f.get("shared_across_devices"):
+                    print(f"    !! Key identical across all devices with same firmware", flush=True)
+
+        if upgrade_findings:
+            print("\n  ── Unsigned Firmware Flash ──────────────────────────────", flush=True)
+            for f in upgrade_findings:
+                mark = _SEV_MARK.get(f.get("severity", "LOW"), "  ")
+                print(f"  [{mark}{f['severity']}]  {f['pattern']}", flush=True)
+                print(f"    path:     {f['path']}", flush=True)
+                print(f"    evidence: {f['evidence']}", flush=True)
+
     # ── Summary ───────────────────────────────────────────────────────────────
     _sec("SUMMARY")
     print(f"  Candidates analyzed : {len(results)}", flush=True)
@@ -1786,6 +2666,12 @@ def run_iot_analysis(show_all=False):
     print(f"  HIGH                : {display_high}", flush=True)
     print(f"  MEDIUM              : {display_med}", flush=True)
     print(f"  LOW                 : {display_low}", flush=True)
+    if crypto_findings:
+        crit_count = sum(1 for f in crypto_findings if f.get("severity") == "CRITICAL")
+        print(f"  Crypto findings     : {len(crypto_findings)}  (CRITICAL: {crit_count})", flush=True)
+    if upgrade_findings:
+        crit_u = sum(1 for f in upgrade_findings if f.get("severity") == "CRITICAL")
+        print(f"  Upgrade findings    : {len(upgrade_findings)}  (CRITICAL: {crit_u})", flush=True)
 
     if web_results:
         print(f"\n  Top web-exposed targets:", flush=True)
@@ -1802,6 +2688,8 @@ def run_iot_analysis(show_all=False):
         "results": results,
         "cgi_files": cgi_files,
         "exploit_candidates": exploit_candidates,
+        "crypto_findings": crypto_findings,
+        "upgrade_findings": upgrade_findings,
         "summary": {
             "candidates_analyzed": len(results),
             "web_exposed": len(web_results),
@@ -1810,6 +2698,8 @@ def run_iot_analysis(show_all=False):
             "low": display_low,
             "exploit_candidates": len(exploit_candidates),
             "unauthenticated_exploits": unauth_count if exploit_candidates else 0,
+            "crypto_findings": len(crypto_findings),
+            "upgrade_findings": len(upgrade_findings),
         },
     }
 
@@ -1919,6 +2809,10 @@ def run_general_analysis(show_all=False):
     print(f"[START] Vulnerability analysis", flush=True)
     sys.stdout.flush()
     results = analyze_services(services, SYSTEM_PATH)
+    if not results:
+        results = _collect_blob_signal_findings(services, SYSTEM_PATH)
+    if not results:
+        results = _collect_container_signal_findings(services, SYSTEM_PATH)
 
     high = [r for r in results if r["level"] == "HIGH"]
     medium = [r for r in results if r["level"] == "MEDIUM"]

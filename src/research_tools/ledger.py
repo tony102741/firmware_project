@@ -2,8 +2,8 @@
 Helper for validating and summarizing firmware candidate ledger files.
 
 Usage:
-  python3 src/ledger.py research/my_ledger.jsonl
-  python3 src/ledger.py research/my_ledger.jsonl --pretty
+  python3 src/research_tools/ledger.py research/my_ledger.jsonl
+  python3 src/research_tools/ledger.py research/my_ledger.jsonl --pretty
 """
 
 import argparse

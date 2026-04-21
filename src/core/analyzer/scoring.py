@@ -481,9 +481,96 @@ def detect_injection_templates(strings):
 _ENDPOINT_RE = re.compile(
     r'(/(?:goform|cgi-bin|cgi|HNAP1|api|admin|apply|setup|wan|wlan|'
     r'wireless|network|firewall|vpn|ddns|nat|qos|upnp|parental|acl|vlan|'
-    r'upgrade|firmware|diagnostic|management|config)[^\s"\'<>\x00]{0,80})',
+    r'upgrade|firmware|diagnostic|management|config|boafrm)[^\s"\'<>\x00]{0,80})',
     re.IGNORECASE,
 )
+
+# TOTOLINK-style form handlers often appear as bare symbol-like strings
+# ("formWsc", "formUploadFile") rather than full "/boafrm/formWsc" paths.
+_FORM_TOKEN_RE = re.compile(
+    r'\b('
+    r'form[A-Z][A-Za-z0-9_]{2,}'
+    r'|formUpload[A-Za-z0-9_]*'
+    r'|formWl[A-Za-z0-9_]*'
+    r'|formWan[A-Za-z0-9_]*'
+    r'|formWsc'
+    r'|formFilter'
+    r'|formFirewall'
+    r'|formDDNS'
+    r'|formIpQoS'
+    r')\b'
+)
+
+# LuCI / Lua controller route declarations:
+#   entry({"admin","mtk","wifi","apcli_connect"}, call("apcli_connect"))
+# Convert these into synthetic endpoint paths like:
+#   /admin/mtk/wifi/apcli_connect
+_LUA_ROUTE_RE = re.compile(
+    r'entry\s*\(\s*\{([^}]{3,160})\}\s*,\s*call\s*\(\s*"([A-Za-z0-9_]+)"\s*\)',
+    re.IGNORECASE,
+)
+
+_SCRIPT_HANDLER_RE = re.compile(
+    r'\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)\s*\('
+    r'|\bcall\s*\(\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*\)',
+    re.IGNORECASE,
+)
+
+_SCRIPT_HANDLER_SKIP = {
+    "index", "main", "init", "entry", "dispatch", "callback", "handler",
+}
+
+
+def _endpoint_priority(endpoint):
+    """
+    Rank endpoints by analyst usefulness rather than plain lexical order.
+
+    Specific form handlers such as /boafrm/formWsc or /goform/SetWanInfo are
+    stronger candidate identifiers than generic config artifacts like
+    /config.dat or /Config*.bin.  Returning them first improves both
+    vuln_summary quality and shortlist ranking.
+    """
+    ep = (endpoint or "").lower()
+    score = 0
+    if "/boafrm/form" in ep or "/goform/" in ep:
+        score += 50
+    if ep.startswith("/admin/") or ep.startswith("/mtk/"):
+        score += 24
+    if any(tok in ep for tok in (
+        "submit_", "upload", "connect", "disconnect", "dpp", "apcli",
+        "wps", "site_survey", "scan", "pin", "cfg",
+    )):
+        score += 14
+    if "/submit_" in ep or ep.endswith("/submit_dpp_uri"):
+        score += 10
+    if "/apcli_" in ep or "apcli_" in ep:
+        score += 8
+    if any(tok in ep for tok in (
+        "apply_", "trigger_", "validate_", "generate_", "retrive_", "retrieve_",
+    )):
+        score -= 4
+    if any(tok in ep for tok in (
+        "/get_", "_status", "/status", "/remove_", "/remove-", "/delete_",
+    )):
+        score -= 8
+    if "/start_" in ep:
+        score -= 3
+    if "formwsc" in ep:
+        score += 18
+    if "formuploadfile" in ep or "formuploadconfig" in ep:
+        score += 15
+    if "formwlsitesurvey" in ep:
+        score += 15
+    if "formupload" in ep or "formwl" in ep or "formwlan" in ep:
+        score += 8
+    if "/cgi-bin/" in ep or "/hnap1/" in ep or "cstecgi.cgi" in ep:
+        score += 8
+    if "?" in ep or "*" in ep or "%" in ep:
+        score -= 5
+    if "*" in ep or ep.endswith(".bin") or ep.endswith(".dat"):
+        score -= 8
+    score += min(12, len(endpoint or "") // 8)
+    return (-score, endpoint)
 
 
 def extract_endpoints(strings):
@@ -502,7 +589,44 @@ def extract_endpoints(strings):
             ep = m.group(1).rstrip('/')
             if len(ep) >= 5:
                 endpoints.add(ep)
-    return sorted(endpoints)[:10]
+        for m in _FORM_TOKEN_RE.finditer(s):
+            token = m.group(1)
+            if token:
+                endpoints.add(f"/boafrm/{token}")
+        for m in _LUA_ROUTE_RE.finditer(s):
+            raw_tokens = m.group(1)
+            call_name = m.group(2)
+            parts = re.findall(r'"([A-Za-z0-9_:-]+)"', raw_tokens)
+            if call_name and (not parts or parts[-1] != call_name):
+                parts.append(call_name)
+            if parts:
+                endpoints.add("/" + "/".join(parts[:8]))
+    return sorted(endpoints, key=_endpoint_priority)[:10]
+
+
+def extract_script_handler_symbols(strings):
+    """
+    Recover handler-like function names from Lua / script text.
+
+    Useful for LuCI controller files where there is no ELF symbol table but the
+    source text still contains concrete function names such as
+    `submit_dpp_uri`, `apcli_connect`, or `ipsec_vpn_disconnect`.
+    """
+    handlers = set()
+    for s in strings or []:
+        for m in _SCRIPT_HANDLER_RE.finditer(s):
+            name = m.group(1) or m.group(2)
+            if not name:
+                continue
+            nl = name.lower()
+            if len(nl) < 4 or nl in _SCRIPT_HANDLER_SKIP:
+                continue
+            if nl.startswith(("get_", "set_", "do_", "apply_", "submit_", "upload_", "apcli_", "ipsec_", "wps_", "form")):
+                handlers.add(name)
+                continue
+            if any(tok in nl for tok in ("connect", "disconnect", "upload", "submit", "dpp", "wps", "cfg", "wireless")):
+                handlers.add(name)
+    return sorted(handlers)[:12]
 
 
 # Auth guard symbols — presence indicates the handler enforces credentials.

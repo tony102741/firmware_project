@@ -61,6 +61,12 @@ _DECL_ONLY_SINK_HINTS = frozenset({
     "#!/bin/sh /etc/",    # init-script shebang
 })
 
+# Strings that look like system() references but are not shell execution sinks.
+_PSEUDO_EXEC_SINK_HINTS = frozenset({
+    "system(flash)",
+    "print mac address in system(flash)",
+})
+
 # The generic /vlan/config endpoint appears in every busybox binary in
 # TOTOLINK builds because it comes from a shared config-parsing library.
 # It is NOT a real attack surface for those binaries.
@@ -92,12 +98,27 @@ _REAL_MEMORY_SINKS = frozenset({
 # excluded — they appear in nearly every router firmware and do not constitute
 # evidence of a specific exploitable handler on their own.
 _HV_ENDPOINT_HINTS = frozenset({
-    "/applyreboot",
     "/goform/", "/cgi-bin/", "/boafrm/",
     "/cstecgi.cgi", "/hnap1/",
     "formupload", "formwanp", "formddns", "formsetwan",
     "formipqos", "formfilter", "formfirewall", "formreboot",
     "formsetwifi", "formsetwlan",
+})
+
+_GENERIC_UPGRADE_ENDPOINTS = frozenset({
+    "/firmware.bin",
+    "/firmware.img",
+    "/upgrade",
+    "/applyreboot",
+    "/firmware",
+    "/config",
+})
+
+_SOURCE_ARTIFACT_ENDPOINT_HINTS = frozenset({
+    ".y",
+    ".l",
+    ".h",
+    "/configparser.y",
 })
 
 
@@ -186,6 +207,10 @@ def _has_real_sink(candidate):
 
     for s in (candidate.get("all_sinks") or []):
         sl = s.lower()
+        if any(h in sl for h in _DECL_ONLY_SINK_HINTS):
+            continue
+        if any(h in sl for h in _PSEUDO_EXEC_SINK_HINTS):
+            continue
         if any(h in sl for h in _REAL_EXEC_SINKS):
             return True
         if is_mem_flow and any(h in sl for h in _REAL_MEMORY_SINKS):
@@ -200,6 +225,35 @@ def _has_hv_endpoint(candidate):
         if any(h in el for h in _HV_ENDPOINT_HINTS):
             return True
     return False
+
+
+def _has_only_generic_upgrade_endpoints(candidate):
+    eps = [e.lower() for e in (candidate.get("endpoints") or []) if e]
+    if not eps:
+        return False
+    return all(e in _GENERIC_UPGRADE_ENDPOINTS for e in eps)
+
+
+def _has_only_source_artifact_endpoints(candidate):
+    eps = [e.lower() for e in (candidate.get("endpoints") or []) if e]
+    if not eps:
+        return False
+    return all(
+        any(e.endswith(h) or h in e for h in _SOURCE_ARTIFACT_ENDPOINT_HINTS)
+        for e in eps
+    )
+
+
+def _split_verified_flows(candidate):
+    strong = []
+    weak = []
+    for f in (candidate.get("verified_flows") or []):
+        verdict = (f.get("verdict") or "").upper()
+        if verdict in ("CONFIRMED", "LIKELY"):
+            strong.append(f)
+        elif verdict == "UNCERTAIN":
+            weak.append(f)
+    return strong, weak
 
 
 # ── CVE triage scoring ────────────────────────────────────────────────────────
@@ -282,16 +336,27 @@ def calc_cve_triage_score(candidate):
     # Convenience flags
     web_exposed   = bool(candidate.get("web_exposed"))
     web_reachable = bool(candidate.get("web_reachable"))
-    verified      = [
-        f for f in (candidate.get("verified_flows") or [])
-        if (f.get("verdict") or "") != "FALSE_POSITIVE"
-    ]
+    strong_verified, weak_verified = _split_verified_flows(candidate)
     missing = candidate.get("missing_links") or []
 
     # ── Hard discard: file-input only ─────────────────────────────────────────
     if (candidate.get("input_type") == "file"
             and not web_exposed and not web_reachable):
         return 0, True, "file-input only — not network-exploitable"
+
+    if (
+        not web_exposed and not web_reachable and not strong_verified and not weak_verified
+        and not candidate.get("handler_surface")
+        and _has_only_generic_upgrade_endpoints(candidate)
+    ):
+        return 0, True, "generic firmware/config artifact without web-reachable handler"
+
+    if (
+        _has_only_source_artifact_endpoints(candidate)
+        and not candidate.get("handler_surface")
+        and not strong_verified
+    ):
+        return 0, True, "source-artifact endpoint only without strong handler evidence"
 
     # ── Hard discard: too vague, not reachable ────────────────────────────────
     if "too_many_unknowns" in missing and not web_exposed and not web_reachable:
@@ -318,8 +383,10 @@ def calc_cve_triage_score(candidate):
         score += 15   # explicit bypass hint (HNAP, no-auth endpoint)
 
     # Evidence quality
-    if verified:
+    if strong_verified:
         score += 20
+    elif weak_verified:
+        score += 5
     conf = candidate.get("confidence") or "WEAK"
     if conf == "HIGH":
         score += 10
@@ -329,6 +396,10 @@ def calc_cve_triage_score(candidate):
     # Endpoint concreteness
     if _has_hv_endpoint(candidate):
         score += 10
+    elif _has_only_generic_upgrade_endpoints(candidate):
+        score -= 8
+    if _has_only_source_artifact_endpoints(candidate):
+        score -= 15
 
     # Sink quality
     sinks_lower = [s.lower() for s in sinks]
@@ -359,14 +430,14 @@ def calc_cve_triage_score(candidate):
     # Without a confirmed data-flow path apply a score ceiling.
     # Escape condition: all 5 strong signals present → raise cap to 55 and mark
     # the candidate; otherwise hard cap at 40.
-    if not verified:
+    if not strong_verified:
         if _is_strong_unverified(candidate):
             score = min(score, _ESCAPE_CAP)
         else:
             score = min(score, _UNVERIFIED_CAP)
 
     # ── Late discard: insufficient signal ────────────────────────────────────
-    if score < 20 and not web_exposed and not web_reachable and not verified:
+    if score < 20 and not web_exposed and not web_reachable and not strong_verified and not weak_verified:
         return score, True, (
             f"triage_score={score} — low signal, not web-reachable, "
             "no verified flows"
@@ -394,15 +465,12 @@ def select_cve_candidates(candidates, top_n=3):
         ts, discard, _ = calc_cve_triage_score(c)
         if discard:
             continue
-        verified = [
-            f for f in (c.get("verified_flows") or [])
-            if (f.get("verdict") or "") != "FALSE_POSITIVE"
-        ]
+        strong_verified, _ = _split_verified_flows(c)
         entry = dict(c)
         entry["triage_score"] = ts
         entry["discard"] = False
         entry["unverified_high_value"] = (
-            not verified and _is_strong_unverified(c)
+            not strong_verified and _is_strong_unverified(c)
         )
         scored.append(entry)
 
@@ -436,12 +504,11 @@ def explain_triage(candidate):
     elif auth == "bypassable":
         lines.append("+15  auth bypassable (HNAP / no-auth hint)")
 
-    verified = [
-        f for f in (candidate.get("verified_flows") or [])
-        if (f.get("verdict") or "") != "FALSE_POSITIVE"
-    ]
-    if verified:
-        lines.append(f"+20  {len(verified)} verified flow(s)")
+    strong_verified, weak_verified = _split_verified_flows(candidate)
+    if strong_verified:
+        lines.append(f"+20  {len(strong_verified)} verified flow(s)")
+    elif weak_verified:
+        lines.append(f"+5   {len(weak_verified)} uncertain flow heuristic(s)")
     conf = candidate.get("confidence") or "WEAK"
     if conf == "HIGH":
         lines.append("+10  confidence HIGH")
@@ -477,11 +544,7 @@ def explain_triage(candidate):
     if candidate.get("controllability") == "HIGH":
         lines.append("+5   controllability HIGH")
 
-    verified_ex = [
-        f for f in (candidate.get("verified_flows") or [])
-        if (f.get("verdict") or "") != "FALSE_POSITIVE"
-    ]
-    if not verified_ex:
+    if not strong_verified:
         if _is_strong_unverified(candidate):
             lines.append(
                 f"     [cap={_ESCAPE_CAP}] UNVERIFIED_HIGH_VALUE — "

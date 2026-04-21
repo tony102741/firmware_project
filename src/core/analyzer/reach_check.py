@@ -294,6 +294,17 @@ def _find_invoking_scripts(binary_name, cgi_files, rootfs):
     return found
 
 
+_WEB_SERVER_NAMES = frozenset({
+    "boa", "httpd", "mini_httpd", "thttpd", "lighttpd", "nginx",
+    "uhttpd", "mongoose", "cgi-bin", "webs",
+})
+
+
+def _is_web_server_binary(binary_path):
+    """Return True if the binary is itself the HTTP server (not a helper)."""
+    return os.path.basename(binary_path).lower() in _WEB_SERVER_NAMES
+
+
 def check_flow_reachability(binary_path, flow, cgi_files, rootfs, web_config):
     """
     Determine if a single confirmed flow is remotely reachable.
@@ -312,6 +323,41 @@ def check_flow_reachability(binary_path, flow, cgi_files, rootfs, web_config):
       remotely_reachable, endpoint, handler, auth_required, auth_strength,
       auth_evidence, input_param, input_method, exploit_scenario, keep
     """
+    verdict = flow.get('verdict', 'UNCERTAIN')
+    is_heuristic = flow.get('func_sym') in ('(heuristic)', '(script-heuristic)')
+
+    # ── 0. Directly-reachable scripts and web-server binaries ────────────────
+    # Two cases that don't need an "invoking script":
+    #   A) boa/httpd etc. — the binary IS the HTTP server
+    #   B) Lua/shell scripts with flow_type cmd_injection — they ARE the handler
+    # For both, synthesise a reachability record from what we already know.
+    is_script_handler = (
+        flow.get('func_sym') == '(script-heuristic)'
+    )
+    if ((_is_web_server_binary(binary_path) or is_script_handler)
+            and is_heuristic and verdict == 'LIKELY'):
+        port = web_config['listen_ports'][0] if web_config['listen_ports'] else 80
+        sink = flow.get('sink_sym', 'system')
+        cgi_vars = flow.get('cgi_vars', [])
+        param_name = cgi_vars[0] if cgi_vars else 'QUERY_STRING'
+        endpoint_str = f"http://device:{port}/cgi-bin/ (HTTP server self-handling)"
+        scenario = (
+            f"POST /cgi-bin/ HTTP/1.1  param={param_name}\n"
+            f"      → {sink}(param) as root — authentication status unknown"
+        )
+        return {
+            'remotely_reachable': True,
+            'endpoint':           endpoint_str,
+            'handler':            os.path.basename(binary_path),
+            'auth_required':      None,
+            'auth_strength':      'unknown',
+            'auth_evidence':      'web server binary handles requests directly',
+            'input_param':        param_name,
+            'input_method':       'CGI/HTTP',
+            'exploit_scenario':   scenario,
+            'keep':               True,
+        }
+
     # ── 1. Find the HTTP handler ──────────────────────────────────────────────
 
     invokers = _find_invoking_scripts(binary_path, cgi_files, rootfs)
@@ -388,13 +434,23 @@ def check_flow_reachability(binary_path, flow, cgi_files, rootfs, web_config):
     verdict = flow.get('verdict', 'UNCERTAIN')
     keep = verdict == 'CONFIRMED'
     if verdict == 'LIKELY':
-        keep = (
-            flow.get('origin') == 'fmt_buf'
-            and 'getenv' in (flow.get('flow_str') or '').lower()
-            and auth_required is False
-            and bool(param_name)
-            and param_name != 'QUERY_STRING (raw)'
-        )
+        is_heuristic_flow = flow.get('func_sym') == '(heuristic)'
+        if is_heuristic_flow:
+            # Heuristic LIKELY: keep when unauthenticated + any param resolved
+            keep = (
+                auth_required is False
+                and bool(param_name)
+                and param_name != 'QUERY_STRING (raw)'
+            )
+        else:
+            # AArch64 deep LIKELY: original strict condition
+            keep = (
+                flow.get('origin') == 'fmt_buf'
+                and 'getenv' in (flow.get('flow_str') or '').lower()
+                and auth_required is False
+                and bool(param_name)
+                and param_name != 'QUERY_STRING (raw)'
+            )
 
     return {
         'remotely_reachable': keep,
