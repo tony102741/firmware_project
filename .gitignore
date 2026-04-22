@@ -6,6 +6,7 @@ data/
 runs/
 fw_dump/
 report/
+research/
 
 .codex
 .venv/
