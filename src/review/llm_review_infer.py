@@ -36,7 +36,7 @@ SRC_ROOT = Path(__file__).resolve().parents[1]
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from review.llm_review import build_compact_packet
+from review.llm_review import build_compact_packet, build_gold_stub
 
 
 PROJECT_ROOT = SRC_ROOT.parent
@@ -98,59 +98,14 @@ def _load_project_api_key() -> str:
 
 def _safe_labels(packet: dict) -> dict:
     engine = packet.get("engine_state") or {}
-    evidence = packet.get("evidence") or {}
-    success_quality = engine.get("success_quality") or "unknown"
-    probe_readiness = engine.get("probe_readiness") or "unknown"
-    blob_family = engine.get("blob_family") or "none"
-    web_surface_detected = bool(
-        engine.get("web_surface_detected")
-        or engine.get("analysis_mode") == "iot_web"
-    )
-
-    top_risk = "no-clear-rce"
-    if success_quality == "blob-success" or probe_readiness in {
-        "blob-ready",
-        "decrypt-probe-ready",
-        "scan-probe-ready",
-        "bundle-probe-ready",
-    }:
-        top_risk = "container-analysis"
-    else:
-        for cand in evidence.get("top_candidates") or []:
-            flow_type = str(cand.get("flow_type") or "").lower()
-            sinks = [str(s).lower() for s in (cand.get("all_sinks") or [])]
-            summary = str(cand.get("vuln_summary") or "").lower()
-            if "overflow" in summary or "buffer_overflow" in flow_type:
-                top_risk = "memory-corruption"
-                break
-            if "cmd_injection" in flow_type or ("command injection" in summary and any(
-                tok in " ".join(sinks) for tok in ("os.execute", "/bin/sh", "session::system", "popen", "system", "exec")
-            )):
-                top_risk = "cmd-injection"
-                break
-        else:
-            summary = engine.get("summary") or {}
-            if summary.get("upgrade_findings"):
-                top_risk = "upgrade-risk"
-            elif summary.get("crypto_findings"):
-                top_risk = "crypto-risk"
-            elif evidence.get("container_targets"):
-                top_risk = "container-analysis"
-
-    if probe_readiness == "decrypt-probe-ready":
-        best_next_action = "run-decrypt-probe"
-    elif probe_readiness == "scan-probe-ready":
-        best_next_action = "inspect-container-payload"
-    elif probe_readiness == "bundle-probe-ready":
-        best_next_action = "inspect-segmented-bundle"
-    elif success_quality == "rootfs-success":
-        best_next_action = "triage-top-candidates"
-    elif success_quality == "blob-success":
-        best_next_action = "expand-binary-signals"
-    else:
-        best_next_action = "review-artifacts"
-
-    encrypted_container = blob_family == "tenda-openssl-container"
+    labels = ((build_gold_stub(packet) or {}).get("labels")) or {}
+    success_quality = labels.get("artifact_kind") or engine.get("success_quality") or "unknown"
+    probe_readiness = labels.get("probe_readiness") or engine.get("probe_readiness") or "unknown"
+    blob_family = labels.get("blob_family") or engine.get("blob_family") or "none"
+    web_surface_detected = bool(labels.get("has_web_ui"))
+    top_risk = labels.get("top_risk_family") or "no-clear-rce"
+    best_next_action = labels.get("best_next_action") or "review-artifacts"
+    encrypted_container = bool(labels.get("encrypted_container"))
 
     if best_next_action == "run-decrypt-probe":
         next_actions = [
@@ -187,7 +142,7 @@ def _safe_labels(packet: dict) -> dict:
     )
 
     return {
-        "has_rootfs": success_quality == "rootfs-success",
+        "has_rootfs": bool(labels.get("has_rootfs")),
         "has_web_ui": web_surface_detected,
         "artifact_kind": success_quality,
         "probe_readiness": probe_readiness,

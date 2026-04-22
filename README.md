@@ -267,11 +267,21 @@ python3 src/review/manual_review_compare.py \
   --manual research/review/manual/manual_review_labels.jsonl \
   --json-out research/review/manual/manual_review_diff.json \
   --markdown-out research/review/manual/manual_review_diff.md
+
+python3 src/review/manual_review_queue.py \
+  --packets research/review/llm/llm_review_packets.jsonl \
+  --predictions research/review/llm/llm_review_predictions_hybrid.jsonl \
+  --manual research/review/manual/manual_review_labels.jsonl \
+  --json-out research/review/manual/manual_review_queue.json \
+  --jsonl-out research/review/manual/manual_review_queue.jsonl \
+  --markdown-out research/review/manual/manual_review_queue.md
 ```
 
 This gives you a concrete mismatch queue such as rootfs-state mistakes,
 container-family mistakes, and next-action mistakes so you can tighten the
-heuristics directly.
+heuristics directly. When LLM predictions are available, the manual review queue
+also highlights where engine labels and LLM labels disagree on risk family,
+artifact state, or best next action so review time can focus on judgment gaps.
 
 `llm_review.py` turns each run into a stable evidence packet for classification,
 planning, triage, and report writing. `llm_review_infer.py` turns those packets

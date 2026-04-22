@@ -464,6 +464,9 @@ def run_llm_followup(args, entries, results):
 
 def run_manual_review_queue(args):
     packet_path = Path(args.llm_packets_output or (PROJECT_ROOT / "research" / "review" / "llm" / "llm_review_packets.jsonl"))
+    prediction_path = Path(
+        args.llm_predictions_output or (PROJECT_ROOT / "research" / "review" / "llm" / "llm_review_predictions_hybrid.jsonl")
+    )
     queue_json = Path(args.review_queue_json_output or (PROJECT_ROOT / "research" / "review" / "manual" / "manual_review_queue.json"))
     queue_jsonl = Path(args.review_queue_jsonl_output or (PROJECT_ROOT / "research" / "review" / "manual" / "manual_review_queue.jsonl"))
     queue_md = Path(args.review_queue_markdown_output or (PROJECT_ROOT / "research" / "review" / "manual" / "manual_review_queue.md"))
@@ -474,6 +477,8 @@ def run_manual_review_queue(args):
         str(MANUAL_REVIEW_QUEUE),
         "--packets",
         str(packet_path),
+        "--predictions",
+        str(prediction_path),
         "--json-out",
         str(queue_json),
         "--jsonl-out",
@@ -488,6 +493,7 @@ def run_manual_review_queue(args):
     subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True)
     return {
         "packet_path": str(packet_path),
+        "prediction_path": str(prediction_path) if prediction_path.is_file() else None,
         "manual_labels": str(manual_labels) if manual_labels.is_file() else None,
         "queue_json": str(queue_json),
         "queue_jsonl": str(queue_jsonl),
