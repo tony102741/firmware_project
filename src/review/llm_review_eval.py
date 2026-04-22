@@ -49,7 +49,13 @@ def main() -> int:
     ap.add_argument("--predictions", required=True)
     args = ap.parse_args()
 
-    gold = {row["review_id"]: row.get("labels") or {} for row in load_jsonl(args.gold)}
+    gold = {}
+    for row in load_jsonl(args.gold):
+        gold[row["review_id"]] = (
+            row.get("labels")
+            or row.get("manual_labels")
+            or {}
+        )
     preds = {}
     for row in load_jsonl(args.predictions):
         preds[row["review_id"]] = row.get("labels") or row.get("predictions") or {}
