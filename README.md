@@ -281,9 +281,9 @@ intentionally want API-backed judgment for opaque or ambiguous samples.
 With `--preflight`, the runner checks `OPENAI_API_KEY` and OpenAI reachability
 first, then falls back to `heuristic` automatically unless you set
 `--fallback-provider fail`.
-For project-local always-on setup, copy `.env.local.example` to `.env.local`
-once and set `OPENAI_API_KEY=...`. The runner will auto-load it on every run,
-so you do not need to export the key manually each time.
+For project-local always-on setup, create `.env.local` once and set
+`OPENAI_API_KEY=...`. The runner will auto-load it on every run, so you do not
+need to export the key manually each time.
 You can also keep `ANTHROPIC_API_KEY=...` there, or store each key separately
 under `.secrets/openai_api_key` and `.secrets/anthropic_api_key`.
 `llm_review_eval.py` then measures how well model predictions match your

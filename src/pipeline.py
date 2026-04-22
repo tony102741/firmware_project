@@ -557,12 +557,9 @@ def ensure_dumper():
     )
     if result.returncode != 0:
         print("[FATAL] go build failed for payload-dumper-go", flush=True)
-        print("[FATAL] If running in Docker: the pre-built binary should have been",
+        print("[FATAL] Install the Go toolchain (golang.org) or replace the binary at:",
               flush=True)
-        print("[FATAL] copied by docker-entrypoint.sh from /opt/tools/payload-dumper-go.",
-              flush=True)
-        print("[FATAL] If running outside Docker: install the Go toolchain (golang.org).",
-              flush=True)
+        print(f"        {DUMPER}", flush=True)
         sys.exit(1)
 
     if not (os.path.isfile(DUMPER) and os.access(DUMPER, os.X_OK)):
