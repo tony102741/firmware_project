@@ -18,6 +18,7 @@ research/
 ghidra_projects/
 ghidra_targets/
 extract_tmp/
+tools/
 tools/ghidra
 tools/ghidra_11.3.2_PUBLIC/
 tools/tmp_*
