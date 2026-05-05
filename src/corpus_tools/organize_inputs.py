@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import filecmp
 import json
 import shutil
 import sys
@@ -42,6 +43,21 @@ def desired_product_dir(path, inputs_dir, corpus_by_path, corpus_by_name):
         return path_label(row["model"])
     inferred = infer_entry(path, inputs_root=inputs_dir)
     return path_label(inferred.get("model") or path.stem)
+
+
+def duplicate_reason(path, dest, root):
+    src_rel = str(path.relative_to(root)).replace("\\", "/")
+    dest_rel = str(dest.relative_to(root)).replace("\\", "/")
+    try:
+        same = (
+            path.stat().st_size == dest.stat().st_size
+            and filecmp.cmp(path, dest, shallow=False)
+        )
+    except OSError:
+        same = False
+    if same:
+        return f"identical duplicate of: {dest_rel}"
+    return f"destination exists: {dest_rel}"
 
 
 def organize_inputs(inputs_dir, corpus_rows):
@@ -82,7 +98,7 @@ def organize_inputs(inputs_dir, corpus_rows):
         if dest.exists():
             skipped.append({
                 "source": str(path.relative_to(root)).replace("\\", "/"),
-                "reason": f"destination exists: {dest.relative_to(root)}",
+                "reason": duplicate_reason(path, dest, root),
             })
             continue
 

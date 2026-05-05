@@ -368,6 +368,230 @@ def _flow_confidence(flow_score, flow_type=None, sinks=None):
     return "WEAK"
 
 
+_BRIDGE_API_IMPORTS = {
+    "nvram_get", "nvram_set", "nvram_bufget", "nvram_bufset",
+    "mib_get", "mib_set", "uci_get", "uci_set",
+    "config_get", "config_set", "cfg_get", "cfg_set",
+    "apmib_get", "apmib_set",
+}
+
+_OUI_RPC_SAFE_ARG_RE = r"^[%w%.%s%-_:#/]-$"
+
+
+def _has_bridge_api(imports):
+    if not imports:
+        return False
+    return bool(set(imports.keys()) & _BRIDGE_API_IMPORTS)
+
+
+def _has_oui_rpc_validator_guard(exec_path, strings, all_sinks):
+    lower_path = (exec_path or "").lower()
+    if "/usr/lib/oui-httpd/rpc/" not in lower_path:
+        return False
+    text = "\n".join(strings or [])
+    if "validator.base(" not in text:
+        return False
+    sink_text = " ".join(str(s) for s in (all_sinks or []))
+    if "os.execute" not in sink_text and "io.popen" not in sink_text:
+        return False
+    # Heuristic: oui-rpc handlers commonly validate params through validator.base
+    # before config persistence or command execution. Treat this as a
+    # framework-level anti-signal for shell injection unless a later stage
+    # proves attacker-controlled metacharacters reach the sink.
+    return True
+
+
+def _has_double_quoted_no_subshell_exec(all_sinks):
+    for sink in all_sinks or []:
+        s = str(sink)
+        l = s.lower()
+        if "os.execute(" not in l and "io.popen(" not in l:
+            continue
+        if '..' not in s:
+            continue
+        if 'echo \\"' not in s and 'echo "' not in s:
+            continue
+        if any(tok in s for tok in ("$(", "`")):
+            continue
+        # newline inside a double-quoted echo argument is not enough to break
+        # into a new shell command when command substitution characters are absent.
+        return True
+    return False
+
+
+_GENERIC_CHAIN_TOKENS = {
+    "admin", "config", "accountmgnt", "history", "firmware", "upgrade",
+    "status", "remote", "management", "system", "popen", "exec", "bin",
+    "sh", "grep", "awk", "ps", "proc", "device", "info", "query",
+}
+
+_STATIC_COMMAND_MARKERS = (
+    "grep ", "awk ", "ps ", "cat ", "echo ", "uname ", "ifconfig ",
+    "iwconfig ", "ethtool ", "lsmod", "route ", "iptables ", "fw_printenv",
+)
+
+_CMD_SUBSTITUTION_MARKERS = ("%s", "%d", "$", "{", "}", "..", "concat", "`", "$(")
+
+_KEY_GATED_PROTOCOL_HINTS = (
+    "encrypted", "encrypt", "decrypt", "cipher", "aes", "rsa", "hmac",
+    "signature", "shared key", "public key", "private key", "session key",
+    "key exchange", "nonce", "challenge", "token", "auth tag",
+)
+
+
+def _signal_tokens(parts, min_len=4):
+    toks = set()
+    for part in parts or []:
+        for tok in _re.split(r'[^a-z0-9_]', str(part).lower()):
+            if len(tok) < min_len or tok in _GENERIC_CHAIN_TOKENS:
+                continue
+            toks.add(tok)
+    return toks
+
+
+def _input_sink_token_overlap(endpoints, templates, config_keys, all_sinks):
+    input_tokens = _signal_tokens(list(endpoints or []) + list(templates or []) + list(config_keys or []))
+    sink_tokens = _signal_tokens(all_sinks or [])
+    return len(input_tokens & sink_tokens)
+
+
+def _has_only_bare_import_exec_sinks(all_sinks):
+    bare = {"system", "popen", "exec", "execl", "execv", "execvp", "execve", "/bin/sh", "sh -c"}
+    sinks = [str(s).strip().lower() for s in (all_sinks or [])]
+    if not sinks:
+        return False
+    exec_sinks = [s for s in sinks if any(tok in s for tok in ("system", "popen", "exec", "/bin/sh", "sh -c"))]
+    if not exec_sinks:
+        return False
+    return all(s in bare for s in exec_sinks)
+
+
+def _looks_like_static_command_sink(all_sinks):
+    cmd_sinks = [str(s) for s in (all_sinks or []) if any(tok in str(s).lower() for tok in ("system", "popen", "/bin/sh", "|", "grep ", "awk ", "ps "))]
+    if not cmd_sinks:
+        return False
+    matched = False
+    for sink in cmd_sinks:
+        lower = sink.lower()
+        if any(marker in lower for marker in _STATIC_COMMAND_MARKERS):
+            matched = True
+        if any(marker in sink for marker in _CMD_SUBSTITUTION_MARKERS):
+            return False
+    return matched
+
+
+def _has_key_gated_protocol_strings(strings):
+    hits = 0
+    for s in strings or []:
+        lower = str(s).lower()
+        if any(tok in lower for tok in _KEY_GATED_PROTOCOL_HINTS):
+            hits += 1
+            if hits >= 2:
+                return True
+    return False
+
+
+def _templates_support_exec(templates):
+    meaningful = 0
+    for template in templates or []:
+        lower = str(template).strip().lower()
+        if not lower:
+            continue
+        if (
+            lower.startswith("echo %s")
+            or lower.startswith("printf %s")
+            or "fail to init" in lower
+            or " start....." in lower
+            or " end....." in lower
+        ):
+            continue
+        if any(tok in lower for tok in (
+            "wget ", "curl ", "iptables ", "route ", "ifconfig ",
+            "/bin/sh", "sh -c", "uci set", "nvram set",
+            "ping ", "traceroute ", "grep ", "awk ",
+        )):
+            if "%s" in template or "%d" in template:
+                meaningful += 1
+            continue
+        if "%s" in template or "%d" in template:
+            meaningful += 1
+    return meaningful > 0
+
+
+def _preliminary_false_positive_risks(
+    *,
+    exec_path,
+    strings,
+    flow_type,
+    all_sinks,
+    templates,
+    missing_links,
+    validation_penalty,
+    import_symbols,
+    config_keys,
+    endpoints,
+    handler_symbols,
+):
+    risks = []
+    flow_l = (flow_type or "").lower()
+    sink_l = [str(s).lower() for s in (all_sinks or [])]
+    missing = set(missing_links or [])
+    import_set = set(import_symbols or [])
+    config_keys = list(config_keys or [])
+    endpoints = list(endpoints or [])
+    handler_symbols = list(handler_symbols or [])
+    token_overlap = _input_sink_token_overlap(endpoints, templates, config_keys, all_sinks)
+    meaningful_templates = _templates_support_exec(templates)
+
+    if "exact_input_unknown" in missing:
+        risks.append("no_exact_input")
+
+    if is_logging_only_sink(all_sinks):
+        risks.append("literal_logging_only")
+
+    if (
+        any(tok in flow_l for tok in ("cmd", "dlopen"))
+        or any(any(k in s for k in ("system", "popen", "exec", "dlopen", "dlsym")) for s in sink_l)
+    ):
+        if not meaningful_templates and (
+            "exact_input_unknown" in missing
+            or _has_only_bare_import_exec_sinks(all_sinks)
+            or _looks_like_static_command_sink(all_sinks)
+        ):
+            risks.append("constant_or_unproven_exec_argument")
+        if (
+            _has_only_bare_import_exec_sinks(all_sinks)
+            and not meaningful_templates
+            and token_overlap == 0
+            and not handler_symbols
+        ):
+            risks.append("sink_import_only")
+        if (
+            not meaningful_templates
+            and token_overlap == 0
+            and (endpoints or handler_symbols)
+        ):
+            risks.append("cross_function_token_contamination")
+        if _has_key_gated_protocol_strings(strings) and not meaningful_templates:
+            risks.append("key_gated_protocol_surface")
+
+    if flow_l in {"buffer_overflow", "bof+net_length", "config_injection", "net_copy_partial", "heap_overflow", "format_string"}:
+        if validation_penalty >= 0.20 and flow_l != "bof+net_length":
+            risks.append("bounded_or_truncated_copy")
+
+    if config_keys and not (import_set & _BRIDGE_API_IMPORTS):
+        if "chain_gap_unknown" in missing or "exact_input_unknown" in missing:
+            risks.append("bridge_api_unproven")
+
+    if _has_oui_rpc_validator_guard(exec_path, strings, all_sinks):
+        risks.append("rpc_default_validator")
+
+    if _has_double_quoted_no_subshell_exec(all_sinks):
+        risks.append("double_quoted_no_subshell_exec")
+
+    return sorted(dict.fromkeys(risks))
+
+
 # ── Main analysis loop ───────────────────────────────────────────────────────
 
 def analyze_services(services, root_path):
@@ -732,6 +956,28 @@ def analyze_services(services, root_path):
             handler_symbols=symbols if symbols else [],
             has_named_fn=_named_fn_flag,
         )
+        handler_symbol_hits = sorted(
+            n for n in symbols
+            if any(h in n for h in (
+                "handle_", "apply_", "set_wan", "set_ddns", "set_wlan",
+                "set_vpn", "do_system", "exec_cmd", "run_cmd",
+                "submit_", "upload_", "apcli_", "ipsec_", "wps_",
+                "connect", "disconnect", "site_survey", "dpp",
+            ))
+        )[:12]
+        preliminary_fp_risks = _preliminary_false_positive_risks(
+            exec_path=path,
+            strings=strings,
+            flow_type=flow_type,
+            all_sinks=all_sinks,
+            templates=templates,
+            missing_links=missing_links,
+            validation_penalty=validation_penalty,
+            import_symbols=list(imports.keys()) if imports else [],
+            config_keys=_config_keys_list,
+            endpoints=endpoints,
+            handler_symbols=handler_symbol_hits,
+        )
 
         sink_score = score_sinks(filtered)
         score = calc_score(
@@ -756,6 +1002,30 @@ def analyze_services(services, root_path):
         # attack surface (format-string bugs only); deprioritise vs exec/memory.
         if is_logging_only_sink(all_sinks):
             score = max(1, int(round(score * 0.5)))
+
+        if "constant_or_unproven_exec_argument" in preliminary_fp_risks:
+            score = max(1, int(round(score * 0.60)))
+
+        if "sink_import_only" in preliminary_fp_risks:
+            score = max(1, int(round(score * 0.55)))
+
+        if "cross_function_token_contamination" in preliminary_fp_risks:
+            score = max(1, int(round(score * 0.60)))
+
+        if "bridge_api_unproven" in preliminary_fp_risks:
+            score = max(1, int(round(score * 0.75)))
+
+        if "bounded_or_truncated_copy" in preliminary_fp_risks:
+            score = max(1, int(round(score * 0.70)))
+
+        if "key_gated_protocol_surface" in preliminary_fp_risks:
+            score = max(1, int(round(score * 0.60)))
+
+        if "rpc_default_validator" in preliminary_fp_risks:
+            score = max(1, int(round(score * 0.60)))
+
+        if "double_quoted_no_subshell_exec" in preliminary_fp_risks:
+            score = max(1, int(round(score * 0.50)))
 
         # Missing-link penalty: a candidate with 3+ unconfirmed chain elements
         # is too vague to outrank a concrete, specific finding.  −25% prevents
@@ -889,15 +1159,7 @@ def analyze_services(services, root_path):
             "endpoints":            endpoints,
 
             # Gap 4: internal symbol-based feature detection (empty if stripped).
-            "handler_symbols":      sorted(
-                n for n in symbols
-                if any(h in n for h in (
-                    "handle_", "apply_", "set_wan", "set_ddns", "set_wlan",
-                    "set_vpn", "do_system", "exec_cmd", "run_cmd",
-                    "submit_", "upload_", "apcli_", "ipsec_", "wps_",
-                    "connect", "disconnect", "site_survey", "dpp",
-                ))
-            )[:12],
+            "handler_symbols":      handler_symbol_hits,
 
             # Gap 5: authentication requirement assessment for frontend handlers.
             "auth_bypass":          auth_status,
@@ -924,6 +1186,8 @@ def analyze_services(services, root_path):
             # Negative = evidence from error paths / sanitization present.
             # Positive = direct-path templates with coupled token evidence.
             "plausibility_bonus":   plausibility_bonus,
+            "false_positive_risks": preliminary_fp_risks,
+            "import_symbols":       sorted(imports.keys())[:64] if imports else [],
 
             # One-line CVE-style vulnerability summary (pre-populated for dossier).
             # auth_bypass is set after scoring so we forward it via a sentinel;

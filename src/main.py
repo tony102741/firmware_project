@@ -25,6 +25,7 @@ from analyzer.verify_flow import verify_exploitable_flows
 from analyzer.reach_check import analyze_reachability
 from analyzer.strings_analyzer import extract_strings
 from analyzer.cve_triage import select_cve_candidates, explain_triage
+from analyzer.scoring import is_logging_only_sink
 from analyzer.crypto_scanner import scan_crypto_material
 from analyzer.upgrade_analyzer import scan_upgrade_scripts
 
@@ -387,6 +388,7 @@ def _is_openwrt_web_script(exec_path):
         or "/usr/lib/lua/luci/jsonrpcbind/" in lower
         or lower.endswith("/luci/sgi/uhttpd.lua")
         or "/usr/libexec/rpcd/" in lower
+        or "/usr/lib/oui-httpd/rpc/" in lower
     )
 
 
@@ -486,8 +488,9 @@ def _collect_generic_blob_services(system_path, max_candidates=None):
         "libc++_shared", "libjnidispatch", "libsoftokn3", "libgraphics-core",
     )
 
+    skip_probe_dirs = {"_openssl_auto", "_offset_probe", ".openssl_auto", ".offset_probe"}
     for dirpath, dirnames, filenames in os.walk(system_path):
-        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in skip_probe_dirs]
         rel_dir = os.path.relpath(dirpath, system_path).replace("\\", "/").lower()
         for name in sorted(filenames):
             lower = name.lower()
@@ -660,6 +663,22 @@ def _collect_container_signal_findings(services, system_path, limit=5):
                 "detail": "OpenSSL Salted__ header",
             })
 
+        if head.startswith(b"SHRS"):
+            payload_offset = 0x100 if payload_offset is None else payload_offset
+            markers.append({
+                "kind": "dlink-shrs",
+                "offset": 0,
+                "detail": "D-Link SHRS firmware wrapper",
+            })
+
+        if head.startswith(b"encrpted_img"):
+            payload_offset = 0x200 if payload_offset is None else payload_offset
+            markers.append({
+                "kind": "dlink-encrypted-img",
+                "offset": 0,
+                "detail": "D-Link encrpted_img wrapper",
+            })
+
         fw_type_match = re.search(r"fw-type:([a-z0-9_-]+)", haystack, re.I)
         if fw_type_match:
             markers.append({
@@ -698,6 +717,8 @@ def _collect_container_signal_findings(services, system_path, limit=5):
         if "openssl-salted" in kinds and salted_off == 0x204:
             vendor_guess = "Tenda-style encrypted firmware container"
             crypto_profile = "openssl-enc-compatible salted payload"
+        elif "dlink-shrs" in kinds or "dlink-encrypted-img" in kinds:
+            vendor_guess = "D-Link wrapped firmware image"
         elif "fw-type" in kinds and "cloud-tag" in kinds:
             vendor_guess = "TP-Link/MERCUSYS cloud firmware container"
         elif "fw-type" in kinds:
@@ -708,6 +729,8 @@ def _collect_container_signal_findings(services, system_path, limit=5):
 
         if payload_offset is None and ("fw-type" in kinds or "cloud-tag" in kinds):
             payload_offset = 0x200
+        elif payload_offset is None and "crypto-meta" in kinds:
+            payload_offset = 0
 
         return markers, vendor_guess, payload_offset, ciphertext_offset, openssl_salt, crypto_profile
 
@@ -820,6 +843,115 @@ def _collect_container_signal_findings(services, system_path, limit=5):
 
     findings.sort(key=lambda r: r["score"], reverse=True)
     return findings[:limit]
+
+
+def _collect_input_wrapper_signal_findings(limit=3):
+    input_path = _ORIGINAL_INPUT_PATH or _INPUT_PATH
+    if not input_path or not os.path.isfile(input_path):
+        return []
+
+    try:
+        with open(input_path, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return []
+
+    markers = []
+    vendor_guess = ""
+    payload_offset = None
+    ciphertext_offset = None
+    openssl_salt = None
+    crypto_profile = ""
+
+    if head.startswith(b"SHRS"):
+        markers.append({
+            "kind": "dlink-shrs",
+            "offset": 0,
+            "detail": "D-Link SHRS firmware wrapper",
+        })
+        vendor_guess = "D-Link wrapped firmware image"
+        payload_offset = 0x400
+    elif head.startswith(b"encrpted_img"):
+        markers.append({
+            "kind": "dlink-encrypted-img",
+            "offset": 0,
+            "detail": "D-Link encrpted_img wrapper",
+        })
+        vendor_guess = "D-Link wrapped firmware image"
+        payload_offset = 0x200
+    elif b"fw-type:Cloud" in head[:128]:
+        markers.append({
+            "kind": "cloud-tagged-container",
+            "offset": head.find(b"fw-type:Cloud"),
+            "detail": "Cloud-tagged firmware bundle",
+        })
+        vendor_guess = "TP-Link/Mercusys cloud firmware container"
+        payload_offset = 0x200
+    elif len(head) >= 0x214 and head[0x204:0x20C] == b"Salted__":
+        markers.append({
+            "kind": "openssl-salted",
+            "offset": 0x204,
+            "detail": "OpenSSL salted payload header",
+        })
+        vendor_guess = "Tenda-style encrypted firmware container"
+        payload_offset = 0x204
+        ciphertext_offset = 0x214
+        openssl_salt = head[0x20C:0x214].hex()
+        crypto_profile = "openssl-enc-compatible salted payload"
+
+    if not markers or payload_offset is None:
+        return []
+
+    try:
+        payload_size = max(0, os.path.getsize(input_path) - payload_offset)
+    except OSError:
+        payload_size = None
+    try:
+        ciphertext_size = (
+            max(0, os.path.getsize(input_path) - ciphertext_offset)
+            if isinstance(ciphertext_offset, int)
+            else None
+        )
+    except OSError:
+        ciphertext_size = None
+
+    return [{
+        "name": f"{os.path.basename(input_path)}:container-signal",
+        "exec": input_path,
+        "binary_path": input_path,
+        "level": "LOW",
+        "score": 22,
+        "confidence": "LOW",
+        "input_type": "blob",
+        "priv": "unknown",
+        "flow_type": "container_signal",
+        "source": "input-wrapper",
+        "controllability": "UNKNOWN",
+        "memory_impact": "UNKNOWN",
+        "validation_penalty": 0.0,
+        "taint_confidence": 0.0,
+        "attack_surface": {"config_files": [], "env_vars": [], "ipc": [], "sockets": []},
+        "all_sinks": [],
+        "sinks": [],
+        "container_markers": markers,
+        "vendor_guess": vendor_guess,
+        "payload_offset": payload_offset,
+        "payload_size": payload_size,
+        "ciphertext_offset": ciphertext_offset,
+        "ciphertext_size": ciphertext_size,
+        "openssl_salt": openssl_salt,
+        "crypto_profile": crypto_profile,
+        "ciphertext_fingerprint": {},
+        "endpoints": [],
+        "vuln_summary": (
+            "encrypted or signed vendor firmware container detected "
+            f"({vendor_guess}): {markers[0]['detail']}"
+        ),
+        "next_steps": [
+            "Inspect the carved payload from the detected D-Link wrapper before generic blob triage.",
+            "Recover the SHRS/encrpted_img header layout so the extractor can strip the wrapper automatically.",
+        ],
+    }][:limit]
 
 
 def _relevel(score, confidence):
@@ -1308,6 +1440,27 @@ def _run_deep_verification(results, top_n=10):
             r["verified_flows"] = []
 
 
+def _verification_budget(results, cgi_files):
+    """
+    Keep deep verification bounded on very large web-root firmwares.
+
+    Large LuCI/webpage-heavy images can surface hundreds of candidate-facing
+    scripts and very large helper binaries.  In that regime, verifying the
+    usual top-10 candidates provides little extra value but can dominate the
+    runtime.  Use a tighter budget derived from corpus shape instead of from
+    vendor/model names.
+    """
+    result_count = len(results or [])
+    cgi_count = len(cgi_files or [])
+    if cgi_count >= 800:
+        return 0
+    if result_count >= 60 or cgi_count >= 800:
+        return 3
+    if result_count >= 35 or cgi_count >= 400:
+        return 5
+    return 10
+
+
 def _print_verified_flows(results):
     """
     Print the CONFIRMED / LIKELY flows found by deep verification.
@@ -1469,9 +1622,26 @@ def _result_path(result):
     return _safe_relpath(result.get("binary_path", result.get("exec")))
 
 
+def _is_text_script_candidate(result):
+    path = result.get("binary_path") or result.get("exec") or ""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in {".sh", ".lua", ".cgi", ".pl", ".py", ".js"}:
+        return True
+    if not path or not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(256)
+    except OSError:
+        return False
+    if head.startswith(b"\x7fELF"):
+        return False
+    return head.startswith(b"#!")
+
+
 def _next_steps_for_result(result, review=None, exploit_paths=None):
     """
-    Generate Ghidra-specific, ordered analysis steps for Stage-2 review.
+    Generate ordered analysis steps for Stage-2 review.
 
     Priority:
       1. Confirmed function VA / handler symbol → "decompile this exact function"
@@ -1533,6 +1703,60 @@ def _next_steps_for_result(result, review=None, exploit_paths=None):
         steps.append(
             "Do not trace random HTTP params from string noise. First recover the payload format or decryption key schedule."
         )
+        return steps[:5]
+    if _is_text_script_candidate(result):
+        steps.append(
+            f"Read `{os.path.basename(path or '')}` directly and trace how shell or script variables reach {sink_s}."
+        )
+        config_keys = result.get("config_keys") or []
+        if config_keys:
+            key_sample = ", ".join(f'"{k}"' for k in config_keys[:3])
+            steps.append(
+                f"Trace config reads for keys {key_sample} and confirm the returned value is concatenated into {sink_s}."
+            )
+        if exploit_paths:
+            ep = exploit_paths[0].get("endpoint", "?")
+            param = exploit_paths[0].get("input_param", "?")
+            auth = exploit_paths[0].get("auth_required")
+            auth_s = "UNAUTHENTICATED" if auth is False else "requires auth"
+            steps.append(
+                f"Craft PoC: `{ep}` [{auth_s}] and inject payload in `{param}` to confirm the script receives attacker input."
+            )
+        elif review and review.get("params"):
+            params = ", ".join(review["params"][:3])
+            steps.append(
+                f"Track attacker-controlled params `{params}` through the script and any helper binaries it invokes."
+            )
+        elif result.get("web_exposed"):
+            steps.append(
+                "Confirm the HTTP route, auth gate, and caller chain before treating the script as a live attack surface."
+            )
+        cc = result.get("cross_chain")
+        if cc and cc.get("writer") and cc.get("shared_keys"):
+            writer = os.path.basename(cc["writer"])
+            keys = ", ".join(f'"{k}"' for k in cc["shared_keys"][:3])
+            steps.append(
+                f"Check the upstream writer `{writer}` for keys {keys}; verify the same data then reaches {sink_s} in this script."
+            )
+        for link in (result.get("missing_links") or []):
+            if len(steps) >= 5:
+                break
+            if link == "exact_input_unknown":
+                steps.append(
+                    "Identify the exact form field or RPC parameter in the web scripts that populates this shell variable."
+                )
+            elif link == "auth_boundary_unknown":
+                steps.append(
+                    "Confirm whether the caller script enforces auth before invoking this code path."
+                )
+            elif link == "dispatch_unknown":
+                steps.append(
+                    "Find which CGI, Lua, or service wrapper invokes this script and map the request path to that caller."
+                )
+            elif link == "chain_gap_unknown":
+                steps.append(
+                    "Locate the intermediate config write or helper command that bridges HTTP input to the final shell sink."
+                )
         return steps[:5]
 
     # ── 1. Start point in Ghidra ──────────────────────────────────────────────
@@ -1662,19 +1886,336 @@ def _next_steps_for_result(result, review=None, exploit_paths=None):
     return steps[:5]
 
 
+def _hardening_summary(hardening):
+    hardening = hardening or {}
+    parts = []
+    if not hardening.get("canary", True):
+        parts.append("no-canary")
+    if not hardening.get("pie", True):
+        parts.append("no-pie")
+    if not hardening.get("relro", True):
+        parts.append("no-relro")
+    if not hardening.get("nx", True):
+        parts.append("no-nx")
+    return parts or ["unknown"]
+
+
+def _extract_confirmed_input(result, exploit_paths, positive_flows):
+    for path in exploit_paths or []:
+        param = path.get("input_param")
+        if param and param != "?":
+            return param
+    for flow in positive_flows or []:
+        origin = str(flow.get("origin") or "")
+        if origin and origin not in {"getenv/net (sanitised or weak chain)"}:
+            return origin
+        flow_str = str(flow.get("flow_str") or "")
+        if flow_str:
+            head = flow_str.split("→", 1)[0].strip()
+            if head and "input()" not in head.lower():
+                return head
+    return "unconfirmed"
+
+
+def _extract_confirmed_sink(result, positive_flows):
+    for flow in positive_flows or []:
+        sink = flow.get("sink_sym")
+        if sink:
+            return sink
+    all_sinks = list(result.get("all_sinks") or result.get("sinks") or [])
+    return all_sinks[0] if all_sinks else "unconfirmed"
+
+
+def _derive_auth_boundary(result, exploit_paths):
+    for path in exploit_paths or []:
+        auth_required = path.get("auth_required")
+        if auth_required is True:
+            return "post-auth"
+        if auth_required is False:
+            return "pre-auth"
+    auth = str(result.get("auth_bypass") or "required")
+    if auth in {"none", "confirmed"}:
+        return "pre-auth"
+    if auth == "bypassable":
+        return "bypassable"
+    if auth == "required":
+        return "post-auth"
+    return "unknown"
+
+
+def _derive_sanitization(result, raw_flows):
+    fp_risks = set(result.get("false_positive_risks") or [])
+    if "rpc_default_validator" in fp_risks or "double_quoted_no_subshell_exec" in fp_risks:
+        return "present"
+    if any(flow.get("sanitized") for flow in (raw_flows or [])):
+        return "present"
+    penalty = float(result.get("validation_penalty") or 0.0)
+    if penalty >= 0.20:
+        return "bounded-or-truncating"
+    return "none-observed"
+
+
+def _derive_false_positive_risks(result, raw_flows):
+    risks = list(result.get("false_positive_risks") or [])
+    reasons = " ".join(str(flow.get("reason") or "").lower() for flow in (raw_flows or []))
+    flow_strs = " ".join(str(flow.get("flow_str") or "").lower() for flow in (raw_flows or []))
+
+    if "constant command argument" in reasons:
+        risks.append("constant_sink_argument")
+    if "sanitization/filtering is present" in reasons:
+        risks.append("sanitized_before_sink")
+    if any(token in reasons for token in (
+        "remote user control is unproven",
+        "verified input-to-sink continuity is missing",
+        "strict exploitability not proven",
+        "chain unconfirmed",
+        "command string is a parameter",
+    )):
+        risks.append("input_to_sink_unproven")
+    if is_logging_only_sink(result.get("all_sinks") or result.get("sinks") or []):
+        risks.append("literal_logging_sink_only")
+
+    import_symbols = set(result.get("import_symbols") or [])
+    config_keys = [str(k).lower() for k in (result.get("config_keys") or [])]
+    if config_keys and not import_symbols.intersection({
+        "nvram_get", "nvram_set", "nvram_bufget", "nvram_bufset",
+        "mib_get", "mib_set", "uci_get", "uci_set",
+        "config_get", "config_set", "cfg_get", "cfg_set",
+        "apmib_get", "apmib_set",
+    }):
+        if any(tok in " ".join(config_keys) for tok in ("nvram", "config", "mib", "uci")) or "bridge" in flow_strs:
+            risks.append("bridge_api_unproven")
+
+    if float(result.get("validation_penalty") or 0.0) >= 0.20 and result.get("memory_impact") != "CONFIRMED":
+        risks.append("bounded_or_truncated_copy")
+
+    sink_text = " ".join(str(s) for s in (result.get("all_sinks") or result.get("sinks") or []))
+    if (
+        not result.get("injection_templates")
+        and any(tok in sink_text.lower() for tok in ("system", "popen", "exec", "/bin/sh"))
+        and all(marker not in sink_text for marker in ("%s", "%d", "$", "..", "concat", "`", "$("))
+    ):
+        risks.append("sink_import_only")
+
+    if (
+        not result.get("injection_templates")
+        and result.get("endpoints")
+        and not result.get("handler_symbols")
+        and any(tok in sink_text.lower() for tok in ("grep ", "awk ", "ps ", "ifconfig ", "ethtool ", "iwconfig "))
+    ):
+        risks.append("cross_function_token_contamination")
+
+    cfg_text = " ".join(str(k).lower() for k in (result.get("config_keys") or []))
+    if any(tok in cfg_text or tok in sink_text.lower() for tok in ("encrypted", "encrypt", "cipher", "aes", "rsa", "signature", "shared key", "token")):
+        if not result.get("injection_templates"):
+            risks.append("key_gated_protocol_surface")
+
+    if result.get("binary_path", "").lower().find("/usr/lib/oui-httpd/rpc/") != -1:
+        sink_text = " ".join(str(s) for s in (result.get("all_sinks") or result.get("sinks") or []))
+        cfg_text = " ".join(config_keys)
+        if any(tok in cfg_text for tok in ("jsonrpc", "params", "method", "function", "call")) and (
+            "os.execute" in sink_text or "io.popen" in sink_text
+        ):
+            risks.append("rpc_default_validator")
+        if (
+            (("os.execute(\"echo \\\"" in sink_text) or ("os.execute(\"echo \"" in sink_text))
+            and ".." in sink_text
+            and "$(" not in sink_text
+            and "`" not in sink_text
+        ):
+            risks.append("double_quoted_no_subshell_exec")
+
+    return sorted(dict.fromkeys(risks))
+
+
+def _derive_candidate_verdict(result, exploit_paths, positive_flows, raw_flows, missing_links, fp_risks):
+    confirmed_input = _extract_confirmed_input(result, exploit_paths, positive_flows)
+    confirmed_sink = _extract_confirmed_sink(result, positive_flows)
+    auth_boundary = _derive_auth_boundary(result, exploit_paths)
+    sanitization = _derive_sanitization(result, raw_flows)
+    has_confirmed = any((flow.get("verdict") or "").upper() == "CONFIRMED" for flow in positive_flows)
+    has_likely = any((flow.get("verdict") or "").upper() == "LIKELY" for flow in positive_flows)
+    has_handler_surface = bool(result.get("handler_surface"))
+    has_web_surface = bool(result.get("web_exposed") or result.get("web_reachable"))
+
+    if any(risk in fp_risks for risk in (
+        "constant_sink_argument",
+        "sink_import_only",
+        "cross_function_token_contamination",
+        "literal_logging_sink_only",
+        "sanitized_before_sink",
+        "bounded_or_truncated_copy",
+        "key_gated_protocol_surface",
+    )) and not (has_confirmed or has_likely):
+        return "reject"
+
+    if (
+        confirmed_input == "unconfirmed"
+        and not has_handler_surface
+        and not (has_confirmed or has_likely)
+    ):
+        return "reject"
+
+    if (
+        confirmed_input == "unconfirmed"
+        and not has_web_surface
+        and not has_handler_surface
+        and confirmed_sink != "unconfirmed"
+    ):
+        return "reject"
+
+    if has_confirmed and confirmed_input != "unconfirmed" and sanitization == "none-observed":
+        if not any(link in missing_links for link in ("exact_input_unknown", "dispatch_unknown", "chain_gap_unknown")):
+            return "cve-ready"
+
+    if has_confirmed or has_likely:
+        if confirmed_input == "unconfirmed":
+            return "reject"
+        if any(link in missing_links for link in ("exact_input_unknown", "dispatch_unknown", "chain_gap_unknown")):
+            return "needs-reversing"
+        return "promising"
+
+    # Reserve "needs-reversing" for candidates that already have at least a
+    # concrete input token plus a concrete sink, even if the middle of the
+    # chain is still missing. Generic daemon noise with only a scary sink and
+    # many unknowns should stay rejected.
+    if (
+        confirmed_input != "unconfirmed"
+        and confirmed_sink != "unconfirmed"
+        and auth_boundary != "unknown"
+        and "input_to_sink_unproven" not in fp_risks
+        and "too_many_unknowns" not in missing_links
+    ):
+        return "needs-reversing"
+
+    if (
+        confirmed_sink != "unconfirmed"
+        and auth_boundary != "unknown"
+        and sanitization != "present"
+        and not any(risk in fp_risks for risk in (
+            "constant_sink_argument",
+            "sink_import_only",
+            "cross_function_token_contamination",
+            "literal_logging_sink_only",
+            "bridge_api_unproven",
+            "bounded_or_truncated_copy",
+            "key_gated_protocol_surface",
+            "rpc_default_validator",
+            "double_quoted_no_subshell_exec",
+        ))
+        and (
+            has_web_surface
+            or has_handler_surface
+            or result.get("endpoints")
+            or result.get("flow_type") in {"buffer_overflow", "format_string", "heap_overflow"}
+        )
+    ):
+        return "low-priority"
+
+    return "reject"
+
+
+def _derive_recommended_next_action(result, cve_readiness):
+    flow_type = (result.get("flow_type") or "").lower()
+    verdict = (cve_readiness.get("verdict") or "").lower()
+    missing_links = set(cve_readiness.get("missing_links") or [])
+    fp_risks = set(cve_readiness.get("false_positive_risks") or [])
+
+    if flow_type in {"container_signal", "blob_signal"}:
+        return "recover-payload-format"
+    if "exact_input_unknown" in missing_links or "no_exact_input" in fp_risks:
+        return "confirm-input-source"
+    if "dispatch_unknown" in missing_links:
+        return "confirm-dispatch-path"
+    if "chain_gap_unknown" in missing_links or "input_to_sink_unproven" in fp_risks:
+        return "bridge-input-to-sink"
+    if cve_readiness.get("sanitization") == "present":
+        return "audit-sanitization-boundary"
+    if verdict in {"promising", "cve-ready"}:
+        return "confirm-exploit-primitive"
+    if flow_type in {"buffer_overflow", "format_string", "heap_overflow"}:
+        return "confirm-copy-site"
+    return "review-artifacts"
+
+
+def _derive_endpoint_input_label(result, exploit_paths):
+    for path in exploit_paths or []:
+        endpoint = path.get("endpoint")
+        input_param = path.get("input_param")
+        if endpoint and input_param:
+            return f"{endpoint} :: {input_param}"
+        if endpoint:
+            return endpoint
+        if input_param:
+            return input_param
+    endpoints = list(result.get("endpoints") or [])
+    if endpoints:
+        return endpoints[0]
+    return "unconfirmed"
+
+
+def _build_cve_readiness(result, exploit_paths=None):
+    raw_flows = list(result.get("verified_flows") or [])
+    positive_flows = [
+        flow for flow in raw_flows
+        if (flow.get("verdict") or "").upper() in {"CONFIRMED", "LIKELY"}
+    ]
+    missing_links = list(result.get("missing_links") or [])
+    fp_risks = _derive_false_positive_risks(result, raw_flows)
+    auth_boundary = _derive_auth_boundary(result, exploit_paths or [])
+    sanitization = _derive_sanitization(result, raw_flows)
+
+    attacker_controlled_argument = "unconfirmed"
+    if any((flow.get("verdict") or "").upper() == "CONFIRMED" for flow in positive_flows):
+        attacker_controlled_argument = "confirmed"
+    elif positive_flows:
+        attacker_controlled_argument = "likely"
+
+    same_request = "unknown"
+    if positive_flows:
+        if any("[restart]" in str(flow.get("flow_str") or "").lower() for flow in positive_flows):
+            same_request = "deferred"
+        else:
+            same_request = "confirmed"
+
+    verdict = _derive_candidate_verdict(
+        result,
+        exploit_paths or [],
+        positive_flows,
+        raw_flows,
+        missing_links,
+        fp_risks,
+    )
+
+    return {
+        "confirmed_input": _extract_confirmed_input(result, exploit_paths or [], positive_flows),
+        "confirmed_sink": _extract_confirmed_sink(result, positive_flows),
+        "attacker_controlled_argument": attacker_controlled_argument,
+        "same_request": same_request,
+        "auth_boundary": auth_boundary,
+        "sanitization": sanitization,
+        "protections": _hardening_summary(result.get("hardening") or {}),
+        "missing_links": missing_links,
+        "false_positive_risks": fp_risks,
+        "verdict": verdict,
+    }
+
+
 def _build_result_snapshot(result, cgi_files=None, exploit_paths=None):
     review = _manual_review_hints(result, cgi_files or []) if cgi_files is not None else None
+    raw_verified = list(result.get("verified_flows") or [])
     verified = [
-        flow for flow in (result.get("verified_flows") or [])
+        flow for flow in raw_verified
         if flow.get("verdict") != "FALSE_POSITIVE"
     ]
+    cve_readiness = _build_cve_readiness(result, exploit_paths or [])
     raw_name = result.get("name")
     display_name = _choose_candidate_label(
         raw_name,
         result.get("endpoints") or [],
         result.get("handler_symbols") or [],
     )
-    return {
+    snapshot = {
         "id": _candidate_id(result),
         "name": display_name,
         "raw_name": raw_name,
@@ -1708,6 +2249,7 @@ def _build_result_snapshot(result, cgi_files=None, exploit_paths=None):
         "fuzzing_hints": list(result.get("fuzzing_hints") or []),
         "manual_review": _json_safe(review),
         "verified_flows": _json_safe(verified),
+        "verified_flows_raw": _json_safe(raw_verified),
         "exploit_paths": _json_safe(exploit_paths or []),
 
         # ── Gap 1–6 exploit-context fields ───────────────────────────────────
@@ -1716,6 +2258,7 @@ def _build_result_snapshot(result, cgi_files=None, exploit_paths=None):
         "endpoints":           list(result.get("endpoints") or []),
         "injection_templates": list(result.get("injection_templates") or []),
         "config_keys":         list(result.get("config_keys") or []),
+        "import_symbols":      list(result.get("import_symbols") or []),
         "handler_symbols":     list(result.get("handler_symbols") or []),
         "auth_bypass":         result.get("auth_bypass", "required"),
         "toctou_risk":         bool(result.get("toctou_risk", False)),
@@ -1725,9 +2268,29 @@ def _build_result_snapshot(result, cgi_files=None, exploit_paths=None):
         "actionability_bonus": result.get("actionability_bonus", 0),
         "missing_links":       list(result.get("missing_links") or []),
         "plausibility_bonus":  result.get("plausibility_bonus", 0),
+        "false_positive_risks": list(result.get("false_positive_risks") or []),
 
-        # CVE triage score — mirrors bundle["cve_candidates"] ranking key.
-        "triage_score": explain_triage(result)[0],
+        # Conservative CVE-readiness model.
+        "endpoint_input": _derive_endpoint_input_label(result, exploit_paths or []),
+        "input_controllability": result.get("controllability") or "UNKNOWN",
+        "confirmed_input": cve_readiness["confirmed_input"],
+        "confirmed_sink": cve_readiness["confirmed_sink"],
+        "attacker_controlled_argument": cve_readiness["attacker_controlled_argument"],
+        "dangerous_argument": (
+            cve_readiness["confirmed_sink"]
+            if cve_readiness["attacker_controlled_argument"] in {"confirmed", "likely"}
+            else "unconfirmed"
+        ),
+        "same_request": cve_readiness["same_request"],
+        "auth_boundary": cve_readiness["auth_boundary"],
+        "sanitization": cve_readiness["sanitization"],
+        "protections": list(cve_readiness["protections"]),
+        "cve_verdict": cve_readiness["verdict"],
+        "recommended_next_action": _derive_recommended_next_action(result, cve_readiness),
+
+        # CVE triage score — filled after snapshot assembly so it can use
+        # conservative readiness fields instead of the raw result only.
+        "triage_score": 0,
 
         # Structured Ghidra hints — ready for direct MCP tool call construction.
         "ghidra_hints": {
@@ -1746,6 +2309,8 @@ def _build_result_snapshot(result, cgi_files=None, exploit_paths=None):
 
         "next_steps": _next_steps_for_result(result, review=review, exploit_paths=exploit_paths),
     }
+    snapshot["triage_score"] = explain_triage(snapshot)[0]
+    return snapshot
 
 
 def _build_exploit_snapshot(entry):
@@ -2123,7 +2688,64 @@ def _export_container_targets(results, run_dir):
         stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
         return stem[-120:] or os.path.splitext(os.path.basename(abs_src))[0]
 
+    def _derive_extraction_hints(export_entry):
+        src = str(export_entry.get("src") or "").lower().replace("\\", "/")
+        dest = str(export_entry.get("dest") or "").lower().replace("\\", "/")
+        hints = []
+        source_kind = "opaque-container"
+
+        if "/_nested_" in src or "/_nested_" in dest:
+            hints.append("nested-decoded-payload")
+            source_kind = "nested-payload"
+        if "_decoded.bin" in src or "_decoded.bin" in dest:
+            hints.append("decoded-inner-blob")
+            if source_kind == "opaque-container":
+                source_kind = "decoded-payload"
+        if "_carve_gzip_" in src or "_carve_gzip_" in dest:
+            hints.append("embedded-gzip-salvage")
+            source_kind = "embedded-gzip"
+        if "_carve_xz_" in src or "_carve_xz_" in dest:
+            hints.append("embedded-xz-salvage")
+            source_kind = "embedded-xz"
+        if "_carve_lzma_" in src or "_carve_lzma_" in dest:
+            hints.append("embedded-lzma-salvage")
+            source_kind = "embedded-lzma"
+        if "_carve_zip_" in src or "_carve_zip_" in dest:
+            hints.append("embedded-zip-salvage")
+            source_kind = "embedded-zip"
+
+        flow_type = export_entry.get("flow_type") or ""
+        if flow_type == "blob_signal":
+            hints.append("segmented-bundle-followup")
+            if source_kind == "opaque-container":
+                source_kind = "segmented-bundle"
+
+        crypto_profile = export_entry.get("crypto_profile") or ""
+        if crypto_profile:
+            hints.append("crypto-profile-present")
+            if "openssl-enc-compatible" in crypto_profile and source_kind == "opaque-container":
+                source_kind = "encrypted-container"
+
+        deduped = []
+        seen_local = set()
+        for hint in hints:
+            if hint in seen_local:
+                continue
+            seen_local.add(hint)
+            deduped.append(hint)
+        return source_kind, deduped
+
     def _candidate_passphrases(base_name, vendor_guess):
+        if "tenda" in (vendor_guess or "").lower():
+            return [
+                "TENDAWIFI",
+                "TendaWiFi",
+                "tendawifi",
+                "tendawifi.com",
+                "Tenda",
+                "tenda",
+            ]
+
         seeds = []
         stem = os.path.splitext(base_name)[0]
         seeds.extend(re.findall(r"[A-Za-z0-9]+", stem))
@@ -2192,6 +2814,8 @@ echo "scan outputs: $OUTDIR"
                 "payload_size": export_entry.get("payload_size"),
                 "flow_type": flow_type,
                 "source": export_entry.get("source"),
+                "source_kind": export_entry.get("source_kind"),
+                "extraction_hints": export_entry.get("extraction_hints") or [],
                 "top_sinks": export_entry.get("all_sinks") or [],
                 "sample_endpoints": export_entry.get("endpoints") or [],
                 "probe_type": "segmented-bundle-scan-probe",
@@ -2205,7 +2829,11 @@ echo "scan outputs: $OUTDIR"
                 "candidate_count": 0,
             }
 
-        if crypto_profile != "openssl-enc-compatible salted payload" and "cloud" not in vendor_guess.lower():
+        if (
+            crypto_profile != "openssl-enc-compatible salted payload"
+            and "cloud" not in vendor_guess.lower()
+            and "d-link wrapped firmware image" not in vendor_guess.lower()
+        ):
             return None
         ciphertext_dest = export_entry.get("ciphertext_dest")
         if crypto_profile == "openssl-enc-compatible salted payload" and not ciphertext_dest:
@@ -2254,6 +2882,8 @@ echo "probe outputs: $OUTDIR"
                 "ciphertext": export_entry.get("ciphertext_dest"),
                 "salt": salt,
                 "crypto_profile": export_entry.get("crypto_profile"),
+                "source_kind": export_entry.get("source_kind"),
+                "extraction_hints": export_entry.get("extraction_hints") or [],
                 "candidate_count": len(candidates),
                 "ciphers": ["aes-128-cbc", "aes-192-cbc", "aes-256-cbc"],
                 "digests": ["md5", "sha256"],
@@ -2299,6 +2929,8 @@ echo "scan outputs: $OUTDIR"
             "payload_offset": export_entry.get("payload_offset"),
             "payload_size": export_entry.get("payload_size"),
             "vendor_guess": vendor_guess,
+            "source_kind": export_entry.get("source_kind"),
+            "extraction_hints": export_entry.get("extraction_hints") or [],
             "probe_type": "container-scan-probe",
         }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -2360,6 +2992,9 @@ echo "scan outputs: $OUTDIR"
             "all_sinks": result.get("all_sinks") or [],
             "endpoints": result.get("endpoints") or [],
         }
+        source_kind, extraction_hints = _derive_extraction_hints(export_entry)
+        export_entry["source_kind"] = source_kind
+        export_entry["extraction_hints"] = extraction_hints
 
         ciphertext_offset = result.get("ciphertext_offset")
         if flow_type == "container_signal" and isinstance(ciphertext_offset, int) and ciphertext_offset >= 0:
@@ -2477,7 +3112,17 @@ def _emit_analysis_bundle(mode, mode_reason, result, *, output_path=None, dossie
                 "endpoints":     c.get("endpoints") or [],
                 "handler_symbols": c.get("handler_symbols") or [],
                 "all_sinks":     c.get("all_sinks") or [],
+                "confirmed_input": c.get("confirmed_input"),
+                "confirmed_sink": c.get("confirmed_sink"),
+                "attacker_controlled_argument": c.get("attacker_controlled_argument"),
+                "same_request": c.get("same_request"),
+                "auth_boundary": c.get("auth_boundary"),
+                "sanitization": c.get("sanitization"),
+                "protections": c.get("protections") or [],
                 "missing_links": c.get("missing_links") or [],
+                "false_positive_risks": c.get("false_positive_risks") or [],
+                "verdict": c.get("cve_verdict"),
+                "next_steps": c.get("next_steps") or [],
             }
             for c in cve_top
         ]),
@@ -2598,14 +3243,27 @@ def run_iot_analysis(show_all=False):
     # Run only on top candidates to keep runtime bounded.
     priority_results = web_results + high_results + med_results
     if priority_results:
+        verify_top_n = _verification_budget(priority_results, cgi_files)
         _sec("VERIFIED EXPLOITABLE FLOWS  (top candidates only)")
-        print("    Running deep argument-taint analysis ...", flush=True)
-        sys.stdout.flush()
-        _run_deep_verification(priority_results, top_n=10)
-        had_flows = _print_verified_flows(priority_results)
-        if not had_flows:
-            print("  (no confirmed flows — binaries may be stripped or use indirect dispatch)",
-                  flush=True)
+        if verify_top_n <= 0:
+            print(
+                "    Skipping deep argument-taint analysis on this oversized web-root "
+                "firmware; using structural triage only.",
+                flush=True,
+            )
+            for r in priority_results:
+                r["verified_flows"] = []
+        else:
+            print(
+                f"    Running deep argument-taint analysis ... (top_n={verify_top_n})",
+                flush=True,
+            )
+            sys.stdout.flush()
+            _run_deep_verification(priority_results, top_n=verify_top_n)
+            had_flows = _print_verified_flows(priority_results)
+            if not had_flows:
+                print("  (no confirmed flows — binaries may be stripped or use indirect dispatch)",
+                      flush=True)
 
     # ── Reachability and exploit scenario generation ──────────────────────────
     # Only runs on candidates that have verified CONFIRMED/LIKELY flows.
@@ -2810,9 +3468,10 @@ def run_general_analysis(show_all=False):
     sys.stdout.flush()
     results = analyze_services(services, SYSTEM_PATH)
     if not results:
-        results = _collect_blob_signal_findings(services, SYSTEM_PATH)
-    if not results:
-        results = _collect_container_signal_findings(services, SYSTEM_PATH)
+        container_results = _collect_container_signal_findings(services, SYSTEM_PATH)
+        blob_results = _collect_blob_signal_findings(services, SYSTEM_PATH)
+        input_wrapper_results = _collect_input_wrapper_signal_findings()
+        results = container_results or input_wrapper_results or blob_results
 
     high = [r for r in results if r["level"] == "HIGH"]
     medium = [r for r in results if r["level"] == "MEDIUM"]

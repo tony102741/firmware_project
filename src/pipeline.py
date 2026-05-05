@@ -24,10 +24,15 @@ import tempfile
 import re
 import shlex
 import lzma
+import zlib
+import zipfile
 import json
 import hashlib
 import atexit
+import math
+from collections import Counter
 from datetime import datetime
+from pathlib import Path
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
@@ -42,6 +47,10 @@ ROOTFS_DIR    = os.path.join(CACHE_DIR, "rootfs")
 EXTRACTED_DIR = os.path.join(CACHE_DIR, "extracted")
 TEMP_INPUTS_DIR = os.path.join(CACHE_DIR, "tmp_inputs")
 RUNS_DIR = os.environ.get("FIRMWARE_RUNS_DIR", os.path.join(PROJECT_ROOT, "runs"))
+DEFAULT_RETAIN_RUNS = int(os.environ.get("FIRMWARE_RETAIN_RUNS", "30"))
+DEFAULT_RETAIN_EXTRACTED = int(os.environ.get("FIRMWARE_RETAIN_EXTRACTED", "2"))
+DEFAULT_STALE_MAX_AGE_HOURS = int(os.environ.get("FIRMWARE_STALE_MAX_AGE_HOURS", "12"))
+_STALE_PREFIX = ".__stale_"
 
 DUMPER      = os.path.join(PROJECT_ROOT, "tools/payload-dumper-go/payload-dumper-go")
 DUMPER_DIR  = os.path.dirname(DUMPER)
@@ -57,6 +66,7 @@ _MAGIC_SPARSE  = b"\x3a\xff\x26\xed"
 _MAGIC_EXT4    = b"\x53\xef"       # at offset 0x438 in ext4 superblock
 _MAGIC_EROFS   = b"\xe2\xe1\xf5\xe0"
 _MAGIC_TAR     = b"ustar"
+_MAGIC_FDT     = b"\xd0\x0d\xfe\xed"
 _FS_MAGIC_PATTERNS = (
     ("squashfs", b"hsqs"),
     ("squashfs", b"sqsh"),
@@ -64,6 +74,12 @@ _FS_MAGIC_PATTERNS = (
     ("squashfs", b"shsq"),
     ("cramfs",   b"\x45\x3d\xcd\x28"),
     ("ubifs",    b"UBI#"),
+)
+_EMBEDDED_PAYLOAD_PATTERNS = (
+    ("gzip", b"\x1f\x8b\x08", ".gz"),
+    ("zip", b"PK\x03\x04", ".zip"),
+    ("xz", b"\xfd7zXZ\x00", ".xz"),
+    ("lzma", b"\x5d\x00\x00\x80", ".lzma"),
 )
 _NESTED_BLOB_EXTS = (".xz", ".lzma", ".7z", ".bin", ".img", ".raw", ".fs", ".blob")
 _UBIREADER_FALLBACK_DIRS = (
@@ -290,6 +306,46 @@ def _prune_dir_set(paths, keep):
         shutil.rmtree(path, ignore_errors=True)
         removed.append(path)
     return removed
+
+
+def _prune_stale_dirs(base_dir, max_age_hours=DEFAULT_STALE_MAX_AGE_HOURS, keep_newest=0):
+    if not os.path.isdir(base_dir):
+        return []
+    now = time.time()
+    stale = []
+    for name in os.listdir(base_dir):
+        full = os.path.join(base_dir, name)
+        if not os.path.isdir(full):
+            continue
+        if not name.startswith(_STALE_PREFIX):
+            continue
+        try:
+            mtime = os.path.getmtime(full)
+        except OSError:
+            continue
+        stale.append((mtime, full))
+    stale.sort(reverse=True)
+    removed = []
+    for idx, (mtime, path) in enumerate(stale):
+        age_hours = (now - mtime) / 3600.0
+        if idx < max(0, keep_newest):
+            continue
+        if max_age_hours is not None and age_hours < max_age_hours:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        removed.append(path)
+    return removed
+
+
+def _dir_count_with_prefix(base_dir, prefix):
+    if not os.path.isdir(base_dir):
+        return 0
+    count = 0
+    for name in os.listdir(base_dir):
+        full = os.path.join(base_dir, name)
+        if os.path.isdir(full) and name.startswith(prefix):
+            count += 1
+    return count
 
 
 def _prepare_run_artifacts(input_path=None):
@@ -947,6 +1003,8 @@ def _resolve_tar_firmware(tar_path):
 
 def clean(skip):
     global _EXTRACTED_ACTIVE
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    _prune_stale_dirs(CACHE_DIR)
     if skip:
         _info("reuse mode — skipping extraction")
         return
@@ -1475,10 +1533,21 @@ def handle_payload_input(payload_path):
     return _validate_partition_images()
 
 
+def _looks_like_iot_img(img_path):
+    magic4 = _read_magic(img_path, 4)
+    if magic4 in {_MAGIC_FDT, b"UBI#", b"hsqs", b"sqsh", b"qshs", b"shsq"}:
+        return True
+    return bool(_find_fs_magic_offsets(img_path, max_hits=1))
+
+
 def handle_img_input(img_path):
+    if _looks_like_iot_img(img_path):
+        _info("img payload looks like embedded IoT firmware; routing through IoT extractor")
+        return extract_iot_firmware(img_path)
     dst = os.path.join(WORK_DIR, os.path.basename(img_path))
     if not os.path.exists(dst):
         shutil.copy2(img_path, dst)
+    return None
 
 
 # ── IoT firmware extraction ───────────────────────────────────────────────────
@@ -1534,6 +1603,7 @@ def print_cache_status():
     print(f"  .cache/rootfs   : {_format_size(_dir_size_bytes(ROOTFS_DIR))}", flush=True)
     print(f"  .cache/build    : {_format_size(_dir_size_bytes(WORK_DIR))}", flush=True)
     print(f"  runs            : {_format_size(_dir_size_bytes(RUNS_DIR))}", flush=True)
+    print(f"  stale cache dirs: {_dir_count_with_prefix(CACHE_DIR, _STALE_PREFIX)}", flush=True)
 
     extracted = _recent_dirs(EXTRACTED_DIR, prefix="extracted_")
     print(f"  extracted sets  : {len(extracted)}", flush=True)
@@ -1575,6 +1645,7 @@ def apply_retention_limits(retain_runs=None, retain_extracted=None):
         removed.extend(_prune_dir_set(_recent_dirs(RUNS_DIR, prefix="run_"), retain_runs))
     if retain_extracted is not None:
         removed.extend(_prune_dir_set(_recent_dirs(EXTRACTED_DIR, prefix="extracted_"), retain_extracted))
+    removed.extend(_prune_stale_dirs(CACHE_DIR))
     for path in removed:
         print(f"pruned: {os.path.relpath(path, PROJECT_ROOT)}", flush=True)
     return removed
@@ -1831,6 +1902,16 @@ def _find_segmented_bundle_root(base_dir):
     return None
 
 
+def _find_segmented_partial_layout(base_dir):
+    if not base_dir or not os.path.isdir(base_dir):
+        return None
+    for dirpath, dirnames, _ in os.walk(base_dir):
+        if os.path.basename(dirpath) == "_segmented_partial_layout":
+            return dirpath
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+    return None
+
+
 def _collect_ranked_bundle_candidates(*base_dirs):
     candidates = []
     seen = set()
@@ -1838,6 +1919,9 @@ def _collect_ranked_bundle_candidates(*base_dirs):
         if not base_dir or not os.path.isdir(base_dir):
             continue
         for dirpath, _, filenames in os.walk(base_dir):
+            parts = set(Path(dirpath).parts)
+            if parts & {"_openssl_auto", "_offset_probe", ".openssl_auto", ".offset_probe"}:
+                continue
             key = os.path.realpath(dirpath)
             if key in seen:
                 continue
@@ -1946,6 +2030,688 @@ def _carve_from_offset_command(src_path, dst_path, offset):
     )
 
 
+def _scan_raw_fs_offsets(blob_path, *candidate_roots):
+    hits = _find_fs_magic_offsets(blob_path)
+    if not hits:
+        return []
+
+    _warn("binwalk did not locate a trusted filesystem root; scanning raw offsets")
+    scanned_roots = []
+    for fs_name, offset in hits:
+        carved = os.path.join(WORK_DIR, f"_carve_{fs_name}_{offset:x}.bin")
+        run_critical(
+            _carve_from_offset_command(blob_path, carved, offset),
+            fatal_msg=f"dd carve failed at offset {offset} for {fs_name}",
+            label=f"dd carve  {fs_name} @ 0x{offset:x}",
+            quiet=True,
+        )
+        carve_out = os.path.join(WORK_DIR, f"_extract_{fs_name}_{offset:x}")
+        _try_extract_iot_blob(
+            carved,
+            carve_out,
+            f"binwalk raw  {fs_name} @ 0x{offset:x}",
+        )
+        scanned_roots.extend(root for root in candidate_roots if root)
+        scanned_roots.append(carve_out)
+    return _collect_ranked_rootfs_candidates(*scanned_roots)
+
+
+def _find_embedded_payload_offsets(path, max_hits=6, chunk_size=8 * 1024 * 1024):
+    max_magic = max(len(magic) for _, magic, _ in _EMBEDDED_PAYLOAD_PATTERNS)
+    overlap = max_magic - 1
+    hits = []
+    seen = set()
+    offset = 0
+    tail = b""
+
+    try:
+        with open(path, "rb") as fh:
+            while len(hits) < max_hits:
+                chunk = fh.read(chunk_size)
+                if not chunk:
+                    break
+                window = tail + chunk
+                base_offset = offset - len(tail)
+
+                for kind, magic, ext in _EMBEDDED_PAYLOAD_PATTERNS:
+                    start = 0
+                    while True:
+                        idx = window.find(magic, start)
+                        if idx < 0:
+                            break
+                        abs_idx = base_offset + idx
+                        key = (kind, abs_idx)
+                        if key not in seen:
+                            hits.append((kind, abs_idx, ext))
+                            seen.add(key)
+                            if len(hits) >= max_hits:
+                                return sorted(hits, key=lambda x: x[1])
+                        start = idx + 1
+
+                offset += len(chunk)
+                tail = window[-overlap:] if overlap > 0 else b""
+    except Exception:
+        return []
+
+    return sorted(hits, key=lambda x: x[1])
+
+
+def _scan_embedded_payloads(blob_path, *candidate_roots):
+    lower = str(blob_path).lower()
+    if lower.endswith((".gz", ".zip", ".xz", ".lzma")):
+        return []
+    base = os.path.basename(lower)
+    if base.startswith(("payload_", "_carve_", "carve_")):
+        return []
+    for _kind, magic, _ext in _EMBEDDED_PAYLOAD_PATTERNS:
+        if _read_magic(blob_path, len(magic)) == magic:
+            return []
+
+    hits = _find_embedded_payload_offsets(blob_path)
+    if not hits:
+        return []
+
+    _warn("filesystem scan did not yield a trusted root; probing embedded payload offsets")
+    scanned_roots = []
+    for kind, offset, ext in hits:
+        if offset == 0:
+            continue
+        carved = os.path.join(WORK_DIR, f"_carve_{kind}_{offset:x}{ext}")
+        run(
+            _carve_from_offset_command(blob_path, carved, offset),
+            label=f"carve embedded  {kind} @ 0x{offset:x}",
+            quiet=True,
+        )
+        if not os.path.isfile(carved):
+            continue
+        try:
+            size = os.path.getsize(carved)
+        except OSError:
+            size = 0
+        if size < 64 * 1024:
+            continue
+        carve_out = os.path.join(WORK_DIR, f"_extract_{kind}_{offset:x}")
+        structure = _structure_info(carved)
+        decoded_target, decoded_structure = _decode_embedded_payload(
+            carved,
+            carve_out,
+            structure,
+        )
+        if decoded_structure:
+            _record_container_evidence(carve_out, decoded_target or carved, {
+                "kind": decoded_structure.get("kind"),
+                "confidence": decoded_structure.get("confidence"),
+                "reasons": decoded_structure.get("reasons"),
+                "size_bytes": decoded_structure.get("size_bytes", 0),
+                "entropy": decoded_structure.get("entropy"),
+                "printable_ratio": decoded_structure.get("printable_ratio"),
+                "extract_offset": decoded_structure.get("extract_offset"),
+                "salvage_source": f"embedded-{kind}-decode",
+                "decoded_from": decoded_structure.get("decoded_from"),
+                "decoded_output_size": decoded_structure.get("decoded_output_size", decoded_structure.get("output_size", 0)),
+            })
+        target_for_extract = decoded_target or carved
+        target_structure = decoded_structure or structure
+        if _should_attempt_nested_extract(target_structure):
+            _try_extract_iot_blob(
+                target_for_extract,
+                carve_out,
+                f"embedded payload  {kind} @ 0x{offset:x}",
+            )
+        scanned_roots.extend(root for root in candidate_roots if root)
+        scanned_roots.append(carve_out)
+    return _collect_ranked_rootfs_candidates(*scanned_roots)
+
+
+def _sample_entropy(path, sample_size=64 * 1024):
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(sample_size)
+    except OSError:
+        return 0.0
+    if not data:
+        return 0.0
+
+    counts = Counter(data)
+    total = len(data)
+    entropy = 0.0
+    for count in counts.values():
+        p = count / total
+        entropy -= p * math.log2(p)
+    return entropy
+
+
+def _sample_printable_ratio(path, sample_size=64 * 1024):
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(sample_size)
+    except OSError:
+        return 0.0
+    if not data:
+        return 0.0
+    printable = 0
+    for b in data:
+        if b in (9, 10, 13) or 32 <= b <= 126:
+            printable += 1
+    return printable / len(data)
+
+
+def _structure_info(path):
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    head = _read_prefix(path, 4096)
+    entropy = round(_sample_entropy(path), 4)
+    printable_ratio = round(_sample_printable_ratio(path), 4)
+
+    kind = "opaque-random"
+    confidence = "low"
+    reasons = []
+    extract_offset = None
+
+    if not head:
+        return {
+            "kind": "missing",
+            "confidence": "low",
+            "size_bytes": size,
+            "entropy": entropy,
+            "printable_ratio": printable_ratio,
+            "reasons": ["empty-or-unreadable"],
+            "extract_offset": None,
+        }
+
+    if head.startswith(_MAGIC_ZIP):
+        kind = "zip-payload"
+        confidence = "high"
+        reasons.append("zip-magic@0")
+    elif head.startswith(b"\x1f\x8b\x08"):
+        kind = "gzip-payload"
+        confidence = "high"
+        reasons.append("gzip-magic@0")
+    elif head.startswith(b"\xfd7zXZ\x00"):
+        kind = "xz-payload"
+        confidence = "high"
+        reasons.append("xz-magic@0")
+    elif head.startswith(b"\x5d\x00\x00\x80"):
+        kind = "lzma-payload"
+        confidence = "medium"
+        reasons.append("lzma-magic@0")
+    elif head.startswith(b"UBI#"):
+        kind = "ubi-image"
+        confidence = "high"
+        reasons.append("ubi-magic@0")
+    elif head.startswith(b"hsqs") or head.startswith(b"sqsh") or head.startswith(b"qshs") or head.startswith(b"shsq"):
+        kind = "squashfs-image"
+        confidence = "high"
+        reasons.append("squashfs-magic@0")
+    elif head.startswith(b"\x7fELF"):
+        kind = "elf-binary"
+        confidence = "medium"
+        reasons.append("elf-magic@0")
+    elif _detect_dlink_wrapper(path):
+        kind = "wrapped-container"
+        confidence = "high"
+        reasons.append("dlink-wrapper@0")
+    elif head.startswith(_MAGIC_PAYLOAD):
+        kind = "android-payload"
+        confidence = "high"
+        reasons.append("payload-bin@0")
+    else:
+        fs_hits = _find_fs_magic_offsets(path, max_hits=2, chunk_size=1024 * 1024)
+        if fs_hits:
+            fs_name, offset = fs_hits[0]
+            kind = f"embedded-{fs_name}"
+            confidence = "medium"
+            reasons.append(f"{fs_name}-magic@0x{offset:x}")
+            if offset > 0:
+                extract_offset = offset
+        else:
+            embedded = _find_embedded_payload_offsets(path, max_hits=2, chunk_size=1024 * 1024)
+            if embedded:
+                payload_kind, offset, _ext = embedded[0]
+                kind = f"embedded-{payload_kind}"
+                confidence = "medium"
+                reasons.append(f"{payload_kind}-magic@0x{offset:x}")
+                if offset > 0:
+                    extract_offset = offset
+
+    if not reasons:
+        if printable_ratio >= 0.70:
+            kind = "text-heavy-blob"
+            confidence = "medium"
+            reasons.append(f"printable-ratio:{printable_ratio:.2f}")
+        elif entropy >= 7.85:
+            kind = "opaque-random"
+            confidence = "low"
+            reasons.append(f"high-entropy:{entropy:.2f}")
+        else:
+            kind = "opaque-binary"
+            confidence = "low"
+            reasons.append(f"binary-blob entropy={entropy:.2f}")
+
+    return {
+        "kind": kind,
+        "confidence": confidence,
+        "size_bytes": size,
+        "entropy": entropy,
+        "printable_ratio": printable_ratio,
+        "reasons": reasons,
+        "extract_offset": extract_offset,
+    }
+
+
+def _should_attempt_nested_extract(structure):
+    kind = str((structure or {}).get("kind") or "")
+    if kind.startswith(("zip-", "gzip-", "xz-", "lzma-", "ubi-", "squashfs-", "wrapped-", "android-")):
+        return True
+    if kind.startswith("embedded-"):
+        return True
+    return False
+
+
+def _probe_gzip_stream(path, offset=0, chunk_size=1024 * 1024):
+    out_bytes = 0
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            dec = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            while True:
+                chunk = fh.read(chunk_size)
+                if not chunk:
+                    break
+                data = dec.decompress(chunk)
+                out_bytes += len(data)
+                if dec.eof:
+                    tail = dec.flush()
+                    out_bytes += len(tail)
+                    return {
+                        "valid": True,
+                        "output_size": out_bytes,
+                        "unused_tail": len(dec.unused_data or b""),
+                    }
+            tail = dec.flush()
+            out_bytes += len(tail)
+            return {"valid": False, "output_size": out_bytes, "reason": "gzip-eof-not-reached"}
+    except zlib.error as exc:
+        return {"valid": False, "output_size": out_bytes, "reason": str(exc)}
+    except OSError as exc:
+        return {"valid": False, "output_size": out_bytes, "reason": str(exc)}
+
+
+def _decode_embedded_payload(carved_path, out_dir, structure):
+    kind = str((structure or {}).get("kind") or "")
+    extract_offset = int((structure or {}).get("extract_offset") or 0)
+    if not kind.startswith((
+        "gzip", "embedded-gzip",
+        "xz", "embedded-xz",
+        "lzma", "embedded-lzma",
+        "zip", "zip-payload", "embedded-zip",
+    )):
+        return None, None
+
+    shutil.rmtree(out_dir, ignore_errors=True)
+    os.makedirs(out_dir, exist_ok=True)
+
+    source_path = carved_path
+    if extract_offset > 0:
+        source_path = os.path.join(out_dir, "_stream_payload.bin")
+        run(
+            _carve_from_offset_command(carved_path, source_path, extract_offset),
+            label=f"carve stream  {os.path.basename(carved_path)} @ 0x{extract_offset:x}",
+            quiet=True,
+        )
+        if not os.path.isfile(source_path):
+            return None, None
+
+    if "gzip" in kind:
+        probe = _probe_gzip_stream(source_path, offset=0)
+        if not probe.get("valid"):
+            return None, {
+                "kind": "gzip-invalid",
+                "confidence": "low",
+                "reasons": [probe.get("reason") or "gzip-parse-failed"],
+                "output_size": probe.get("output_size", 0),
+            }
+        decoded = os.path.join(out_dir, "decoded_from_gzip.bin")
+        try:
+            with open(source_path, "rb") as src, open(decoded, "wb") as dst:
+                dec = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    data = dec.decompress(chunk)
+                    if data:
+                        dst.write(data)
+                    if dec.eof:
+                        tail = dec.flush()
+                        if tail:
+                            dst.write(tail)
+                        break
+        except Exception:
+            return None, {
+                "kind": "gzip-invalid",
+                "confidence": "low",
+                "reasons": ["gzip-decode-write-failed"],
+                "output_size": probe.get("output_size", 0),
+            }
+        decoded_structure = _structure_info(decoded)
+        decoded_structure["decoded_from"] = kind
+        decoded_structure["decoded_output_size"] = probe.get("output_size", 0)
+        return decoded, decoded_structure
+
+    if "xz" in kind or "lzma" in kind:
+        decoded = os.path.join(out_dir, "decoded_from_lzma.bin")
+        if _decompress_lzma_blob(source_path, decoded):
+            decoded_structure = _structure_info(decoded)
+            decoded_structure["decoded_from"] = kind
+            return decoded, decoded_structure
+        return None, {
+            "kind": "lzma-invalid",
+            "confidence": "low",
+            "reasons": ["lzma-decode-failed"],
+            "output_size": 0,
+        }
+
+    if "zip" in kind and zipfile.is_zipfile(source_path):
+        extract_dir = os.path.join(out_dir, "_zip")
+        os.makedirs(extract_dir, exist_ok=True)
+        try:
+            with zipfile.ZipFile(source_path) as zf:
+                zf.extractall(extract_dir)
+        except Exception:
+            return None, {
+                "kind": "zip-invalid",
+                "confidence": "low",
+                "reasons": ["zip-extract-failed"],
+                "output_size": 0,
+            }
+        return extract_dir, {
+            "kind": "zip-layout",
+            "confidence": "medium",
+            "reasons": ["zip-extract-ok"],
+            "output_size": _dir_size_bytes(extract_dir),
+        }
+
+    return None, None
+
+
+def _record_container_evidence(base_dir, payload_path, entry):
+    if not base_dir:
+        return
+    record_path = os.path.join(base_dir, "CONTAINER_EVIDENCE.json")
+    payload_rel = None
+    try:
+        payload_rel = os.path.relpath(payload_path, base_dir)
+    except Exception:
+        payload_rel = payload_path
+    item = dict(entry or {})
+    item["payload"] = payload_rel
+    existing = []
+    try:
+        if os.path.isfile(record_path):
+            with open(record_path, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, list):
+                existing = loaded
+    except Exception:
+        existing = []
+
+    dedup_key = (
+        item.get("payload"),
+        item.get("kind"),
+        item.get("extract_offset"),
+    )
+    filtered = []
+    for row in existing:
+        row_key = (
+            row.get("payload"),
+            row.get("kind"),
+            row.get("extract_offset"),
+        )
+        if row_key != dedup_key:
+            filtered.append(row)
+    filtered.append(item)
+    filtered.sort(key=lambda row: (str(row.get("kind") or ""), str(row.get("payload") or "")))
+    _json_dump(record_path, filtered)
+
+
+def _load_container_evidence(base_dir):
+    record_path = os.path.join(base_dir, "CONTAINER_EVIDENCE.json")
+    try:
+        with open(record_path, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        if isinstance(loaded, list):
+            return loaded
+    except Exception:
+        pass
+    return []
+
+
+def _safe_link_or_copy(src, dst):
+    try:
+        if os.path.lexists(dst):
+            os.unlink(dst)
+        os.symlink(os.path.relpath(src, os.path.dirname(dst)), dst)
+        return
+    except OSError:
+        pass
+    shutil.copy2(src, dst)
+
+
+def _summarize_segment_cluster(members):
+    extract_offsets = [m.get("extract_offset") for m in members if isinstance(m.get("extract_offset"), int)]
+    carve_offsets = [m.get("carve_offset") for m in members if isinstance(m.get("carve_offset"), int)]
+    payload_sizes = [m.get("size_bytes") for m in members if isinstance(m.get("size_bytes"), int)]
+    valid_decodes = []
+    invalid_decodes = []
+    for member in members:
+        decode_kind = str(member.get("decode_kind") or "")
+        if not decode_kind:
+            continue
+        if decode_kind.endswith("-invalid"):
+            invalid_decodes.append(member)
+            continue
+        if decode_kind.startswith((
+            "zip-", "gzip-", "xz-", "lzma-", "ubi-", "squashfs-", "elf-", "embedded-"
+        )):
+            valid_decodes.append(member)
+
+    extract_span = (max(extract_offsets) - min(extract_offsets)) if len(extract_offsets) >= 2 else 0
+    carve_span = (max(carve_offsets) - min(carve_offsets)) if len(carve_offsets) >= 2 else 0
+    size_span = (max(payload_sizes) - min(payload_sizes)) if len(payload_sizes) >= 2 else 0
+
+    if valid_decodes:
+        relation = "independent-or-decodable-streams"
+    elif invalid_decodes and len(invalid_decodes) == len(members) and extract_span <= 0x8000 and size_span <= 0x8000:
+        relation = "overlapping-segments-of-larger-container"
+    elif len(members) >= 3 and extract_span <= 0x10000:
+        relation = "clustered-segments-unconfirmed"
+    else:
+        relation = "isolated-fragments"
+
+    return {
+        "relation": relation,
+        "member_count": len(members),
+        "valid_decode_count": len(valid_decodes),
+        "invalid_decode_count": len(invalid_decodes),
+        "extract_span": extract_span,
+        "carve_span": carve_span,
+        "size_span": size_span,
+        "promotion_safe": bool(valid_decodes) and relation == "independent-or-decodable-streams",
+    }
+
+
+def _reconstruct_container_partial_layout(base_dir, cluster_gap=0x8000, max_links_per_cluster=4):
+    rows = _load_container_evidence(base_dir)
+    if not rows:
+        return None
+
+    decode_rows = {}
+    for row in rows:
+        source = str(row.get("salvage_source") or "")
+        if "decode" not in source:
+            continue
+        key = (
+            row.get("wrapper_kind"),
+            row.get("carve_offset"),
+            row.get("payload"),
+        )
+        decode_rows[key] = row
+
+    candidates = []
+    for row in rows:
+        kind = str(row.get("kind") or "")
+        if not kind.startswith("embedded-"):
+            continue
+        payload_rel = row.get("payload")
+        if not payload_rel:
+            continue
+        payload_path = os.path.join(base_dir, payload_rel)
+        if not os.path.isfile(payload_path):
+            continue
+        extract_offset = row.get("extract_offset")
+        if not isinstance(extract_offset, int):
+            continue
+        decode = decode_rows.get((
+            row.get("wrapper_kind"),
+            row.get("carve_offset"),
+            payload_rel,
+        ))
+        entry = dict(row)
+        entry["payload_path"] = payload_path
+        entry["decode_kind"] = (decode or {}).get("kind")
+        entry["decode_reasons"] = (decode or {}).get("reasons")
+        candidates.append(entry)
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda row: (
+        str(row.get("wrapper_kind") or row.get("salvage_source") or ""),
+        str(row.get("kind") or ""),
+        int(row.get("extract_offset") or 0),
+        int(row.get("carve_offset") or 0),
+    ))
+
+    clusters = []
+    for row in candidates:
+        family = str(row.get("wrapper_kind") or row.get("salvage_source") or "container")
+        stream_kind = str(row.get("kind") or "")
+        if not clusters:
+            clusters.append({
+                "family": family,
+                "stream_kind": stream_kind,
+                "members": [row],
+                "min_offset": int(row.get("extract_offset") or 0),
+                "max_offset": int(row.get("extract_offset") or 0),
+            })
+            continue
+        current = clusters[-1]
+        if (
+            current["family"] == family and
+            current["stream_kind"] == stream_kind and
+            abs(int(row.get("extract_offset") or 0) - current["max_offset"]) <= cluster_gap
+        ):
+            current["members"].append(row)
+            current["max_offset"] = max(current["max_offset"], int(row.get("extract_offset") or 0))
+            current["min_offset"] = min(current["min_offset"], int(row.get("extract_offset") or 0))
+            continue
+        clusters.append({
+            "family": family,
+            "stream_kind": stream_kind,
+            "members": [row],
+            "min_offset": int(row.get("extract_offset") or 0),
+            "max_offset": int(row.get("extract_offset") or 0),
+        })
+
+    materialized = []
+    for cluster in clusters:
+        summary = _summarize_segment_cluster(cluster["members"])
+        if summary["member_count"] < 2 and summary["valid_decode_count"] == 0:
+            continue
+        cluster["summary"] = summary
+        materialized.append(cluster)
+
+    if not materialized:
+        return None
+
+    layout_dir = os.path.join(base_dir, "_container_partial_layout")
+    shutil.rmtree(layout_dir, ignore_errors=True)
+    os.makedirs(layout_dir, exist_ok=True)
+
+    manifest = {
+        "reconstruction_level": "partial-segment-layout",
+        "promotion_safe": False,
+        "clusters": [],
+    }
+
+    for idx, cluster in enumerate(materialized, 1):
+        cluster_dir = os.path.join(layout_dir, f"cluster_{idx:02d}")
+        seg_dir = os.path.join(cluster_dir, "segments")
+        os.makedirs(seg_dir, exist_ok=True)
+
+        reps = sorted(
+            cluster["members"],
+            key=lambda row: (
+                int(row.get("carve_offset") or 0),
+                int(row.get("extract_offset") or 0),
+            ),
+        )[:max_links_per_cluster]
+
+        rep_entries = []
+        for rep in reps:
+            src = rep["payload_path"]
+            name = (
+                f"carve_{int(rep.get('carve_offset') or 0):x}"
+                f"__extract_{int(rep.get('extract_offset') or 0):x}"
+                f"__{os.path.basename(src)}"
+            )
+            dst = os.path.join(seg_dir, name)
+            _safe_link_or_copy(src, dst)
+            rep_entries.append({
+                "path": os.path.relpath(dst, layout_dir),
+                "carve_offset": rep.get("carve_offset"),
+                "extract_offset": rep.get("extract_offset"),
+                "decode_kind": rep.get("decode_kind"),
+                "decode_reasons": rep.get("decode_reasons"),
+                "size_bytes": rep.get("size_bytes"),
+            })
+
+        cluster_manifest = {
+            "family": cluster["family"],
+            "stream_kind": cluster["stream_kind"],
+            "offset_range": [cluster["min_offset"], cluster["max_offset"]],
+            "summary": cluster["summary"],
+            "representatives": rep_entries,
+        }
+        _json_dump(os.path.join(cluster_dir, "CLUSTER.json"), cluster_manifest)
+        manifest["clusters"].append(cluster_manifest)
+
+    if not manifest["clusters"]:
+        shutil.rmtree(layout_dir, ignore_errors=True)
+        return None
+
+    _json_dump(os.path.join(layout_dir, "PARTIAL_LAYOUT.json"), manifest)
+    return layout_dir
+
+
+def _looks_like_opaque_nested_blob(path):
+    base = os.path.basename(path)
+    if "." in base:
+        return False
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    if size < 512 * 1024:
+        return False
+    if _read_magic(path, 4) == b"UBI#":
+        return True
+    return _sample_entropy(path) >= 7.2
+
+
 def _looks_like_nested_blob(path):
     lower = path.lower().replace("\\", "/")
     base_lower = os.path.basename(lower)
@@ -1980,6 +2746,8 @@ def _looks_like_nested_blob(path):
     for _, magic in _FS_MAGIC_PATTERNS:
         if _read_magic(path, len(magic)) == magic:
             return True
+    if _looks_like_opaque_nested_blob(path):
+        return True
     return False
 
 
@@ -2019,6 +2787,129 @@ def _rank_nested_blob(path):
 
 def _has_ubi_magic(path):
     return _read_magic(path, 4) == b"UBI#"
+
+
+_DLINK_WRAPPER_OFFSETS = (0x40, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000)
+
+
+def _read_prefix(path, size):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(size)
+    except OSError:
+        return b""
+
+
+def _detect_dlink_wrapper(path):
+    head = _read_prefix(path, 4096)
+    for sig, kind, label in (
+        (b"SHRS", "shrs", "D-Link SHRS wrapped image"),
+        (b"encrpted_img", "encrypted_img", "D-Link encrpted_img wrapper"),
+    ):
+        idx = head.find(sig)
+        if idx < 0:
+            continue
+        fields = []
+        body = head[idx + len(sig): idx + len(sig) + 16]
+        for off in range(0, len(body) - 1, 2):
+            be = int.from_bytes(body[off:off + 2], "big")
+            le = int.from_bytes(body[off:off + 2], "little")
+            for value in (be, le):
+                if 0x20 <= value <= 0x4000:
+                    fields.append(value)
+        rel_offsets = list(_DLINK_WRAPPER_OFFSETS)
+        rel_offsets.extend(fields)
+        deduped = []
+        seen = set()
+        for value in sorted(rel_offsets):
+            if value in seen:
+                continue
+            seen.add(value)
+            deduped.append(value)
+        return {
+            "kind": kind,
+            "label": label,
+            "signature_offset": idx,
+            "header_fields": deduped[:12],
+            "candidate_offsets": tuple(deduped[:16]),
+        }
+    return None
+
+
+def _try_extract_dlink_wrapped_blob(blob_path, out_dir):
+    wrapper = _detect_dlink_wrapper(blob_path)
+    if not wrapper:
+        return None
+
+    _info(
+        f"{wrapper['label']} detected; trying common D-Link payload offsets "
+        f"({', '.join(hex(o) for o in wrapper['candidate_offsets'])})"
+    )
+
+    candidates = []
+    header_base = int(wrapper.get("signature_offset") or 0)
+    for offset in wrapper["candidate_offsets"]:
+        absolute_offset = header_base + offset
+        carved = os.path.join(out_dir, f"_dlink_payload_0x{absolute_offset:x}.bin")
+        run(
+            _carve_from_offset_command(blob_path, carved, absolute_offset),
+            label=f"dlink carve  {os.path.basename(blob_path)} @ 0x{absolute_offset:x}",
+            quiet=True,
+        )
+        if not os.path.isfile(carved) or os.path.getsize(carved) < (1 << 20):
+            continue
+
+        structure = _structure_info(carved)
+        _record_container_evidence(out_dir, carved, {
+            "kind": structure.get("kind"),
+            "confidence": structure.get("confidence"),
+            "reasons": structure.get("reasons"),
+            "size_bytes": structure.get("size_bytes"),
+            "entropy": structure.get("entropy"),
+            "printable_ratio": structure.get("printable_ratio"),
+            "extract_offset": structure.get("extract_offset"),
+            "salvage_source": "dlink-wrapper-carve",
+            "wrapper_kind": wrapper.get("kind"),
+            "wrapper_signature_offset": wrapper.get("signature_offset"),
+            "wrapper_header_fields": wrapper.get("header_fields"),
+            "carve_offset": absolute_offset,
+        })
+        nested_dir = os.path.join(out_dir, f"_dlink_extract_0x{absolute_offset:x}")
+        decoded_target, decoded_structure = _decode_embedded_payload(
+            carved,
+            nested_dir,
+            structure,
+        )
+        if decoded_structure:
+            _record_container_evidence(out_dir, decoded_target or carved, {
+                "kind": decoded_structure.get("kind"),
+                "confidence": decoded_structure.get("confidence"),
+                "reasons": decoded_structure.get("reasons"),
+                "size_bytes": decoded_structure.get("size_bytes", 0),
+                "entropy": decoded_structure.get("entropy"),
+                "printable_ratio": decoded_structure.get("printable_ratio"),
+                "extract_offset": decoded_structure.get("extract_offset"),
+                "salvage_source": "dlink-wrapper-decode",
+                "wrapper_kind": wrapper.get("kind"),
+                "wrapper_signature_offset": wrapper.get("signature_offset"),
+                "wrapper_header_fields": wrapper.get("header_fields"),
+                "carve_offset": absolute_offset,
+                "decoded_from": decoded_structure.get("decoded_from"),
+                "decoded_output_size": decoded_structure.get("decoded_output_size", decoded_structure.get("output_size", 0)),
+            })
+        target_for_extract = decoded_target or carved
+        target_structure = decoded_structure or structure
+        if not _should_attempt_nested_extract(target_structure):
+            continue
+
+        _try_extract_iot_blob(target_for_extract, nested_dir, f"dlink nested  0x{absolute_offset:x}")
+        candidates.extend(_collect_ranked_rootfs_candidates(nested_dir))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: (-x["score"], -x["size_bytes"], x["path"]))
+    return candidates[0]["path"]
 
 
 def _ubireader_available():
@@ -2445,7 +3336,623 @@ def _decode_segmented_chunk(blob_path, out_dir):
     return None
 
 
+def _synthesize_segmented_webroot(base_dir, expanded_dirs, max_files=600):
+    """
+    Build a synthetic, browsable web-root from segmented bundle expansions.
+    This does not claim full firmware reconstruction; it only tries to merge
+    recovered web assets and CGI/server binaries into a stable analysis tree so
+    later stages can still reason about the web surface.
+    """
+    if not expanded_dirs:
+        return None
+
+    interesting_exts = {
+        ".html", ".htm", ".js", ".css", ".xml", ".json", ".svg", ".ico",
+        ".gif", ".jpg", ".jpeg", ".png", ".asp", ".php", ".cgi", ".lua",
+        ".sh", ".conf", ".txt",
+    }
+    interesting_names = {
+        "httpd", "lighttpd", "uhttpd", "boa", "cgi-bin", "index.html",
+        "default.html",
+    }
+
+    staged = []
+    seen_real = set()
+    for root in expanded_dirs:
+        if not root or not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith("_") and not d.startswith(".")]
+            for name in filenames:
+                src = os.path.join(dirpath, name)
+                try:
+                    real = os.path.realpath(src)
+                    size = os.path.getsize(src)
+                except OSError:
+                    continue
+                if real in seen_real or size <= 0:
+                    continue
+
+                rel = os.path.relpath(src, root).replace("\\", "/")
+                ext = os.path.splitext(name)[1].lower()
+                rel_lower = rel.lower()
+                keep = False
+                if ext in interesting_exts:
+                    keep = True
+                elif name.lower() in interesting_names:
+                    keep = True
+                elif any(token in rel_lower for token in ("/www/", "/web/", "/cgi", "lighttpd", "httpd", "uhttpd")):
+                    keep = True
+                elif os.access(src, os.X_OK) and size <= 16 * 1024 * 1024:
+                    keep = True
+
+                if not keep:
+                    continue
+                seen_real.add(real)
+                staged.append((src, rel, size))
+
+    if len(staged) < 12:
+        return None
+
+    staged.sort(key=lambda item: (item[1].count("/"), len(item[1]), -item[2]))
+    synth = os.path.join(base_dir, "_segmented_webroot")
+    shutil.rmtree(synth, ignore_errors=True)
+    os.makedirs(synth, exist_ok=True)
+    for sub in ("www", "cgi-bin", "bin", "usr/bin", "etc", "lib"):
+        os.makedirs(os.path.join(synth, sub), exist_ok=True)
+
+    copied = 0
+    used_names = set()
+    for src, rel, _size in staged:
+        rel_lower = rel.lower()
+        base = os.path.basename(rel)
+        if any(token in rel_lower for token in ("/www/", "/web/")) or base.lower().endswith((".html", ".htm", ".js", ".css", ".xml", ".json", ".svg", ".ico", ".gif", ".jpg", ".jpeg", ".png")):
+            dest = os.path.join(synth, "www", base)
+        elif base.lower().endswith(".cgi") or "/cgi" in rel_lower:
+            dest = os.path.join(synth, "cgi-bin", base)
+        elif os.access(src, os.X_OK):
+            dest = os.path.join(synth, "usr/bin", base)
+        elif base.lower().endswith((".conf", ".lua", ".sh", ".txt")):
+            dest = os.path.join(synth, "etc", base)
+        else:
+            dest = os.path.join(synth, "www", base)
+
+        stem, ext = os.path.splitext(dest)
+        dedup = 1
+        while dest in used_names or os.path.exists(dest):
+            dest = f"{stem}_{dedup}{ext}"
+            dedup += 1
+        try:
+            shutil.copy2(src, dest)
+            used_names.add(dest)
+            copied += 1
+        except OSError:
+            continue
+        if copied >= max_files:
+            break
+
+    if copied < 12:
+        shutil.rmtree(synth, ignore_errors=True)
+        return None
+
+    index_path = os.path.join(synth, "www", "SEGMENTED_BUNDLE_NOTE.txt")
+    Path(index_path).write_text(
+        "Synthetic webroot assembled from segmented bundle chunks.\n"
+        "Use this only for web-surface triage, not as a full firmware rootfs.\n",
+        encoding="utf-8",
+    )
+    return synth
+
+
+def _synthesize_segmented_partial_layout(base_dir, expanded_dirs, max_segments=16):
+    """
+    Build a compact analysis layout for segmented bundles when a real webroot
+    cannot be reconstructed. This keeps only representative container chunks
+    and decoded payloads so downstream triage sees a small, stable set of
+    artifacts instead of thousands of noisy carve byproducts.
+    """
+    reps = []
+    seen_real = set()
+
+    try:
+        root_names = sorted(os.listdir(base_dir))
+    except OSError:
+        root_names = []
+
+    for name in root_names:
+        path = os.path.join(base_dir, name)
+        if not os.path.isfile(path):
+            continue
+        if not (
+            _looks_like_nested_blob(path)
+            or name.lower().endswith(".7z")
+            or name.lower().endswith(".bin")
+        ):
+            continue
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if size < 64 * 1024:
+            continue
+        real = os.path.realpath(path)
+        if real in seen_real:
+            continue
+        seen_real.add(real)
+        reps.append({
+            "src": path,
+            "origin": "segment-root",
+            "size_bytes": size,
+            "name": name,
+        })
+
+    for root in expanded_dirs:
+        if not root or not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith("_") and not d.startswith(".")]
+            for name in filenames:
+                path = os.path.join(dirpath, name)
+                lower = name.lower()
+                if not (
+                    lower == "_decoded.bin"
+                    or lower.endswith(".7z")
+                    or lower.endswith(".bin")
+                ):
+                    continue
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                if size < 64 * 1024:
+                    continue
+                real = os.path.realpath(path)
+                if real in seen_real:
+                    continue
+                seen_real.add(real)
+                reps.append({
+                    "src": path,
+                    "origin": "nested-decode",
+                    "size_bytes": size,
+                    "name": os.path.relpath(path, root).replace("\\", "/"),
+                })
+
+    if len(reps) < 4:
+        return None
+
+    reps.sort(
+        key=lambda row: (
+            0 if row["origin"] == "nested-decode" else 1,
+            -row["size_bytes"],
+            row["name"],
+        )
+    )
+
+    layout_dir = os.path.join(base_dir, "_segmented_partial_layout")
+    shutil.rmtree(layout_dir, ignore_errors=True)
+    seg_dir = os.path.join(layout_dir, "segments")
+    os.makedirs(seg_dir, exist_ok=True)
+
+    manifest = {
+        "reconstruction_level": "segmented-partial-layout",
+        "segment_count": 0,
+        "representatives": [],
+    }
+
+    used = set()
+    copied = 0
+    for rep in reps:
+        src = rep["src"]
+        base = os.path.basename(src)
+        dst = os.path.join(seg_dir, base)
+        stem, ext = os.path.splitext(dst)
+        dedup = 1
+        while dst in used or os.path.exists(dst):
+            dst = f"{stem}_{dedup}{ext}"
+            dedup += 1
+        try:
+            _safe_link_or_copy(src, dst)
+        except OSError:
+            continue
+        used.add(dst)
+        copied += 1
+        manifest["representatives"].append({
+            "path": os.path.relpath(dst, layout_dir),
+            "origin": rep["origin"],
+            "size_bytes": rep["size_bytes"],
+            "source_name": rep["name"],
+        })
+        if copied >= max_segments:
+            break
+
+    if copied < 4:
+        shutil.rmtree(layout_dir, ignore_errors=True)
+        return None
+
+    manifest["segment_count"] = copied
+    Path(os.path.join(layout_dir, "SEGMENTED_PARTIAL_LAYOUT.txt")).write_text(
+        "Representative segmented bundle layout for static triage.\n"
+        "This is not a full reconstructed rootfs.\n",
+        encoding="utf-8",
+    )
+    _json_dump(os.path.join(layout_dir, "PARTIAL_LAYOUT.json"), manifest)
+    return layout_dir
+
+
+def _synthesize_probe_partial_layout(base_dir, payload_paths, layout_name="_probe_partial_layout", max_segments=8):
+    rows = []
+    seen = set()
+    for path in payload_paths:
+        if not path or not os.path.isfile(path):
+            continue
+        real = os.path.realpath(path)
+        if real in seen:
+            continue
+        seen.add(real)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if size < 64 * 1024:
+            continue
+        rows.append((path, size))
+
+    if len(rows) < 2:
+        return None
+
+    rows.sort(key=lambda item: (-item[1], os.path.basename(item[0])))
+    layout_dir = os.path.join(base_dir, layout_name)
+    shutil.rmtree(layout_dir, ignore_errors=True)
+    seg_dir = os.path.join(layout_dir, "segments")
+    os.makedirs(seg_dir, exist_ok=True)
+
+    manifest = {
+        "reconstruction_level": "probe-partial-layout",
+        "segment_count": 0,
+        "segments": [],
+    }
+
+    copied = 0
+    used = set()
+    for path, size in rows:
+        dst = os.path.join(seg_dir, os.path.basename(path))
+        stem, ext = os.path.splitext(dst)
+        dedup = 1
+        while dst in used or os.path.exists(dst):
+            dst = f"{stem}_{dedup}{ext}"
+            dedup += 1
+        _safe_link_or_copy(path, dst)
+        used.add(dst)
+        copied += 1
+        manifest["segments"].append({
+            "path": os.path.relpath(dst, layout_dir),
+            "size_bytes": size,
+        })
+        if copied >= max_segments:
+            break
+
+    if copied < 2:
+        shutil.rmtree(layout_dir, ignore_errors=True)
+        return None
+
+    manifest["segment_count"] = copied
+    Path(os.path.join(layout_dir, "PARTIAL_LAYOUT.txt")).write_text(
+        "Representative offset/decrypt probe payloads for static triage.\n",
+        encoding="utf-8",
+    )
+    _json_dump(os.path.join(layout_dir, "PARTIAL_LAYOUT.json"), manifest)
+    return layout_dir
+
+
+def _candidate_passphrases_from_blob_name(blob_path, vendor_hint=""):
+    if "tenda" in vendor_hint.lower():
+        return [
+            "TENDAWIFI",
+            "TendaWiFi",
+            "tendawifi",
+            "tendawifi.com",
+            "Tenda",
+            "tenda",
+        ]
+
+    seeds = []
+    stem = os.path.splitext(os.path.basename(blob_path))[0]
+    seeds.extend(re.findall(r"[A-Za-z0-9]+", stem))
+    if vendor_hint:
+        seeds.extend(re.findall(r"[A-Za-z0-9]+", vendor_hint))
+    preferred = ["TENDAWIFI", "TendaWiFi", "tendawifi", "tendawifi.com", "Tenda", "tenda"]
+    seeds = preferred + seeds
+
+    out = []
+    seen = set()
+    for seed in seeds:
+        if len(seed) < 3:
+            continue
+        variants = (seed, seed.lower(), seed.upper())
+        for variant in variants:
+            if variant in seen:
+                continue
+            seen.add(variant)
+            out.append(variant)
+
+    compact = "".join(ch for ch in stem if ch.isalnum())
+    if compact and compact not in seen:
+        out.append(compact)
+    return out[:64]
+
+
+def _try_auto_openssl_container_extract(blob_path, out_dir, vendor_hint=""):
+    try:
+        with open(blob_path, "rb") as fh:
+            head = fh.read(0x214)
+            if len(head) < 0x214 or head[0x204:0x20C] != b"Salted__":
+                return None
+            salt = head[0x20C:0x214].hex()
+    except OSError:
+        return None
+
+    probe_dir = os.path.join(out_dir, ".openssl_auto")
+    shutil.rmtree(probe_dir, ignore_errors=True)
+    os.makedirs(probe_dir, exist_ok=True)
+
+    ciphertext = os.path.join(probe_dir, "ciphertext.bin")
+    with open(blob_path, "rb") as src, open(ciphertext, "wb") as dst:
+        src.seek(0x214)
+        shutil.copyfileobj(src, dst)
+
+    candidates = _candidate_passphrases_from_blob_name(blob_path, vendor_hint)
+    if not candidates:
+        return None
+
+    digest_order = ("sha256", "md5")
+    cipher_order = ("aes-128-cbc", "aes-256-cbc", "aes-192-cbc")
+    attempts = []
+
+    for passphrase in candidates:
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", passphrase)[:96] or "candidate"
+        for digest in digest_order:
+            for cipher in cipher_order:
+                out_blob = os.path.join(probe_dir, f"{safe}_{cipher}_{digest}.bin")
+                proc = run(
+                    " ".join([
+                        "openssl", "enc", "-d", f"-{cipher}",
+                        "-md", digest, "-S", salt, "-salt",
+                        "-pass", shlex.quote(f"pass:{passphrase}"),
+                        "-in", shlex.quote(ciphertext),
+                        "-out", shlex.quote(out_blob),
+                    ]),
+                    label=f"openssl auto  {os.path.basename(blob_path)}",
+                    quiet=True,
+                )
+                if proc.returncode != 0 or not os.path.isfile(out_blob):
+                    continue
+                try:
+                    size = os.path.getsize(out_blob)
+                except OSError:
+                    size = 0
+                if size < 256 * 1024:
+                    continue
+                structure = _structure_info(out_blob)
+                attempts.append({
+                    "passphrase": passphrase,
+                    "cipher": cipher,
+                    "digest": digest,
+                    "path": os.path.relpath(out_blob, out_dir),
+                    "size_bytes": size,
+                    "structure": structure,
+                })
+                _record_container_evidence(out_dir, out_blob, {
+                    "kind": structure.get("kind"),
+                    "confidence": structure.get("confidence"),
+                    "reasons": structure.get("reasons"),
+                    "size_bytes": structure.get("size_bytes"),
+                    "entropy": structure.get("entropy"),
+                    "printable_ratio": structure.get("printable_ratio"),
+                    "extract_offset": structure.get("extract_offset"),
+                    "salvage_source": "openssl-decrypt",
+                    "passphrase": passphrase,
+                    "cipher": cipher,
+                    "digest": digest,
+                })
+                if not _should_attempt_nested_extract(structure):
+                    continue
+                nested_out = os.path.join(
+                    probe_dir,
+                    f"_nested_{os.path.basename(out_blob)}"
+                )
+                if isinstance(structure.get("extract_offset"), int) and structure["extract_offset"] > 0:
+                    extracted = _try_auto_offset_carve_extract(
+                        out_blob,
+                        probe_dir,
+                        offsets=(structure["extract_offset"],),
+                    )
+                    if extracted:
+                        _ok(
+                            "auto OpenSSL carved-payload salvage succeeded: "
+                            f"{os.path.relpath(out_blob, PROJECT_ROOT)}"
+                        )
+                        return extracted
+                rootfs = _try_extract_iot_blob(
+                    out_blob,
+                    nested_out,
+                    f"openssl nested  {os.path.basename(out_blob)}",
+                )
+                if rootfs:
+                    _ok(
+                        "auto OpenSSL container extract succeeded: "
+                        f"{os.path.relpath(out_blob, PROJECT_ROOT)}"
+                    )
+                    return rootfs
+                raw_candidates = _scan_raw_fs_offsets(out_blob, nested_out, probe_dir)
+                if raw_candidates:
+                    _ok(
+                        "auto OpenSSL raw-fs salvage succeeded: "
+                        f"{os.path.relpath(out_blob, PROJECT_ROOT)}"
+                    )
+                    return raw_candidates[0]["path"]
+    if attempts:
+        _json_dump(os.path.join(probe_dir, "decrypt_attempts.json"), attempts)
+        probe_partial_layout = _reconstruct_container_partial_layout(probe_dir)
+        if probe_partial_layout:
+            _ok(
+                "auto OpenSSL probe partial layout assembled: "
+                f"{os.path.relpath(probe_partial_layout, PROJECT_ROOT)}"
+            )
+            return probe_partial_layout
+        partial_layout = _reconstruct_container_partial_layout(out_dir)
+        if partial_layout:
+            _ok(
+                "auto OpenSSL partial layout assembled: "
+                f"{os.path.relpath(partial_layout, PROJECT_ROOT)}"
+            )
+            return partial_layout
+    return None
+
+
+def _try_auto_offset_carve_extract(blob_path, out_dir, offsets):
+    probe_dir = os.path.join(out_dir, ".offset_probe")
+    shutil.rmtree(probe_dir, ignore_errors=True)
+    os.makedirs(probe_dir, exist_ok=True)
+
+    try:
+        total_size = os.path.getsize(blob_path)
+    except OSError:
+        return None
+
+    carved_payloads = []
+
+    for offset in offsets:
+        if offset <= 0 or offset >= total_size - 4096:
+            continue
+        carved = os.path.join(probe_dir, f"payload_{offset:x}.bin")
+        with open(blob_path, "rb") as src, open(carved, "wb") as dst:
+            src.seek(offset)
+            shutil.copyfileobj(src, dst)
+        carved_payloads.append(carved)
+        structure = _structure_info(carved)
+        _record_container_evidence(out_dir, carved, {
+            "kind": structure.get("kind"),
+            "confidence": structure.get("confidence"),
+            "reasons": structure.get("reasons"),
+            "size_bytes": structure.get("size_bytes"),
+            "entropy": structure.get("entropy"),
+            "printable_ratio": structure.get("printable_ratio"),
+            "extract_offset": structure.get("extract_offset"),
+            "salvage_source": "offset-carve",
+            "carve_offset": offset,
+        })
+        decoded_target, decoded_structure = _decode_embedded_payload(
+            carved,
+            nested_out := os.path.join(probe_dir, f"_nested_{offset:x}"),
+            structure,
+        )
+        if decoded_structure:
+            _record_container_evidence(out_dir, decoded_target or carved, {
+                "kind": decoded_structure.get("kind"),
+                "confidence": decoded_structure.get("confidence"),
+                "reasons": decoded_structure.get("reasons"),
+                "size_bytes": decoded_structure.get("size_bytes", 0),
+                "entropy": decoded_structure.get("entropy"),
+                "printable_ratio": decoded_structure.get("printable_ratio"),
+                "extract_offset": decoded_structure.get("extract_offset"),
+                "salvage_source": "offset-carve-decode",
+                "carve_offset": offset,
+                "decoded_from": decoded_structure.get("decoded_from"),
+                "decoded_output_size": decoded_structure.get("decoded_output_size", decoded_structure.get("output_size", 0)),
+            })
+        target_for_extract = decoded_target or carved
+        target_structure = decoded_structure or structure
+        if not _should_attempt_nested_extract(target_structure):
+            continue
+        rootfs = _try_extract_iot_blob(
+            target_for_extract,
+            nested_out,
+            f"carve nested  {os.path.basename(blob_path)}@0x{offset:x}",
+        )
+        if rootfs:
+            _ok(
+                "auto offset-carve extract succeeded: "
+                f"{os.path.relpath(carved, PROJECT_ROOT)}"
+            )
+            return rootfs
+        raw_candidates = _scan_raw_fs_offsets(carved, nested_out, probe_dir)
+        if raw_candidates:
+            _ok(
+                "auto offset-carve raw-fs salvage succeeded: "
+                f"{os.path.relpath(carved, PROJECT_ROOT)}"
+            )
+            return raw_candidates[0]["path"]
+    partial_layout = _synthesize_probe_partial_layout(probe_dir, carved_payloads)
+    if partial_layout:
+        _ok(
+            "auto offset-carve partial layout assembled: "
+            f"{os.path.relpath(partial_layout, PROJECT_ROOT)}"
+        )
+        return partial_layout
+    return None
+
+
+def _extract_cloud_header_offsets(head):
+    offsets = []
+    for off in (0x110, 0x114, 0x118, 0x11C):
+        if off + 4 > len(head):
+            continue
+        value = int.from_bytes(head[off:off + 4], "big")
+        if 0x200 <= value <= 0x200000:
+            offsets.append(value)
+    deduped = []
+    seen = set()
+    for value in offsets:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return tuple(deduped)
+
+
+def _try_auto_container_extract(blob_path, out_dir):
+    """
+    Low-cost automatic probes for opaque vendor containers that previously
+    required manual probe scripts. Keep this conservative: only try a few
+    fixed offsets and common OpenSSL salted layouts.
+    """
+    try:
+        with open(blob_path, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return None
+
+    if len(head) >= 0x214 and head[0x204:0x20C] == b"Salted__":
+        rootfs = _try_auto_openssl_container_extract(
+            blob_path,
+            out_dir,
+            vendor_hint="Tenda style OpenSSL container",
+        )
+        if rootfs:
+            return rootfs
+
+    if b"fw-type:Cloud" in head[:128]:
+        header_offsets = _extract_cloud_header_offsets(head)
+        offset_candidates = header_offsets + tuple(
+            off for off in (0x200, 0x400, 0x800, 0x1000, 0x2000, 0x4000, 0x10000)
+            if off not in header_offsets
+        )
+        rootfs = _try_auto_offset_carve_extract(
+            blob_path,
+            out_dir,
+            offsets=offset_candidates,
+        )
+        if rootfs:
+            return rootfs
+
+    return None
+
+
 def _expand_segmented_bundle_chunks(base_dir, max_blobs=8):
+    lowered_base = str(base_dir).lower().replace("\\", "/")
+    if "/_extract_" in lowered_base or "/_carve_" in lowered_base:
+        return []
+
     pending = []
     for dirpath, dirnames, filenames in os.walk(base_dir):
         dirnames[:] = [d for d in dirnames if not d.startswith("_nested_")]
@@ -2456,6 +3963,20 @@ def _expand_segmented_bundle_chunks(base_dir, max_blobs=8):
             if not _looks_like_nested_blob(blob_path):
                 continue
             pending.append(blob_path)
+
+    if not pending:
+        try:
+            fallback_files = [
+                os.path.join(base_dir, name)
+                for name in os.listdir(base_dir)
+            ]
+        except OSError:
+            fallback_files = []
+        for blob_path in fallback_files:
+            if not os.path.isfile(blob_path):
+                continue
+            if _looks_like_opaque_nested_blob(blob_path):
+                pending.append(blob_path)
 
     pending.sort(key=_rank_nested_blob, reverse=True)
     expanded = []
@@ -2476,6 +3997,10 @@ def _try_extract_iot_blob(blob_path, out_dir, label):
 
     if _has_ubi_magic(blob_path):
         return _extract_ubi_blob(blob_path, os.path.join(out_dir, "_ubi_extract"))
+
+    dlink_root = _try_extract_dlink_wrapped_blob(blob_path, out_dir)
+    if dlink_root:
+        return dlink_root
 
     dji_fast = _is_dji_firmware_blob(blob_path)
     run(
@@ -2499,6 +4024,20 @@ def _try_extract_iot_blob(blob_path, out_dir, label):
         sqfs = find_squashfs_root(out_dir)
         if sqfs:
             return sqfs
+        synthesized = _synthesize_segmented_webroot(segmented_root, segmented_expanded)
+        if synthesized:
+            _ok(
+                "segmented bundle synthetic webroot assembled: "
+                f"{os.path.relpath(synthesized, PROJECT_ROOT)}"
+            )
+            return synthesized
+        segmented_partial = _synthesize_segmented_partial_layout(segmented_root, segmented_expanded)
+        if segmented_partial:
+            _ok(
+                "segmented bundle partial layout assembled: "
+                f"{os.path.relpath(segmented_partial, PROJECT_ROOT)}"
+            )
+            return segmented_partial
     if dji_fast:
         _expand_dji_bundles(out_dir)
     elif not segmented_expanded:
@@ -2537,7 +4076,15 @@ def _try_extract_iot_blob(blob_path, out_dir, label):
             sqfs = _extract_ubi_blob(ubi_blobs[0], os.path.join(inner, "_ubi_extract"))
             if sqfs:
                 return sqfs
-        return find_squashfs_root(inner)
+        inner_sqfs = find_squashfs_root(inner)
+        if inner_sqfs:
+            return inner_sqfs
+
+    rescue_candidates = _scan_raw_fs_offsets(blob_path, out_dir, inner)
+    if not rescue_candidates:
+        rescue_candidates = _scan_embedded_payloads(blob_path, out_dir, inner)
+    if rescue_candidates:
+        return rescue_candidates[0]["path"]
     return None
 
 
@@ -2549,6 +4096,24 @@ def _validate_iot_rootfs(dst, min_files=2000):
         print(f"        Path:  {dst}", flush=True)
         sys.exit(1)
     return count
+
+
+def _has_visible_analysis_artifacts(base_dir):
+    if not base_dir or not os.path.isdir(base_dir):
+        return False
+    note_names = {"container_evidence.json", "decrypt_attempts.json"}
+    for dirpath, dirnames, filenames in os.walk(base_dir):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        rel = os.path.relpath(dirpath, base_dir)
+        if rel != "." and rel.startswith("."):
+            continue
+        for name in filenames:
+            if name.startswith("."):
+                continue
+            if name.lower() in note_names:
+                continue
+            return True
+    return False
 
 
 def _check_iot_rootfs(candidate, min_files=800):
@@ -2648,20 +4213,7 @@ def extract_iot_firmware(bin_path):
     candidates = _collect_ranked_rootfs_candidates(out_dir)
 
     if not candidates and not is_dji_blob:
-        _warn("binwalk did not locate a filesystem root; scanning raw offsets")
-        for fs_name, offset in _find_fs_magic_offsets(bin_path):
-            carved = os.path.join(WORK_DIR, f"_carve_{fs_name}_{offset:x}.bin")
-            run_critical(
-                _carve_from_offset_command(bin_path, carved, offset),
-                fatal_msg=f"dd carve failed at offset {offset} for {fs_name}",
-                label=f"dd carve  {fs_name} @ 0x{offset:x}",
-                quiet=True,
-            )
-            carve_out = os.path.join(WORK_DIR, f"_extract_{fs_name}_{offset:x}")
-            _try_extract_iot_blob(
-                carved, carve_out, f"binwalk raw  {fs_name} @ 0x{offset:x}"
-            )
-            candidates = _collect_ranked_rootfs_candidates(out_dir, carve_out)
+        candidates = _scan_raw_fs_offsets(bin_path, out_dir)
     elif not candidates and is_dji_blob:
         _warn("DJI package detected; skipping raw filesystem carving and deep recursive unpacking")
 
@@ -2677,7 +4229,30 @@ def extract_iot_firmware(bin_path):
                 _ok(f"system     → {os.path.relpath(os.path.join(ROOTFS_DIR, 'system'), PROJECT_ROOT)}")
                 return os.path.join(ROOTFS_DIR, "system")
 
+        auto_container_rootfs = _try_auto_container_extract(bin_path, out_dir)
+        if auto_container_rootfs:
+            _ok(f"auto rootfs  → {os.path.relpath(auto_container_rootfs, PROJECT_ROOT)}")
+            return auto_container_rootfs
+
+        if not _has_visible_analysis_artifacts(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+            raw_copy = os.path.join(out_dir, os.path.basename(bin_path))
+            if os.path.abspath(raw_copy) != os.path.abspath(bin_path):
+                shutil.copy2(bin_path, raw_copy)
+
+        partial_layout = _reconstruct_container_partial_layout(out_dir)
+        if partial_layout:
+            _ok(f"partial layout: {os.path.relpath(partial_layout, PROJECT_ROOT)}")
+        segmented_partial_layout = _find_segmented_partial_layout(out_dir)
+        if segmented_partial_layout and os.path.isdir(segmented_partial_layout):
+            partial_layout = segmented_partial_layout
+            _ok(f"segmented partial layout: {os.path.relpath(partial_layout, PROJECT_ROOT)}")
+
         bundle_candidates = _collect_ranked_bundle_candidates(out_dir)
+        if partial_layout and os.path.basename(partial_layout) == "_segmented_partial_layout":
+            _warn("no classic rootfs found; using segmented partial layout fallback")
+            _ok(f"analysis root: {os.path.relpath(partial_layout, PROJECT_ROOT)}")
+            return partial_layout
         if bundle_candidates:
             selected = bundle_candidates[0]
             _warn("no classic rootfs found; using generic firmware bundle fallback")
@@ -2685,6 +4260,10 @@ def extract_iot_firmware(bin_path):
             _ok(f"analysis root: {os.path.relpath(out_dir, PROJECT_ROOT)}")
             _ok(f"selected score: {selected['score']}  ({', '.join(selected['why'])})")
             return out_dir
+        if partial_layout:
+            _warn("no classic rootfs found; using partial container layout fallback")
+            _ok(f"analysis root: {os.path.relpath(partial_layout, PROJECT_ROOT)}")
+            return partial_layout
         if _count_files(out_dir) > 0:
             _warn("no classic rootfs or bundle candidate found; using extracted directory fallback")
             _ok(f"analysis root: {os.path.relpath(out_dir, PROJECT_ROOT)}")
@@ -2695,6 +4274,7 @@ def extract_iot_firmware(bin_path):
             return out_dir
 
         _warn("binwalk ran but no classic rootfs or bundle candidate was found; using raw blob fallback")
+        os.makedirs(out_dir, exist_ok=True)
         raw_copy = os.path.join(out_dir, os.path.basename(bin_path))
         if os.path.abspath(raw_copy) != os.path.abspath(bin_path):
             shutil.copy2(bin_path, raw_copy)
@@ -2712,6 +4292,22 @@ def extract_iot_firmware(bin_path):
                 _warn("top rootfs candidate was rejected; using next-best candidate")
             break
         rejected[info["path"]] = error
+
+    if selected is None and candidates and not is_dji_blob:
+        rescue_candidates = _scan_raw_fs_offsets(bin_path, out_dir)
+        if rescue_candidates:
+            candidates = rescue_candidates
+            rejected = {}
+            selected = None
+            for idx, info in enumerate(candidates):
+                count, error = _check_iot_rootfs(info)
+                if error is None:
+                    info["validated_file_count"] = count
+                    selected = info
+                    if idx > 0:
+                        _warn("top rootfs candidate was rejected; using raw-offset rescue candidate")
+                    break
+                rejected[info["path"]] = error
 
     _print_rootfs_candidate_summary(candidates, selected=selected, rejected=rejected)
 
@@ -2857,6 +4453,11 @@ def _write_manifest(path, payload):
 def _load_json(path):
     if not path or not os.path.isfile(path):
         return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
 
 
 def _manifest_input_entry(path, type_name):
@@ -2871,11 +4472,6 @@ def _manifest_input_entry(path, type_name):
         entry["sha256"] = _sha256_file(path)
         entry["size_bytes"] = os.path.getsize(path)
     return entry
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception:
-        return None
 
 
 def _is_iot_batch_candidate(path):
@@ -3065,6 +4661,11 @@ def main():
         help="keep only the newest N extracted_* directories under .cache/extracted/")
     args = parser.parse_args()
 
+    if args.retain_runs is None:
+        args.retain_runs = DEFAULT_RETAIN_RUNS
+    if args.retain_extracted is None:
+        args.retain_extracted = DEFAULT_RETAIN_EXTRACTED
+
     if args.status:
         print_cache_status()
         sys.exit(0)
@@ -3144,6 +4745,7 @@ def main():
         "run_dir": os.path.relpath(run_artifacts["run_dir"], PROJECT_ROOT),
         "log_path": os.path.relpath(run_artifacts["log_path"], PROJECT_ROOT),
         "result_path": os.path.relpath(output_path, PROJECT_ROOT),
+        "canonical_result_path": os.path.relpath(run_artifacts["result_path"], PROJECT_ROOT),
         "dossier_dir": os.path.relpath(run_artifacts["dossier_dir"], PROJECT_ROOT),
         "started_at": datetime.now().isoformat(timespec="seconds"),
         "status": "running",
@@ -3226,7 +4828,9 @@ def main():
             elif input_type == INPUT_PAYLOAD:
                 handle_payload_input(path)
             elif input_type == INPUT_IMG:
-                handle_img_input(path)
+                analysis_system_path = handle_img_input(path)
+                if analysis_system_path == os.path.join(ROOTFS_DIR, "system"):
+                    analysis_vendor_path = os.path.join(ROOTFS_DIR, "vendor")
             elif input_type == INPUT_IOT:
                 analysis_system_path = handle_iot_input(path)
                 if analysis_system_path == os.path.join(ROOTFS_DIR, "system"):
@@ -3289,7 +4893,7 @@ def main():
     if args.skip:
         analysis_system_path = None
         analysis_vendor_path = None
-    elif input_type != INPUT_IOT:
+    elif input_type != INPUT_IOT and analysis_system_path is None:
         analysis_system_path = assembled_root or os.path.join(ROOTFS_DIR, "system")
         analysis_vendor_path = (
             os.path.join(ROOTFS_DIR, "vendor")
@@ -3304,6 +4908,8 @@ def main():
     )
 
     result_payload = _load_json(output_path) or {}
+    if result_payload and os.path.abspath(output_path) != os.path.abspath(run_artifacts["result_path"]):
+        _json_dump(run_artifacts["result_path"], result_payload)
     manifest["status"] = "completed"
     manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
     manifest["elapsed_seconds"] = int(time.time() - t_total)

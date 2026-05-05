@@ -128,6 +128,40 @@ def infer_entry(path, inputs_root="inputs"):
         ),
         (
             re.compile(
+                r"^Archer (?P<model>AX55|AX72)(?:\((?P<region>[A-Z]+)\))?_V(?P<hw>\d+)_(?P<build>\d{6})\.(?P<ext>zip)$",
+                re.I,
+            ),
+            lambda m: {
+                "vendor": "TP-Link",
+                "model": f"Archer {m.group('model').upper()}",
+                "version": (
+                    f"V{m.group('hw')}_{m.group('build')}_{m.group('region').upper()}"
+                    if m.group("region")
+                    else f"V{m.group('hw')}_{m.group('build')}"
+                ),
+                "release_date": infer_release_date(f"20{m.group('build')}"),
+                "suspected_stack": [],
+                "arch": "",
+                "notes": "Metadata inferred from TP-Link Archer AX filename pattern. Region tag is preserved in the version when present in the local filename.",
+            },
+        ),
+        (
+            re.compile(
+                r"^Archer (?P<model>AX55|AX72)_V(?P<hw>\d+)_(?P<build>\d{6})\.(?P<ext>zip)$",
+                re.I,
+            ),
+            lambda m: {
+                "vendor": "TP-Link",
+                "model": f"Archer {m.group('model').upper()}",
+                "version": f"V{m.group('hw')}_{m.group('build')}",
+                "release_date": infer_release_date(f"20{m.group('build')}"),
+                "suspected_stack": [],
+                "arch": "",
+                "notes": "Metadata inferred from TP-Link Archer AX filename pattern.",
+            },
+        ),
+        (
+            re.compile(
                 r"^TOTOLINK_C8380R_X6000R_.*_(?P<version>V.+)\.(?P<ext>zip)$",
                 re.I,
             ),
@@ -281,6 +315,21 @@ def infer_entry(path, inputs_root="inputs"):
         ),
         (
             re.compile(
+                r"^(?P<model>RX9Pro)v(?P<hw>\d+)FirmwareV(?P<build>\d{8})\.(?P<ext>zip)$",
+                re.I,
+            ),
+            lambda m: {
+                "vendor": "Tenda",
+                "model": "RX9 Pro",
+                "version": f"V{m.group('hw')}_{m.group('build')}",
+                "release_date": infer_release_date(m.group("build")),
+                "suspected_stack": [],
+                "arch": "",
+                "notes": "Metadata inferred from Tenda RX9 Pro firmware archive naming.",
+            },
+        ),
+        (
+            re.compile(
                 r"^(?P<region>[A-Z]{2})_(?P<model>TX2Pro)V(?P<hw>\d+\.\d+)\w*_V(?P<version>\d+\.\d+\.\d+\.\d+)_multi_(?P<build>[A-Z0-9]+)\.(?P<ext>zip)$",
                 re.I,
             ),
@@ -341,6 +390,24 @@ def infer_entry(path, inputs_root="inputs"):
         ),
         (
             re.compile(
+                r"^miwifi_(?P<platform>ra82|rb01)_firmware_[^_]+_(?P<version>\d+\.\d+\.\d+)_INT\.(?P<ext>bin)$",
+                re.I,
+            ),
+            lambda m: {
+                "vendor": "Xiaomi",
+                "model": {
+                    "ra82": "AX3000",
+                    "rb01": "AX3200",
+                }[m.group("platform").lower()],
+                "version": m.group("version"),
+                "release_date": "",
+                "suspected_stack": ["xiaoqiang", "lighttpd", "squashfs"],
+                "arch": "",
+                "notes": "Metadata inferred from Xiaomi miwifi firmware naming. Platform token was mapped to the retail model name.",
+            },
+        ),
+        (
+            re.compile(
                 r"^FW_(?P<model>RT_AX58U)_(?P<version>\d+)\.(?P<ext>zip)$",
                 re.I,
             ),
@@ -390,6 +457,21 @@ def infer_entry(path, inputs_root="inputs"):
         ),
         (
             re.compile(
+                r"^(?P<model>RAX50)-V(?P<version>\d+\.\d+\.\d+\.\d+)\.(?P<ext>zip)$",
+                re.I,
+            ),
+            lambda m: {
+                "vendor": "NETGEAR",
+                "model": m.group("model").upper(),
+                "version": f"V{m.group('version')}",
+                "release_date": "",
+                "suspected_stack": ["micro_httpd", "ubifs", "broadcom"],
+                "arch": "",
+                "notes": "Metadata inferred from NETGEAR firmware ZIP pattern without the secondary build suffix.",
+            },
+        ),
+        (
+            re.compile(
                 r"^SRM_(?P<model>RT6600ax)_(?P<build>\d+)\.(?P<ext>pat)$",
                 re.I,
             ),
@@ -401,6 +483,66 @@ def infer_entry(path, inputs_root="inputs"):
                 "suspected_stack": ["synology", "package-firmware", "tar"],
                 "arch": "",
                 "notes": "Metadata inferred from Synology SRM PAT package naming. PAT is a tar-like firmware bundle rather than a plain router image.",
+            },
+        ),
+        (
+            re.compile(
+                r"^synology_[^_]+_(?P<model>rt2600ac)\.(?P<ext>pat)$",
+                re.I,
+            ),
+            lambda m: {
+                "vendor": "Synology",
+                "model": "RT2600ac",
+                "version": "unknown",
+                "release_date": "",
+                "suspected_stack": ["synology", "package-firmware", "tar"],
+                "arch": "",
+                "notes": "Metadata inferred from Synology platform PAT naming where the build number is not embedded in the local filename.",
+            },
+        ),
+        (
+            re.compile(
+                r"^DIR-X(?P<model>\d+)_A(?P<hw>\d+)_Firmware_V(?P<version>[\d.]+B\d+)\.(?P<ext>zip)$",
+                re.I,
+            ),
+            lambda m: {
+                "vendor": "D-Link",
+                "model": f"DIR-X{m.group('model')}",
+                "version": f"A{m.group('hw')}_{m.group('version').upper()}",
+                "release_date": "",
+                "suspected_stack": ["lighttpd", "squashfs"],
+                "arch": "",
+                "notes": "Metadata inferred from D-Link archive naming.",
+            },
+        ),
+        (
+            re.compile(
+                r"^DIRX(?P<model>\d+)A(?P<hw>\d+)_FWV?(?P<version>[\d.]+B\d+(?:_beta)?)\.(?P<ext>bin)$",
+                re.I,
+            ),
+            lambda m: {
+                "vendor": "D-Link",
+                "model": f"DIR-X{m.group('model')}",
+                "version": f"A{m.group('hw')}_{m.group('version').upper()}",
+                "release_date": "",
+                "suspected_stack": ["lighttpd", "squashfs"],
+                "arch": "",
+                "notes": "Metadata inferred from D-Link raw firmware naming.",
+            },
+        ),
+        (
+            re.compile(
+                r"^DIRX(?P<model>\d+)A(?P<hw>\d+)_FW(?P<version>\d+B\d+)(?: \((?P<copy>\d+)\))?\.(?P<ext>bin)$",
+                re.I,
+            ),
+            lambda m: {
+                "vendor": "D-Link",
+                "model": f"DIR-X{m.group('model')}",
+                "version": f"A{m.group('hw')}_{m.group('version').upper()}",
+                "release_date": "",
+                "suspected_stack": ["lighttpd", "squashfs"],
+                "arch": "",
+                "notes": "Metadata inferred from D-Link raw firmware naming. Local duplicate copy marker was ignored during normalization.",
             },
         ),
     ]
@@ -462,7 +604,13 @@ def iter_input_files(inputs_dir):
     root = Path(inputs_dir)
     if not root.exists():
         return
-    for path in sorted(root.rglob("*")):
+    for path in sorted(
+        root.rglob("*"),
+        key=lambda p: (
+            -len(p.relative_to(root).parts),
+            str(p).lower(),
+        ),
+    ):
         if not path.is_file():
             continue
         if path.name.endswith(ZONE_SUFFIX):
@@ -486,12 +634,19 @@ def find_missing_entries(inputs_dir, corpus_path):
         if entry.get("local_filename")
     }
     missing = []
+    seen_names = set()
+    seen_ids = set()
     root = Path(inputs_dir)
     for path in iter_input_files(root):
         rel_local_path = str((root / path.relative_to(root))).replace("\\", "/")
         if rel_local_path in known_paths or path.name in known_names:
             continue
-        missing.append(infer_entry(path, inputs_root=root))
+        inferred = infer_entry(path, inputs_root=root)
+        if inferred["local_filename"] in seen_names or inferred["corpus_id"] in seen_ids:
+            continue
+        missing.append(inferred)
+        seen_names.add(inferred["local_filename"])
+        seen_ids.add(inferred["corpus_id"])
     return missing
 
 

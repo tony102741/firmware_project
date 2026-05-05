@@ -41,6 +41,8 @@ _WEB_ROOT_REL_HINTS = (
     "www/webpages",
     "etc/wifidog",
     "usr/lib/lua/luci",
+    "usr/lib/oui-httpd/rpc",
+    "usr/libexec/rpcd",
 )
 
 _TP_LINK_WEB_FILES = {
@@ -188,6 +190,20 @@ def _extract_refs_from_text_file(path, rootfs):
     return refs
 
 
+def _is_web_handler_file(rel, name, ext):
+    rel = rel.replace("\\", "/").lower()
+    name = name.lower()
+    if ext in _SCRIPT_EXTS or ext in _FRONTEND_EXTS or name in _WEB_ENTRY_NAMES:
+        return True
+    return (
+        rel.startswith("usr/libexec/rpcd/")
+        or rel.startswith("usr/lib/oui-httpd/rpc/")
+        or rel.startswith("usr/lib/lua/luci/controller/")
+        or rel.startswith("usr/lib/lua/luci/apprpc/")
+        or rel.startswith("usr/lib/lua/luci/jsonrpcbind/")
+    )
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def scan_web_surface(rootfs):
@@ -223,13 +239,18 @@ def scan_web_surface(rootfs):
                 ext   = os.path.splitext(f)[1].lower()
                 rel   = os.path.relpath(fpath, rootfs).replace("\\", "/").lower()
 
-                if ext in _FRONTEND_EXTS or f.lower() in _WEB_ENTRY_NAMES:
+                if _is_web_handler_file(rel, f, ext):
                     cgi_files.append(fpath)
 
-                if ext in _SCRIPT_EXTS or f.lower() in _WEB_ENTRY_NAMES:
+                if _is_web_handler_file(rel, f, ext):
                     web_bins.update(_extract_refs(fpath, rootfs))
                     # CGI binary itself counts as web-exposed
-                    if os.access(fpath, os.X_OK) or "/cgi-bin/" in rel:
+                    if (
+                        os.access(fpath, os.X_OK)
+                        or "/cgi-bin/" in rel
+                        or rel.startswith("usr/libexec/rpcd/")
+                        or rel.startswith("usr/lib/oui-httpd/rpc/")
+                    ):
                         web_bins.add(os.path.normpath(fpath))
 
     # ── 3. Web server configs / launch scripts → parse for routed binaries ───

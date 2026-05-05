@@ -451,7 +451,7 @@ _SHELL_CMD_HINTS = {
 }
 
 # Format specifiers that indicate user-supplied value substitution.
-_FORMAT_SPECS = {"%s", "%d", "%i", "%u", "%x", "%02x", "$(", "`"}
+_FORMAT_SPECS = {"%s", "%d", "%i", "%u", "%x", "%02x"}
 
 
 def detect_injection_templates(strings):
@@ -645,6 +645,12 @@ _AUTH_BYPASS_HINTS = {
     "noauth",
 }
 
+_KEY_GATED_PROTOCOL_HINTS = {
+    "encrypted", "encrypt", "decrypt", "cipher", "aes", "rsa", "hmac",
+    "signature", "shared key", "public key", "private key", "session key",
+    "key exchange", "nonce", "challenge", "token", "auth tag",
+}
+
 
 def assess_auth_bypass(strings, has_frontend):
     """
@@ -665,6 +671,11 @@ def assess_auth_bypass(strings, has_frontend):
 
     if any(any(k in l for k in _AUTH_BYPASS_HINTS) for l in lower):
         return 'bypassable', 2
+    # Frontend-visible handlers that are still key-gated / encrypted should
+    # not be upgraded to pre-auth solely because classic cookie/session
+    # keywords are absent.
+    if any(any(k in l for k in _KEY_GATED_PROTOCOL_HINTS) for l in lower):
+        return 'required', 0
     if not any(any(k in l for k in _AUTH_GUARD_KEYWORDS) for l in lower):
         return 'none', 3
     return 'required', 0
@@ -925,6 +936,11 @@ _EXEC_SINK_KEYS = {
     "memcpy", "__memcpy_chk", "read(", "fwrite", "write(",
 }
 
+_LOGGING_SINK_KEYS = {
+    "printf", "fprintf", "syslog", "snprintf", "vsnprintf",
+    "vprintf", "vfprintf", "puts", "puts_unlocked",
+}
+
 
 def is_logging_only_sink(all_sinks):
     """
@@ -941,11 +957,19 @@ def is_logging_only_sink(all_sinks):
     """
     if not all_sinks:
         return False
+    saw_known_logging = False
     for sink in all_sinks:
         l = sink.lower()
         if any(k in l for k in _EXEC_SINK_KEYS):
             return False   # at least one exec / memory sink found
-    return True
+        if any(k == l or k in l for k in _LOGGING_SINK_KEYS):
+            saw_known_logging = True
+            continue
+        # Unknown textual sink fragments (for example shell pipelines) should
+        # not be downgraded as "logging only" just because they lack a known
+        # exec symbol name.
+        return False
+    return saw_known_logging
 
 
 # ── Integer overflow → heap overflow detection ────────────────────────────────

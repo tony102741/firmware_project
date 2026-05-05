@@ -324,6 +324,19 @@ def calc_cve_triage_score(candidate):
       4. too_many_unknowns + not web-exposed
       5. triage_score < 20 AND not web-exposed AND no verified_flows
     """
+    verdict = (candidate.get("cve_verdict") or candidate.get("verdict") or "").lower()
+    confirmed_input = candidate.get("confirmed_input")
+    confirmed_sink = candidate.get("confirmed_sink")
+    attacker_arg = str(candidate.get("attacker_controlled_argument") or "unconfirmed").lower()
+    same_request = str(candidate.get("same_request") or "unknown").lower()
+    auth_boundary = str(candidate.get("auth_boundary") or "").lower()
+    sanitization = str(candidate.get("sanitization") or "unknown").lower()
+    false_positive_risks = set(candidate.get("false_positive_risks") or [])
+
+    # ── Hard discard: explicit reject from conservative readiness model ──────
+    if verdict == "reject":
+        return 0, True, "conservative readiness model rejected the candidate"
+
     # ── Hard discard: busybox noise ───────────────────────────────────────────
     if is_busybox_noise(candidate):
         return 0, True, "busybox applet — SHELL=/bin/sh is not a reachable sink"
@@ -425,6 +438,64 @@ def calc_cve_triage_score(candidate):
     # Controllability
     if candidate.get("controllability") == "HIGH":
         score += 5
+
+    # Conservative CVE-readiness structure
+    if confirmed_input and confirmed_input != "unconfirmed":
+        score += 10
+    if confirmed_sink and confirmed_sink != "unconfirmed":
+        score += 4
+
+    if attacker_arg == "confirmed":
+        score += 18
+    elif attacker_arg == "likely":
+        score += 8
+
+    if same_request == "confirmed":
+        score += 8
+    elif same_request == "deferred":
+        score -= 6
+
+    if auth_boundary == "pre-auth":
+        score += 10
+    elif auth_boundary == "bypassable":
+        score += 5
+    elif auth_boundary == "post-auth":
+        score += 1
+
+    if sanitization == "present":
+        score -= 10
+    elif sanitization == "bounded-or-truncating":
+        score -= 8
+
+    if verdict == "cve-ready":
+        score += 20
+    elif verdict == "promising":
+        score += 10
+    elif verdict == "needs-reversing":
+        score -= 4
+
+    if "constant_sink_argument" in false_positive_risks:
+        score -= 25
+    if "sink_import_only" in false_positive_risks:
+        score -= 20
+    if "cross_function_token_contamination" in false_positive_risks:
+        score -= 18
+    if "literal_logging_sink_only" in false_positive_risks:
+        score -= 20
+    if "bridge_api_unproven" in false_positive_risks:
+        score -= 10
+    if "bounded_or_truncated_copy" in false_positive_risks:
+        score -= 8
+    if "key_gated_protocol_surface" in false_positive_risks:
+        score -= 15
+    if "rpc_default_validator" in false_positive_risks:
+        score -= 18
+    if "double_quoted_no_subshell_exec" in false_positive_risks:
+        score -= 15
+    if "input_to_sink_unproven" in false_positive_risks:
+        score -= 14
+    if "no_exact_input" in false_positive_risks:
+        score -= 8
 
     # ── Verified-flows gate: cap unverified candidates ───────────────────────
     # Without a confirmed data-flow path apply a score ceiling.
@@ -543,6 +614,62 @@ def explain_triage(candidate):
         lines.append("+3   injection templates present")
     if candidate.get("controllability") == "HIGH":
         lines.append("+5   controllability HIGH")
+
+    if candidate.get("confirmed_input") and candidate.get("confirmed_input") != "unconfirmed":
+        lines.append(f"+10  confirmed_input ({candidate.get('confirmed_input')})")
+    if candidate.get("confirmed_sink") and candidate.get("confirmed_sink") != "unconfirmed":
+        lines.append(f"+4   confirmed_sink ({candidate.get('confirmed_sink')})")
+
+    attacker_arg = str(candidate.get("attacker_controlled_argument") or "unconfirmed").lower()
+    if attacker_arg == "confirmed":
+        lines.append("+18  attacker-controlled sink argument confirmed")
+    elif attacker_arg == "likely":
+        lines.append("+8   attacker-controlled sink argument likely")
+
+    same_request = str(candidate.get("same_request") or "unknown").lower()
+    if same_request == "confirmed":
+        lines.append("+8   same-request execution")
+    elif same_request == "deferred":
+        lines.append("-6   deferred/restart bridge")
+
+    auth_boundary = str(candidate.get("auth_boundary") or "").lower()
+    if auth_boundary == "pre-auth":
+        lines.append("+10  auth_boundary pre-auth")
+    elif auth_boundary == "bypassable":
+        lines.append("+5   auth_boundary bypassable")
+    elif auth_boundary == "post-auth":
+        lines.append("+1   auth_boundary post-auth")
+
+    sanitization = str(candidate.get("sanitization") or "unknown").lower()
+    if sanitization == "present":
+        lines.append("-10  sanitization present")
+    elif sanitization == "bounded-or-truncating":
+        lines.append("-8   bounded/truncating copy path")
+
+    verdict = (candidate.get("cve_verdict") or candidate.get("verdict") or "").lower()
+    if verdict == "cve-ready":
+        lines.append("+20  conservative verdict cve-ready")
+    elif verdict == "promising":
+        lines.append("+10  conservative verdict promising")
+    elif verdict == "needs-reversing":
+        lines.append("-4   conservative verdict needs-reversing")
+
+    for risk in candidate.get("false_positive_risks") or []:
+        penalty = {
+            "constant_sink_argument": "-25",
+            "sink_import_only": "-20",
+            "cross_function_token_contamination": "-18",
+            "literal_logging_sink_only": "-20",
+            "bridge_api_unproven": "-10",
+            "bounded_or_truncated_copy": "-8",
+            "key_gated_protocol_surface": "-15",
+            "rpc_default_validator": "-18",
+            "double_quoted_no_subshell_exec": "-15",
+            "input_to_sink_unproven": "-14",
+            "no_exact_input": "-8",
+        }.get(risk)
+        if penalty:
+            lines.append(f"{penalty}  false_positive_risk {risk}")
 
     if not strong_verified:
         if _is_strong_unverified(candidate):

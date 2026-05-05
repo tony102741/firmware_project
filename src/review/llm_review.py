@@ -28,6 +28,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
@@ -59,6 +60,50 @@ def load_jsonl(path: str | Path) -> List[dict]:
     return rows
 
 
+@lru_cache(maxsize=1)
+def _default_corpus_rows() -> List[dict]:
+    path = PROJECT_ROOT / "research" / "corpus" / "firmware_corpus.jsonl"
+    if not path.is_file():
+        return []
+    try:
+        return load_jsonl(path)
+    except Exception:
+        return []
+
+
+def _infer_corpus_entry_for_bundle(bundle: dict) -> Optional[dict]:
+    input_info = bundle.get("input") or {}
+    original_input = input_info.get("original") or {}
+    local_filename = os.path.basename(original_input.get("path") or "")
+    run_id = bundle.get("run_id") or ""
+    run_parts = run_id.split("/") if run_id else []
+
+    rows = _default_corpus_rows()
+    if not rows:
+        return None
+
+    if local_filename:
+        for row in rows:
+            if row.get("local_filename") == local_filename:
+                return row
+
+    if run_id:
+        for row in rows:
+            if row.get("run_id") == run_id:
+                return row
+
+    if len(run_parts) >= 2:
+        model_hint = run_parts[0].strip().lower()
+        sample_hint = run_parts[1].strip().lower()
+        for row in rows:
+            model = str(row.get("model") or "").strip().lower()
+            filename = str(row.get("local_filename") or "").strip().lower()
+            if model == model_hint and filename and filename in sample_hint:
+                return row
+
+    return None
+
+
 def _safe_rel(pathish: Optional[str]) -> str:
     if not pathish:
         return ""
@@ -69,6 +114,100 @@ def _safe_rel(pathish: Optional[str]) -> str:
         return str(pathish)
 
 
+def _infer_success_quality_from_bundle(bundle: dict) -> Optional[str]:
+    analysis = bundle.get("analysis") or {}
+    analysis_mode = analysis.get("mode")
+    system_path = str(analysis.get("system_path") or "").lower()
+    candidate_count = len(bundle.get("candidates") or [])
+    blob_candidate_count = len(bundle.get("container_targets") or [])
+
+    rootfs_markers = (
+        "/squashfs-root",
+        "/rootfs",
+        "/system",
+        "/_ubi_extract/",
+        "/.cache/rootfs/",
+    )
+    if analysis_mode in {"iot_web", "android"} and any(marker in system_path for marker in rootfs_markers):
+        return "rootfs-success"
+    if analysis_mode == "general" and (candidate_count > 0 or blob_candidate_count > 0):
+        return "blob-success"
+    if analysis_mode:
+        return "fallback-success"
+    return None
+
+
+def _infer_blob_family_from_bundle(bundle: dict, success_quality: Optional[str]) -> Optional[str]:
+    if success_quality != "blob-success":
+        return None
+
+    target0 = ((bundle.get("container_targets") or [None])[0]) or {}
+    source_kind = (target0.get("source_kind") or "").lower()
+    extraction_hints = [str(h).lower() for h in (target0.get("extraction_hints") or [])]
+
+    top = (_top_candidates(bundle, limit=1) or [None])[0]
+    if not top:
+        if source_kind == "encrypted-container":
+            return "tenda-openssl-container"
+        if "embedded-gzip-salvage" in extraction_hints or "embedded-lzma-salvage" in extraction_hints:
+            return "generic-container"
+        if source_kind in {"segmented-bundle", "nested-payload", "decoded-payload"}:
+            return "tp-link-segmented-bundle"
+        return "generic-blob-signal"
+
+    flow_type = (top.get("flow_type") or "").lower()
+    vendor_guess = (top.get("vendor_guess") or "").lower()
+    binary_path = (top.get("binary_path") or "").lower()
+
+    if flow_type == "container_signal":
+        if "tenda-style" in vendor_guess or "openssl salted" in (top.get("vuln_summary") or "").lower():
+            return "tenda-openssl-container"
+        if "tp-link/mercusys cloud" in vendor_guess:
+            return "mercusys-cloud-container"
+        return "generic-container"
+
+    if flow_type == "blob_signal":
+        if "_decoded.bin" in binary_path or "blob-signal" in (top.get("name") or "").lower():
+            return "tp-link-segmented-bundle"
+        return "generic-blob-signal"
+
+    return "generic-blob-signal"
+
+
+def _infer_probe_readiness_from_bundle(bundle: dict, success_quality: Optional[str]) -> Optional[str]:
+    if success_quality == "rootfs-success":
+        return "rootfs-ready"
+    if success_quality == "fallback-success":
+        return "fallback-ready"
+
+    for target in (bundle.get("container_targets") or []):
+        probe_bundle = target.get("probe_bundle") or {}
+        probe_type = probe_bundle.get("probe_type")
+        if probe_type == "openssl-enc-probe":
+            return "decrypt-probe-ready"
+        if probe_type == "container-scan-probe":
+            return "scan-probe-ready"
+        if probe_type == "segmented-bundle-scan-probe":
+            return "bundle-probe-ready"
+
+    if success_quality == "blob-success":
+        return "blob-ready"
+    return None
+
+
+def _container_target_context(bundle: dict) -> dict:
+    target = ((bundle.get("container_targets") or [None])[0]) or {}
+    probe = target.get("probe_bundle") or {}
+    return {
+        "source_kind": (target.get("source_kind") or "").lower(),
+        "extraction_hints": [str(h).lower() for h in (target.get("extraction_hints") or [])],
+        "probe_type": (probe.get("probe_type") or target.get("probe_type") or "").lower(),
+        "vendor_guess": (target.get("vendor_guess") or "").lower(),
+        "crypto_profile": (target.get("crypto_profile") or "").lower(),
+        "candidate_count": probe.get("candidate_count") or target.get("candidate_count") or 0,
+    }
+
+
 def _top_candidates(bundle: dict, limit: int = TOP_CANDIDATES) -> List[dict]:
     cve = bundle.get("cve_candidates") or []
     if cve:
@@ -76,14 +215,100 @@ def _top_candidates(bundle: dict, limit: int = TOP_CANDIDATES) -> List[dict]:
     return (bundle.get("candidates") or [])[:limit]
 
 
-def _infer_best_next_action(success_quality: str, probe_readiness: str, blob_family: Optional[str]) -> str:
+def _has_command_sink(sinks: List[str]) -> bool:
+    joined = " ".join(sinks)
+    if "os.execute" in joined or "session::system" in joined:
+        return True
+    for sink in sinks:
+        token = sink.strip().lower()
+        if token in {"system", "popen", "exec", "execl", "/bin/sh", "command"}:
+            return True
+    return False
+
+
+def _is_speculative_dlopen_web_candidate(candidate: Optional[dict]) -> bool:
+    if not candidate:
+        return False
+    flow_type = (candidate.get("flow_type") or "").lower()
+    if flow_type != "dlopen_injection":
+        return False
+    if not candidate.get("web_exposed"):
+        return False
+    if candidate.get("handler_surface"):
+        return False
+    missing_links = set(candidate.get("missing_links") or [])
+    if "exact_input_unknown" not in missing_links:
+        return False
+    if candidate.get("verified_flows"):
+        return False
+    summary = (candidate.get("vuln_summary") or "").lower()
+    sinks = [str(s).lower() for s in (candidate.get("all_sinks") or [])]
+    return (
+        "dlopen" in summary
+        or "dynamic library" in summary
+        or any("dlopen" in sink or "dlsym" in sink for sink in sinks)
+    )
+
+
+def _is_indirect_rpc_helper_candidate(candidate: Optional[dict]) -> bool:
+    if not candidate:
+        return False
+    if not candidate.get("web_exposed"):
+        return False
+    if candidate.get("handler_surface"):
+        return False
+    if candidate.get("verified_flows"):
+        return False
+
+    path = str(candidate.get("binary_path") or "").lower()
+    if not (
+        "/usr/lib/oui-httpd/rpc/" in path
+        or "/usr/libexec/rpcd/" in path
+    ):
+        return False
+
+    summary = (candidate.get("vuln_summary") or "").lower()
+    sinks = [str(s).lower() for s in (candidate.get("all_sinks") or [])]
+    return (
+        "command injection" in summary
+        or _has_command_sink(sinks)
+    )
+
+
+def _infer_best_next_action(
+    success_quality: str,
+    probe_readiness: str,
+    blob_family: Optional[str],
+    top_candidate: Optional[dict] = None,
+    bundle: Optional[dict] = None,
+) -> str:
+    container_ctx = _container_target_context(bundle or {})
     if probe_readiness == "decrypt-probe-ready":
         return "run-decrypt-probe"
     if probe_readiness == "scan-probe-ready":
+        if container_ctx["source_kind"].startswith("embedded-"):
+            return "inspect-container-payload"
         return "inspect-container-payload"
     if probe_readiness == "bundle-probe-ready":
         return "inspect-segmented-bundle"
     if success_quality == "rootfs-success":
+        if not top_candidate:
+            return "review-artifacts"
+        if _is_speculative_dlopen_web_candidate(top_candidate):
+            return "review-artifacts"
+        if _is_indirect_rpc_helper_candidate(top_candidate):
+            return "review-artifacts"
+        name = str(top_candidate.get("name") or "").lower()
+        sinks = [str(s).lower() for s in (top_candidate.get("all_sinks") or [])]
+        if (
+            name in {"httpd", "boa", "lighttpd", "uhttpd"}
+            and top_candidate.get("web_exposed")
+            and not top_candidate.get("handler_surface")
+            and not (top_candidate.get("flow_type") or "")
+            and any(s.startswith("function ") for s in sinks)
+            and not _has_command_sink(sinks)
+        ):
+            return "review-artifacts"
         return "triage-top-candidates"
     if success_quality == "blob-success":
         if blob_family == "tenda-openssl-container":
@@ -92,6 +317,8 @@ def _infer_best_next_action(success_quality: str, probe_readiness: str, blob_fam
             return "inspect-container-payload"
         if blob_family == "tp-link-segmented-bundle":
             return "inspect-segmented-bundle"
+        if container_ctx["source_kind"] in {"embedded-gzip", "embedded-xz", "embedded-lzma", "embedded-zip"}:
+            return "inspect-container-payload"
         return "expand-binary-signals"
     return "review-artifacts"
 
@@ -103,13 +330,22 @@ def _infer_top_risk_family(
 ) -> str:
     summary_bundle = bundle.get("summary") or {}
     crypto_findings = int(summary_bundle.get("crypto_findings") or 0)
+    cands = _top_candidates(bundle, limit=8)
 
     if success_quality == "blob-success":
+        for cand in cands:
+            flow_type = (cand.get("flow_type") or "").lower()
+            summary = (cand.get("vuln_summary") or "").lower()
+            sinks = [str(s).lower() for s in (cand.get("all_sinks") or [])]
+            if "overflow" in summary or "buffer_overflow" in flow_type:
+                return "memory-corruption"
+            if any(s in sinks for s in ("strcpy", "sprintf", "memcpy", "memmove")):
+                return "memory-corruption"
         return "container-analysis"
+
     if probe_readiness in {"decrypt-probe-ready", "scan-probe-ready", "bundle-probe-ready"}:
         return "container-analysis"
 
-    cands = _top_candidates(bundle, limit=8)
     for cand in cands:
         flow_type = (cand.get("flow_type") or "").lower()
         sinks = [str(s).lower() for s in (cand.get("all_sinks") or [])]
@@ -118,8 +354,22 @@ def _infer_top_risk_family(
         missing_links = set(cand.get("missing_links") or [])
         endpoints = [str(ep).lower() for ep in (cand.get("endpoints") or [])]
         handler_surface = bool(cand.get("handler_surface"))
+        name = str(cand.get("name") or "").lower()
 
         if flow_type == "shell_var_injection" and not cand.get("web_exposed") and not endpoints:
+            return "no-clear-rce"
+        if (
+            name in {"httpd", "boa", "lighttpd", "uhttpd"}
+            and cand.get("web_exposed")
+            and not handler_surface
+            and not flow_type
+            and any(s.startswith("function ") for s in sinks)
+            and not _has_command_sink(sinks)
+        ):
+            return "no-clear-rce"
+        if _is_speculative_dlopen_web_candidate(cand):
+            return "no-clear-rce"
+        if _is_indirect_rpc_helper_candidate(cand):
             return "no-clear-rce"
         if (
             not cand.get("web_exposed")
@@ -154,15 +404,13 @@ def _infer_top_risk_family(
                 return "crypto-risk"
 
         if cand.get("web_exposed") and confidence in {"HIGH", "MEDIUM"}:
-            if "command injection" in summary and any(
-                tok in " ".join(sinks) for tok in ("os.execute", "/bin/sh", "session::system", "popen", "system", "exec")
-            ):
+            if "command injection" in summary and _has_command_sink(sinks):
                 return "cmd-injection"
 
         if "overflow" in summary or "buffer_overflow" in flow_type:
             return "memory-corruption"
 
-        if "cmd_injection" in flow_type or any(s in sinks for s in ("system", "popen", "exec", "/bin/sh", "command")):
+        if "cmd_injection" in flow_type or _has_command_sink(sinks):
             return "cmd-injection"
         if any(s in sinks for s in ("strcpy", "sprintf", "memcpy", "memmove")):
             return "memory-corruption"
@@ -175,6 +423,50 @@ def _infer_top_risk_family(
     if bundle.get("container_targets"):
         return "container-analysis"
     return "no-clear-rce"
+
+
+def _infer_encrypted_container(
+    packet: dict,
+    *,
+    probe_readiness: str,
+    blob_family: str,
+) -> bool:
+    if blob_family == "tenda-openssl-container":
+        return True
+    if probe_readiness == "decrypt-probe-ready":
+        return True
+
+    top_candidates = packet.get("evidence", {}).get("top_candidates") or []
+    container_targets = packet.get("evidence", {}).get("container_targets") or []
+
+    for cand in top_candidates:
+        summary = (cand.get("vuln_summary") or "").lower()
+        next_steps = " ".join(cand.get("next_steps") or []).lower()
+        if "unsigned/nosign" in summary or "nosign build marker" in summary:
+            continue
+        if any(
+            token in summary or token in next_steps
+            for token in (
+                "encrypted or signed vendor firmware container",
+                "signed vendor firmware container",
+                "encrypted vendor firmware container",
+                "cloud firmware container",
+                "decryption key",
+                "decrypt or verify routine",
+                " aes",
+            )
+        ):
+            return True
+
+    for target in container_targets:
+        vendor_guess = (target.get("vendor_guess") or "").lower()
+        probe_type = (target.get("probe_type") or "").lower()
+        if probe_type == "container-decrypt-probe":
+            return True
+        if probe_type == "container-scan-probe" and blob_family == "generic-container":
+            return True
+
+    return False
 
 
 def _resolve_results_path(
@@ -242,6 +534,8 @@ def _slim_container_target(target: dict) -> dict:
         "ciphertext_offset": target.get("ciphertext_offset"),
         "ciphertext_size": target.get("ciphertext_size"),
         "openssl_salt": target.get("openssl_salt") or "",
+        "source_kind": target.get("source_kind") or "",
+        "extraction_hints": target.get("extraction_hints") or [],
         "dest": target.get("dest"),
         "ciphertext_dest": target.get("ciphertext_dest"),
         "probe_type": probe.get("probe_type"),
@@ -252,8 +546,12 @@ def _slim_container_target(target: dict) -> dict:
 
 
 def build_review_packet(bundle: dict, corpus_entry: Optional[dict] = None) -> dict:
+    if corpus_entry is None:
+        corpus_entry = _infer_corpus_entry_for_bundle(bundle)
     analysis = bundle.get("analysis") or {}
     summary = bundle.get("summary") or {}
+    input_info = bundle.get("input") or {}
+    original_input = input_info.get("original") or {}
     top_candidates = [_slim_candidate(c) for c in _top_candidates(bundle)]
     container_targets = [_slim_container_target(t) for t in (bundle.get("container_targets") or [])]
     dossiers = [
@@ -267,9 +565,18 @@ def build_review_packet(bundle: dict, corpus_entry: Optional[dict] = None) -> di
     success_quality = corpus_entry.get("success_quality") if corpus_entry else None
     probe_readiness = corpus_entry.get("probe_readiness") if corpus_entry else None
     blob_family = corpus_entry.get("blob_family") if corpus_entry else None
+    if success_quality is None:
+        success_quality = _infer_success_quality_from_bundle(bundle)
+    if probe_readiness is None:
+        probe_readiness = _infer_probe_readiness_from_bundle(bundle, success_quality)
+    if blob_family is None:
+        blob_family = _infer_blob_family_from_bundle(bundle, success_quality)
     web_surface_detected = corpus_entry.get("web_surface_detected") if corpus_entry else None
-    if web_surface_detected is None and summary.get("web_exposed") is not None:
-        web_surface_detected = bool(summary.get("web_exposed"))
+    summary_web_exposed = summary.get("web_exposed")
+    if summary_web_exposed is not None:
+        web_surface_detected = bool(summary_web_exposed)
+    elif web_surface_detected is None and analysis.get("mode") == "iot_web":
+        web_surface_detected = True
 
     packet = {
         "schema_version": "2026-04-21",
@@ -278,8 +585,8 @@ def build_review_packet(bundle: dict, corpus_entry: Optional[dict] = None) -> di
             "vendor": (corpus_entry or {}).get("vendor"),
             "model": (corpus_entry or {}).get("model"),
             "version": (corpus_entry or {}).get("version"),
-            "local_filename": (corpus_entry or {}).get("local_filename"),
-            "input_type": (corpus_entry or {}).get("input_type"),
+            "local_filename": (corpus_entry or {}).get("local_filename") or os.path.basename(original_input.get("path") or ""),
+            "input_type": (corpus_entry or {}).get("input_type") or original_input.get("type"),
             "product_class": (corpus_entry or {}).get("product_class"),
             "run_id": bundle.get("run_id"),
             "run_dir": bundle.get("run_dir"),
@@ -402,6 +709,8 @@ def build_compact_packet(packet: dict) -> dict:
             "name": target.get("name"),
             "vendor_guess": target.get("vendor_guess"),
             "crypto_profile": target.get("crypto_profile"),
+            "source_kind": target.get("source_kind"),
+            "extraction_hints": target.get("extraction_hints") or [],
             "payload_offset": target.get("payload_offset"),
             "ciphertext_offset": target.get("ciphertext_offset"),
             "openssl_salt": target.get("openssl_salt"),
@@ -437,7 +746,7 @@ def build_gold_stub(packet: dict) -> dict:
     blob_family = engine.get("blob_family") or "none"
     top_candidates = packet["evidence"].get("top_candidates") or []
     top = top_candidates[0] if top_candidates else {}
-    inferred_next_action = _infer_best_next_action(success_quality, probe_readiness, blob_family)
+    inferred_next_action = _infer_best_next_action(success_quality, probe_readiness, blob_family, top, bundle=packet.get("evidence") or {})
     if (
         success_quality == "rootfs-success"
         and (top.get("flow_type") or "").lower() == "shell_var_injection"
@@ -454,13 +763,19 @@ def build_gold_stub(packet: dict) -> dict:
         and any(link in set(top.get("missing_links") or []) for link in ("exact_input_unknown", "dispatch_unknown"))
     ):
         inferred_next_action = "review-artifacts"
+    if success_quality == "rootfs-success" and _is_speculative_dlopen_web_candidate(top):
+        inferred_next_action = "review-artifacts"
     labels = {
         "has_rootfs": success_quality == "rootfs-success",
         "has_web_ui": bool(engine.get("web_surface_detected") or engine.get("analysis_mode") == "iot_web"),
         "artifact_kind": success_quality,
         "probe_readiness": probe_readiness,
         "blob_family": blob_family,
-        "encrypted_container": blob_family == "tenda-openssl-container",
+        "encrypted_container": _infer_encrypted_container(
+            packet,
+            probe_readiness=probe_readiness,
+            blob_family=blob_family,
+        ),
         "best_next_action": inferred_next_action,
         "top_risk_family": _infer_top_risk_family(
             {
