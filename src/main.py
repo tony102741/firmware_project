@@ -11,7 +11,10 @@ from pathlib import Path
 # Ensure src/core/ is on sys.path so that 'from parser.init_parser import ...'
 # resolves to src/core/parser/init_parser.py regardless of how this script is
 # invoked (directly, via pipeline.py subprocess, or with a manual PYTHONPATH).
+_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 _CORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "core")
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
 if _CORE_DIR not in sys.path:
     sys.path.insert(0, _CORE_DIR)
 
@@ -28,6 +31,11 @@ from analyzer.cve_triage import select_cve_candidates, explain_triage
 from analyzer.scoring import is_logging_only_sink
 from analyzer.crypto_scanner import scan_crypto_material
 from analyzer.upgrade_analyzer import scan_upgrade_scripts
+from research_tools.architecture_metadata import (
+    SCHEMA_VERSION as ARCH_SCHEMA_VERSION,
+    collect_architecture_artifacts,
+    normalize_target_metadata,
+)
 
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -3075,8 +3083,23 @@ def _emit_analysis_bundle(mode, mode_reason, result, *, output_path=None, dossie
                 )
             print(line, flush=True)
 
+    target_metadata = normalize_target_metadata(
+        _INPUT_PATH,
+        original_input_path=_ORIGINAL_INPUT_PATH,
+        input_type=_INPUT_TYPE,
+        run_id=_RUN_ID,
+    )
+    architecture_artifacts = collect_architecture_artifacts(
+        SYSTEM_PATH,
+        vendor_path=VENDOR_PATH,
+        candidates=snapshots,
+        analysis_reason=mode_reason,
+        target_metadata=target_metadata,
+    )
+
     bundle = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "artifact_schema_version": ARCH_SCHEMA_VERSION,
         "run_id": _RUN_ID,
         "run_dir": _safe_relpath(_RUN_DIR),
         "input": {
@@ -3095,6 +3118,18 @@ def _emit_analysis_bundle(mode, mode_reason, result, *, output_path=None, dossie
             "system_path": _safe_relpath(SYSTEM_PATH),
             "vendor_path": _safe_relpath(VENDOR_PATH),
         },
+        "target_metadata": architecture_artifacts.get("target_metadata") or target_metadata,
+        "architecture_profile": architecture_artifacts.get("architecture_profile") or {},
+        "management_inventory": architecture_artifacts.get("management_inventory") or {},
+        "service_topology": architecture_artifacts.get("service_topology") or {},
+        "config_backend": architecture_artifacts.get("config_backend") or {},
+        "helper_script_inventory": architecture_artifacts.get("helper_script_inventory") or {},
+        "filesystem_inventory": architecture_artifacts.get("filesystem_inventory") or {},
+        "command_materialization_features": architecture_artifacts.get("command_materialization_features") or {},
+        "execution_wrapper_features": architecture_artifacts.get("execution_wrapper_features") or {},
+        "extraction_quality_flags": architecture_artifacts.get("extraction_quality_flags") or {},
+        "extraction_evidence": architecture_artifacts.get("extraction_evidence") or {},
+        "artifact_paths": architecture_artifacts.get("artifact_paths") or {},
         "summary": _json_safe(result.get("summary") or {}),
         "candidates": snapshots,
         "cve_candidates": _json_safe([

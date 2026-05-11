@@ -14,11 +14,53 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+ARCH_MARKERS = {
+    "uhttpd": ["bin/uhttpd", "usr/sbin/uhttpd", "sbin/uhttpd"],
+    "boa": ["bin/boa", "usr/sbin/boa", "sbin/boa"],
+    "lighttpd": ["usr/sbin/lighttpd", "sbin/lighttpd"],
+    "httpd": ["bin/httpd", "usr/sbin/httpd", "sbin/httpd"],
+    "nginx": ["usr/sbin/nginx", "sbin/nginx"],
+    "luci": ["usr/lib/lua/luci", "www/luci-static"],
+    "cgi-bin": ["www/cgi-bin", "usr/lib/cgi-bin", "cgi-bin"],
+    "boafrm": ["www/boafrm", "web/boafrm"],
+    "procd": ["sbin/procd"],
+    "rpcd": ["sbin/rpcd", "usr/sbin/rpcd"],
+    "ubus": ["sbin/ubus", "bin/ubus", "usr/sbin/ubus"],
+    "uci": ["sbin/uci", "bin/uci"],
+    "etc-config": ["etc/config"],
+    "etc-initd": ["etc/init.d"],
+    "apmib": ["bin/flash", "lib/libapmib.so", "lib/libapmib"],
+    "nvram": ["usr/sbin/nvram", "sbin/nvram", "bin/nvram"],
+    "mtk-wifi": ["sbin/iwpriv", "lib/wifi", "etc/wireless"],
+}
+
+ARCH_HELPERS = [
+    "config_generate",
+    "smp.sh",
+    "smp-mt76.sh",
+    "wifi_check_country",
+    "getfirm",
+    "offline_download_monitor.lua",
+    "mtkwifi.lua",
+    "autoupgrade.lua",
+    "system.lua",
+    "easycwmp",
+    "dut_auto_upgrade",
+    "opkg",
+    "ndppd",
+    "connmode",
+    "firmware.lua",
+    "easymesh_network.lua",
+]
 
 
 KNOWN_FP_REGRESSIONS = [
@@ -66,6 +108,312 @@ KNOWN_ISSUE_SUPPRESSIONS = [
 def _norm(text: str | None) -> str:
     raw = str(text or "").lower()
     return "".join(ch for ch in raw if ch.isalnum())
+
+
+def _stable_id(*parts: str, size: int = 12) -> str:
+    joined = "||".join(str(part or "") for part in parts)
+    return hashlib.sha1(joined.encode("utf-8")).hexdigest()[:size]
+
+
+def _component_family(name: str | None) -> str:
+    raw = str(name or "").strip().lower()
+    if not raw:
+        return "unknown"
+    raw = raw.split(":")[0]
+    if ".lua/" in raw:
+        return raw
+    raw = raw.split("::")[0]
+    raw = raw.split("(")[0]
+    return raw.strip()
+
+
+def _command_template(candidate: dict) -> str:
+    sink = str(candidate.get("confirmed_sink") or "").lower()
+    all_sinks = " || ".join(str(x).lower() for x in (candidate.get("all_sinks") or []))
+    text = " ".join([
+        sink,
+        all_sinks,
+        str(candidate.get("vuln_summary") or "").lower(),
+    ])
+    if "system.$cfg" in text:
+        return "system.$cfg"
+    if "eval `$getmib" in text or ("getmib" in text and "eval" in text):
+        return "eval-getmib"
+    if "session::system(" in text:
+        return "session::system"
+    if "os.execute" in text:
+        return "os.execute"
+    if "io.popen" in text or re.search(r"\bpopen\b", text):
+        return "popen"
+    if "iwpriv" in text and " set " in text:
+        return "iwpriv-set"
+    if "grep -v grep" in text and "awk" in text:
+        return "grep-awk-pipeline"
+    if "curl --user" in text:
+        return "curl-user-template"
+    if "wget -o /tmp/$filename" in text or "wget -o /tmp/" in text:
+        return "wget-output-template"
+    if "rm -rf $tmpdir/$subdev" in text:
+        return "rm-subdev-template"
+    if "rm -f $productinfo" in text:
+        return "rm-productinfo-template"
+    if "echo %s" in text and (">" in text):
+        return "echo-percent-redirect"
+    if "/bin/sh" in text:
+        return "/bin/sh"
+    if "system" in text:
+        return "system"
+    if "exec" in text:
+        return "exec"
+    return str(candidate.get("flow_type") or "unknown").lower()
+
+
+def _source_type(candidate: dict) -> str:
+    confirmed_input = str(candidate.get("confirmed_input") or "").lower()
+    endpoint = str(candidate.get("endpoint_input") or "").lower()
+    config_keys = " ".join(str(x).lower() for x in (candidate.get("config_keys") or []))
+    name = str(candidate.get("name") or candidate.get("raw_name") or "").lower()
+    if confirmed_input == "query_string":
+        return "http-query"
+    if any(tok in endpoint for tok in ("/upload", "/restore", "/firmware", "multipart")):
+        return "upload-metadata"
+    if endpoint not in {"", "unconfirmed"}:
+        return "management-endpoint"
+    if any(tok in config_keys for tok in ("apmib_get", "apmib_set", "mib", "getmib", "flash", "uci", "nvram")):
+        return "config-mib"
+    if any(tok in name for tok in ("repeater", "site-survey", "easymesh", "mesh", "wps", "wireless")):
+        return "wireless-control-plane"
+    if candidate.get("config_keys"):
+        return "config-derived"
+    return "unconfirmed"
+
+
+def _sink_type(candidate: dict) -> str:
+    sink = str(candidate.get("confirmed_sink") or "").lower()
+    all_sinks = " ".join(str(x).lower() for x in (candidate.get("all_sinks") or []))
+    text = " ".join([sink, all_sinks])
+    if any(tok in text for tok in ("os.execute", "system", "/bin/sh", "popen", "io.popen", "exec")):
+        return "shell-exec"
+    if any(tok in text for tok in ("strcpy", "sprintf", "strcat", "memcpy", "memmove", "sscanf", "fprintf", "printf")):
+        return "copy-format"
+    return "unknown"
+
+
+def _execution_mode(candidate: dict) -> str:
+    source_type = _source_type(candidate)
+    template = _command_template(candidate)
+    endpoint = str(candidate.get("endpoint_input") or "").lower()
+    if source_type == "http-query":
+        return "direct"
+    if source_type in {"config-mib", "config-derived"} or "getmib" in template:
+        return "deferred"
+    if source_type == "upload-metadata":
+        return "materialized"
+    if endpoint not in {"", "unconfirmed"}:
+        return "management-plane"
+    return "operational"
+
+
+def _recurrence_confidence(candidate: dict) -> str:
+    verdict = _candidate_verdict(candidate)
+    smell = _derive_smell_strength(candidate)
+    if verdict == "cve-ready":
+        return "cve-ready"
+    if verdict == "promising":
+        return "manually-prioritized-candidate"
+    if smell == "strong-smell":
+        return "strong-candidate"
+    if smell == "medium-smell":
+        return "medium-candidate"
+    if _candidate_verdict_reason(candidate).startswith("reject:"):
+        return "suppressed"
+    return "idiom-only"
+
+
+def _false_positive_reason(candidate: dict) -> str:
+    verdict_reason = _candidate_verdict_reason(candidate)
+    if verdict_reason.startswith("reject:") or "false-positive-risk:" in verdict_reason:
+        return verdict_reason
+    risks = candidate.get("false_positive_risks") or []
+    if risks:
+        return f"risk:{sorted(str(r) for r in risks)[0]}"
+    return ""
+
+
+def _parse_recovered_components(bundle: dict) -> list[str]:
+    analysis = bundle.get("analysis") or {}
+    reason = str(analysis.get("reason") or "").lower()
+    candidates = bundle.get("candidates") or []
+    names = []
+    for cand in candidates:
+        if cand.get("web_exposed") or cand.get("handler_surface"):
+            names.append(_component_family(cand.get("name") or cand.get("raw_name")))
+    components = []
+    if "uhttpd" in reason:
+        components.append("uhttpd")
+    if "boa" in reason:
+        components.append("boa")
+    if "httpd" in reason:
+        components.append("httpd")
+    if "lighttpd" in reason:
+        components.append("lighttpd")
+    if "/www" in reason or "/cgi-bin" in reason:
+        components.append("web-assets")
+    components.extend(sorted({name for name in names if name and name != "unknown"})[:8])
+    return sorted(dict.fromkeys(components))
+
+
+def _resolve_analysis_root(results_path: Path | None, analysis_path: str | None) -> Path | None:
+    if not analysis_path:
+        return None
+    raw = Path(str(analysis_path))
+    candidates = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        if results_path:
+            candidates.append((results_path.parent / raw).resolve())
+        candidates.append((PROJECT_ROOT / raw).resolve())
+        candidates.append((Path("/") / raw).resolve())
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _root_has_any(root: Path, rel_paths: list[str]) -> bool:
+    return any((root / rel).exists() for rel in rel_paths)
+
+
+def _root_glob_exists(root: Path, pattern: str) -> bool:
+    try:
+        next(root.rglob(pattern))
+        return True
+    except StopIteration:
+        return False
+    except Exception:
+        return False
+
+
+def _infer_architecture_family(markers: set[str], helper_names: list[str], success_quality: str) -> str:
+    helper_set = set(helper_names)
+    if success_quality in {"fallback-success", "missing"} or not markers:
+        return "opaque-or-partial"
+    if {"boa", "apmib"} <= markers:
+        return "legacy-boa-apmib"
+    if {"httpd", "lighttpd", "nvram"} <= markers:
+        return "dual-httpd-lighttpd-nvram"
+    if {"luci", "uci", "ubus"} <= markers and "mtkwifi.lua" in helper_set:
+        return "openwrt-mtk-lua-wireless"
+    if {"luci", "uci", "ubus", "uhttpd"} <= markers and {"config_generate", "smp.sh"} & helper_set:
+        return "openwrt-shell-helper-sdk"
+    if {"luci", "uci", "ubus", "uhttpd"} <= markers and {"getfirm", "wifi_check_country", "ndppd"} & helper_set:
+        return "openwrt-vendor-management-stack"
+    if {"luci", "uci", "ubus", "nginx"} <= markers:
+        return "openwrt-nginx-service-stack"
+    if {"lighttpd", "cgi-bin", "mtk-wifi"} <= markers:
+        return "lighttpd-cgi-mtk"
+    if {"luci", "uci", "ubus"} <= markers:
+        return "openwrt-derived-generic"
+    return "mixed-embedded-control-plane"
+
+
+def _architecture_provenance_level(
+    architecture_family: str,
+    markers: set[str],
+    helper_names: list[str],
+    vendor: str,
+) -> tuple[str, str]:
+    helper_set = set(helper_names)
+    if architecture_family == "opaque-or-partial":
+        return "speculative-similarity", "insufficient filesystem recovery; architecture inference is based on partial artifacts only"
+    if architecture_family == "legacy-boa-apmib":
+        return "probable-shared-lineage", "boa plus apmib is a strong legacy SDK signature, but this pass does not prove OEM provenance"
+    if architecture_family == "openwrt-shell-helper-sdk" and {"config_generate", "smp.sh"} <= helper_set:
+        return "probable-shared-lineage", "shared OpenWrt-style layout plus repeated shell-helper names suggests reused SDK or OEM helper layers"
+    if architecture_family == "openwrt-vendor-management-stack" and {"getfirm", "wifi_check_country", "ndppd"} & helper_set:
+        return "probable-shared-lineage", "the same management handlers and config workflow recur within a consistent OpenWrt-derived layout"
+    if architecture_family == "openwrt-mtk-lua-wireless":
+        return "heuristic-similarity", "Mediatek wireless Lua and OpenWrt-style layout recur, but provenance remains architecture-level only"
+    if architecture_family in {"dual-httpd-lighttpd-nvram", "lighttpd-cgi-mtk"}:
+        return "heuristic-similarity", "service topology and config style recur, but exact reuse may reflect convergent vendor design"
+    if architecture_family == "openwrt-nginx-service-stack":
+        return "heuristic-similarity", "layout strongly resembles an OpenWrt-derived service stack with custom web fronting"
+    if {"luci", "uci", "ubus"} <= markers:
+        return "heuristic-similarity", "shared control-plane building blocks indicate architectural reuse more than exact code provenance"
+    return "speculative-similarity", f"markers for {vendor or 'unknown vendor'} are too generic to claim stronger lineage"
+
+
+def _scan_architecture_profile(item: dict) -> dict:
+    corpus = item.get("corpus") or {}
+    bundle = item.get("bundle") or {}
+    results_path = item.get("results_path")
+    analysis = bundle.get("analysis") or {}
+    root = _resolve_analysis_root(results_path, analysis.get("system_path"))
+    markers = []
+    helper_names = []
+    if root and root.exists():
+        for name, rel_paths in ARCH_MARKERS.items():
+            if _root_has_any(root, rel_paths):
+                markers.append(name)
+        for helper in ARCH_HELPERS:
+            if _root_glob_exists(root, helper):
+                helper_names.append(helper)
+    marker_set = set(markers)
+    web_stack = [
+        name for name in ("boa", "uhttpd", "lighttpd", "httpd", "nginx", "luci", "cgi-bin", "boafrm")
+        if name in marker_set
+    ]
+    config_layers = [name for name in ("apmib", "uci", "nvram", "etc-config", "ubus") if name in marker_set]
+    execution_wrappers = [
+        name for name in ("system.lua", "config_generate", "smp.sh", "smp-mt76.sh", "mtkwifi.lua", "opkg", "ndppd", "easycwmp")
+        if name in helper_names
+    ]
+    orchestration_hooks = [
+        name for name in ("autoupgrade.lua", "dut_auto_upgrade", "firmware.lua", "easymesh_network.lua", "offline_download_monitor.lua", "getfirm", "connmode")
+        if name in helper_names
+    ]
+    if "procd" in marker_set:
+        init_framework = "procd+init.d"
+    elif "etc-initd" in marker_set:
+        init_framework = "init.d"
+    else:
+        init_framework = "unknown"
+    if {"rpcd", "ubus"} <= marker_set:
+        service_topology = "rpcd+ubus-control-plane"
+    elif "ubus" in marker_set:
+        service_topology = "ubus-control-plane"
+    elif "cgi-bin" in marker_set or "boafrm" in marker_set:
+        service_topology = "cgi-handler-control-plane"
+    else:
+        service_topology = "opaque-or-minimal"
+    family = _infer_architecture_family(marker_set, helper_names, str(corpus.get("success_quality") or "missing"))
+    provenance_level, rationale = _architecture_provenance_level(
+        family,
+        marker_set,
+        helper_names,
+        str(corpus.get("vendor") or ""),
+    )
+    helper_signature = ",".join(sorted(helper_names[:8])) or "none"
+    marker_signature = ",".join(sorted(markers)) or "none"
+    return {
+        "system_root": str(root) if root else "",
+        "rootfs_recovered": bool(root and root.exists()),
+        "filesystem_markers": sorted(markers),
+        "web_stack": web_stack,
+        "config_layers": config_layers,
+        "init_framework": init_framework,
+        "service_topology": service_topology,
+        "helper_conventions": sorted(helper_names),
+        "execution_wrappers": execution_wrappers,
+        "orchestration_hooks": orchestration_hooks,
+        "helper_signature": helper_signature,
+        "marker_signature": marker_signature,
+        "architecture_family": family,
+        "provenance_level": provenance_level,
+        "provenance_rationale": rationale,
+        "architecture_cluster_hint": f"ac-{_stable_id(family, marker_signature, helper_signature)}",
+    }
 
 
 def load_json(path: str | Path) -> dict:
@@ -125,7 +473,10 @@ def build_manifest_index(runs_root: Path) -> dict[str, list[dict]]:
         run_id = str(manifest.get("run_id") or manifest_path.parent.name or "")
         if not run_id:
             continue
-        resolved = _resolve_result_path(manifest_path, manifest.get("result_path"))
+        resolved = _resolve_result_path(
+            manifest_path,
+            manifest.get("canonical_result_path") or manifest.get("result_path"),
+        )
         row = {
             "manifest_path": manifest_path,
             "manifest": manifest,
@@ -177,17 +528,66 @@ def _find_manifest_row(manifest_index: dict[str, list[dict]], corpus_row: dict) 
 
 def build_loose_results_index() -> dict[str, list[Path]]:
     index: dict[str, list[Path]] = defaultdict(list)
-    for path in Path("/tmp").glob("*results*.json"):
+    paths = list(Path("/tmp").glob("*results*.json"))
+    paths.extend(sorted((PROJECT_ROOT / "runs").glob("**/results.json")))
+    for path in paths:
         keys = {
             _norm(path.name),
             _norm(path.stem),
         }
+        for parent in path.parts[-5:]:
+            if len(parent) >= 4:
+                keys.add(_norm(parent))
         for token in path.stem.replace("-", "_").split("_"):
             if len(token) >= 4:
                 keys.add(_norm(token))
         for key in keys:
             if key:
                 index[key].append(path)
+    return index
+
+
+def build_batch_results_index(batch_summary: dict | None) -> dict[str, Path]:
+    index: dict[str, Path] = {}
+    if not batch_summary:
+        return index
+    for row in batch_summary.get("results") or []:
+        raw = row.get("results_json")
+        if not raw:
+            continue
+        path = Path(str(raw))
+        if not path.is_file():
+            continue
+        for key in (
+            str(row.get("corpus_id") or "").strip(),
+            str(row.get("sample") or "").strip(),
+            str(Path(str(row.get("sample") or "")).stem).strip(),
+        ):
+            if key:
+                index[key] = path
+    return index
+
+
+def build_canonical_results_index() -> dict[str, Path]:
+    index: dict[str, Path] = {}
+    for path in sorted((PROJECT_ROOT / "runs").glob("**/results.json")):
+        try:
+            bundle = load_json(path)
+        except Exception:
+            continue
+        target = bundle.get("target_metadata") or {}
+        input_obj = bundle.get("input") or {}
+        originals = [
+            str(target.get("corpus_id") or "").strip(),
+            str(target.get("local_filename") or "").strip(),
+            str(bundle.get("run_id") or "").strip(),
+            str(Path(str((input_obj.get("original") or {}).get("path") or "")).name).strip(),
+            str(Path(str((input_obj.get("resolved") or {}).get("path") or "")).name).strip(),
+        ]
+        for raw in originals:
+            if raw:
+                index[raw] = path
+                index[_norm(raw)] = path
     return index
 
 
@@ -233,13 +633,32 @@ def _find_loose_results(loose_index: dict[str, list[Path]], corpus_row: dict) ->
     return None
 
 
-def load_corpus_bundles(corpus_rows: list[dict]) -> list[dict]:
+def load_corpus_bundles(corpus_rows: list[dict], batch_summary: dict | None = None) -> list[dict]:
     manifest_index = build_manifest_index(PROJECT_ROOT / "runs")
     loose_index = build_loose_results_index()
+    batch_index = build_batch_results_index(batch_summary)
+    canonical_index = build_canonical_results_index()
     bundles = []
     for row in corpus_rows:
         manifest_row = _find_manifest_row(manifest_index, row)
-        results_path = manifest_row.get("results_path") if manifest_row else None
+        run_id = str(row.get("run_id") or "").strip()
+        run_id_results = (PROJECT_ROOT / "runs" / run_id / "results.json") if run_id else None
+        results_path = (
+            (run_id_results if run_id_results and run_id_results.is_file() else None)
+            or
+            canonical_index.get(str(row.get("corpus_id") or "").strip())
+            or canonical_index.get(_norm(str(row.get("corpus_id") or "").strip()))
+            or canonical_index.get(str(row.get("local_filename") or "").strip())
+            or canonical_index.get(_norm(str(row.get("local_filename") or "").strip()))
+            or canonical_index.get(str(Path(str(row.get("local_filename") or "")).name).strip())
+            or canonical_index.get(_norm(str(Path(str(row.get("local_filename") or "")).name).strip()))
+            or
+            batch_index.get(str(row.get("corpus_id") or "").strip())
+            or batch_index.get(str(row.get("local_filename") or "").strip())
+            or batch_index.get(str(Path(str(row.get("local_filename") or "")).stem).strip())
+        )
+        if results_path is None:
+            results_path = manifest_row.get("results_path") if manifest_row else None
         manifest = manifest_row.get("manifest") if manifest_row else None
         manifest_path = manifest_row.get("manifest_path") if manifest_row else None
         if results_path is None:
@@ -265,6 +684,858 @@ def load_corpus_bundles(corpus_rows: list[dict]) -> list[dict]:
             "bundle": bundle,
         })
     return bundles
+
+
+def build_target_summaries(bundles: list[dict]) -> list[dict]:
+    rows = []
+    for item in bundles:
+        corpus = item.get("corpus") or {}
+        bundle = item.get("bundle") or {}
+        analysis = bundle.get("analysis") or {}
+        candidates = bundle.get("candidates") or []
+        emitted_target = bundle.get("target_metadata") or {}
+        fallback_architecture = _scan_architecture_profile(item)
+        emitted_architecture_profile = bundle.get("architecture_profile") or {}
+        architecture_profile = emitted_architecture_profile or fallback_architecture
+        command_patterns = Counter()
+        config_mib_flows = Counter()
+        target_candidates = []
+        for cand in candidates:
+            command_patterns[_command_template(cand)] += 1
+            source_type = _source_type(cand)
+            execution_mode = _execution_mode(cand)
+            if source_type in {"config-mib", "config-derived"} or execution_mode == "deferred":
+                config_mib_flows[f"{source_type}->{_command_template(cand)}"] += 1
+            target_candidates.append({
+                "component": str(cand.get("name") or cand.get("raw_name") or "unknown"),
+                "component_family": _component_family(cand.get("name") or cand.get("raw_name")),
+                "command_template": _command_template(cand),
+                "source_type": source_type,
+                "sink_type": _sink_type(cand),
+                "execution_mode": execution_mode,
+                "candidate_confidence": _recurrence_confidence(cand),
+                "candidate_score": int(cand.get("score") or 0),
+                "priority_score": _candidate_review_priority(cand)[0],
+                "verdict": _candidate_verdict(cand),
+                "verdict_reason": _candidate_verdict_reason(cand),
+                "false_positive_reason": _false_positive_reason(cand),
+            })
+        rows.append({
+            "corpus_id": emitted_target.get("corpus_id") or corpus.get("corpus_id"),
+            "vendor": emitted_target.get("vendor") or corpus.get("vendor"),
+            "model": emitted_target.get("model") or corpus.get("model"),
+            "version": emitted_target.get("version") or corpus.get("version"),
+            "extraction_status": corpus.get("extraction_status") or "missing",
+            "analysis_status": corpus.get("analysis_status") or "missing",
+            "success_quality": corpus.get("success_quality") or "missing",
+            "probe_readiness": corpus.get("probe_readiness") or "missing",
+            "blob_family": corpus.get("blob_family") or "none",
+            "suspected_stack": corpus.get("suspected_stack") or [],
+            "arch": corpus.get("arch") or "",
+            "analysis_mode": analysis.get("mode") or "unknown",
+            "analysis_reason": analysis.get("reason") or "unknown",
+            "recovered_components": _parse_recovered_components(bundle),
+            "target_metadata": emitted_target,
+            "architecture_profile": architecture_profile,
+            "architecture_family": architecture_profile.get("architecture_family") or fallback_architecture.get("architecture_family") or "unknown",
+            "architecture_fingerprint": architecture_profile.get("architecture_fingerprint") or "",
+            "management_inventory": bundle.get("management_inventory") or {},
+            "service_topology": bundle.get("service_topology") or {},
+            "config_backend": bundle.get("config_backend") or {},
+            "helper_script_inventory": bundle.get("helper_script_inventory") or {},
+            "command_materialization_features": bundle.get("command_materialization_features") or {},
+            "execution_wrapper_features": bundle.get("execution_wrapper_features") or {},
+            "extraction_quality_flags": bundle.get("extraction_quality_flags") or {},
+            "artifact_schema_version": bundle.get("artifact_schema_version") or "",
+            "architecture_artifact_source": "emitted" if emitted_architecture_profile else "report-time-fallback",
+            "fallback_architecture_profile": fallback_architecture,
+            "command_materialization_patterns": command_patterns.most_common(8),
+            "config_mib_flows": config_mib_flows.most_common(8),
+            "candidate_rows": target_candidates,
+        })
+    rows.sort(key=lambda row: (str(row.get("vendor") or ""), str(row.get("model") or ""), str(row.get("version") or "")))
+    return rows
+
+
+def build_recurrence_clusters(target_summaries: list[dict]) -> list[dict]:
+    clusters: dict[tuple[str, str, str, str, str], dict] = {}
+    for target in target_summaries:
+        for cand in target.get("candidate_rows") or []:
+            key = (
+                cand.get("component_family") or "unknown",
+                cand.get("command_template") or "unknown",
+                cand.get("source_type") or "unknown",
+                cand.get("sink_type") or "unknown",
+                cand.get("execution_mode") or "unknown",
+            )
+            cluster = clusters.setdefault(key, {
+                "cluster_id": f"rc-{_stable_id(*key)}",
+                "component_family": key[0],
+                "command_template": key[1],
+                "source_type": key[2],
+                "sink_type": key[3],
+                "execution_mode": key[4],
+                "vendors": set(),
+                "models": set(),
+                "versions": set(),
+                "firmwares": set(),
+                "confidence": Counter(),
+                "verdicts": Counter(),
+                "false_positive_reasons": Counter(),
+                "examples": [],
+            })
+            firmware_label = f"{target.get('vendor')} {target.get('model')} {target.get('version')}"
+            cluster["vendors"].add(str(target.get("vendor") or ""))
+            cluster["models"].add(str(target.get("model") or ""))
+            cluster["versions"].add(str(target.get("version") or ""))
+            cluster["firmwares"].add(firmware_label)
+            cluster["confidence"][cand.get("candidate_confidence") or "unknown"] += 1
+            cluster["verdicts"][cand.get("verdict") or "unknown"] += 1
+            if cand.get("false_positive_reason"):
+                cluster["false_positive_reasons"][cand["false_positive_reason"]] += 1
+            if len(cluster["examples"]) < 6:
+                cluster["examples"].append({
+                    "firmware": firmware_label,
+                    "component": cand.get("component"),
+                    "candidate_confidence": cand.get("candidate_confidence"),
+                    "verdict_reason": cand.get("verdict_reason"),
+                    "priority_score": cand.get("priority_score"),
+                })
+            cand["recurrence_cluster_id"] = cluster["cluster_id"]
+
+    rows = []
+    for cluster in clusters.values():
+        rows.append({
+            "cluster_id": cluster["cluster_id"],
+            "component_family": cluster["component_family"],
+            "command_template": cluster["command_template"],
+            "source_type": cluster["source_type"],
+            "sink_type": cluster["sink_type"],
+            "execution_mode": cluster["execution_mode"],
+            "vendor_count": len(cluster["vendors"]),
+            "model_count": len(cluster["models"]),
+            "version_count": len(cluster["versions"]),
+            "firmware_count": len(cluster["firmwares"]),
+            "confidence": dict(cluster["confidence"]),
+            "verdicts": dict(cluster["verdicts"]),
+            "false_positive_reasons": dict(cluster["false_positive_reasons"]),
+            "examples": cluster["examples"],
+        })
+    rows.sort(key=lambda row: (-int(row["firmware_count"]), -int(row["vendor_count"]), row["cluster_id"]))
+    return rows
+
+
+def build_architecture_clusters(target_summaries: list[dict]) -> list[dict]:
+    clusters: dict[tuple[str, str, str, str, str], dict] = {}
+    for target in target_summaries:
+        profile = target.get("architecture_profile") or {}
+        topology = target.get("service_topology") or {}
+        helper_inventory = target.get("helper_script_inventory") or {}
+        key = (
+            str(profile.get("architecture_family") or "unknown"),
+            str(topology.get("init_framework") or profile.get("init_framework") or "unknown"),
+            str(topology.get("control_plane") or profile.get("service_topology") or "unknown"),
+            str(profile.get("marker_signature") or "none"),
+            str(helper_inventory.get("helper_signature") or profile.get("helper_signature") or "none"),
+        )
+        cluster = clusters.setdefault(key, {
+            "cluster_id": f"ac-{_stable_id(*key)}",
+            "architecture_family": key[0],
+            "init_framework": key[1],
+            "service_topology": key[2],
+            "marker_signature": key[3],
+            "helper_signature": key[4],
+            "vendors": set(),
+            "models": set(),
+            "versions": set(),
+            "firmwares": set(),
+            "success_quality": Counter(),
+            "provenance": Counter(),
+            "helpers": Counter(),
+            "markers": Counter(),
+            "example_targets": [],
+        })
+        firmware_label = f"{target.get('vendor')} {target.get('model')} {target.get('version')}"
+        cluster["vendors"].add(str(target.get("vendor") or ""))
+        cluster["models"].add(str(target.get("model") or ""))
+        cluster["versions"].add(str(target.get("version") or ""))
+        cluster["firmwares"].add(firmware_label)
+        cluster["success_quality"][str(target.get("success_quality") or "missing")] += 1
+        cluster["provenance"][str(profile.get("provenance_level") or "unknown")] += 1
+        for helper in profile.get("helper_conventions") or []:
+            cluster["helpers"][str(helper)] += 1
+        for marker in profile.get("filesystem_markers") or []:
+            cluster["markers"][str(marker)] += 1
+        if len(cluster["example_targets"]) < 6:
+            cluster["example_targets"].append({
+                "firmware": firmware_label,
+                "vendor": target.get("vendor"),
+                "model": target.get("model"),
+                "version": target.get("version"),
+                "success_quality": target.get("success_quality"),
+                "recovered_components": target.get("recovered_components") or [],
+            })
+    rows = []
+    for cluster in clusters.values():
+        rows.append({
+            "cluster_id": cluster["cluster_id"],
+            "architecture_family": cluster["architecture_family"],
+            "init_framework": cluster["init_framework"],
+            "service_topology": cluster["service_topology"],
+            "marker_signature": cluster["marker_signature"],
+            "helper_signature": cluster["helper_signature"],
+            "vendor_count": len(cluster["vendors"]),
+            "model_count": len(cluster["models"]),
+            "version_count": len(cluster["versions"]),
+            "firmware_count": len(cluster["firmwares"]),
+            "success_quality": dict(cluster["success_quality"]),
+            "provenance": dict(cluster["provenance"]),
+            "top_helpers": dict(cluster["helpers"].most_common(8)),
+            "top_markers": dict(cluster["markers"].most_common(10)),
+            "example_targets": cluster["example_targets"],
+        })
+    rows.sort(key=lambda row: (-int(row["firmware_count"]), -int(row["vendor_count"]), row["cluster_id"]))
+    return rows
+
+
+def architecture_clusters_report(target_summaries: list[dict], architecture_clusters: list[dict]) -> tuple[list[dict], list[str]]:
+    lines = ["# Architecture Clusters", ""]
+    if not architecture_clusters:
+        lines.append("(no architecture clusters built)")
+        return architecture_clusters, lines
+    family_counts = Counter(row.get("architecture_family") or "unknown" for row in target_summaries)
+    lines.extend([
+        f"- total clusters: `{len(architecture_clusters)}`",
+        f"- architecture families: `{dict(family_counts)}`",
+        f"- targets summarized: `{len(target_summaries)}`",
+        "",
+    ])
+    for row in architecture_clusters[:20]:
+        lines.extend([
+            f"## {row['cluster_id']}",
+            f"- architecture_family: `{row['architecture_family']}`",
+            f"- init_framework: `{row['init_framework']}`",
+            f"- service_topology: `{row['service_topology']}`",
+            f"- recurrence: `firmwares={row['firmware_count']}, vendors={row['vendor_count']}, models={row['model_count']}, versions={row['version_count']}`",
+            f"- provenance mix: `{row['provenance']}`",
+            f"- success_quality: `{row['success_quality']}`",
+            f"- marker_signature: `{row['marker_signature']}`",
+            f"- helper_signature: `{row['helper_signature']}`",
+            f"- top_helpers: `{row['top_helpers']}`",
+        ])
+        for ex in row.get("example_targets") or []:
+            lines.append(f"- example: `{ex['firmware']} / {ex['success_quality']} / {', '.join(ex.get('recovered_components') or []) or 'no-components'}`")
+        lines.append("")
+    return architecture_clusters, lines
+
+
+def sdk_lineage_hypotheses_report(target_summaries: list[dict], architecture_clusters: list[dict]) -> tuple[list[dict], list[str]]:
+    hypotheses = []
+    for row in architecture_clusters:
+        if int(row.get("firmware_count") or 0) < 2:
+            continue
+        vendors = sorted({str(ex.get("vendor") or "") for ex in (row.get("example_targets") or []) if ex.get("vendor")})
+        if row.get("architecture_family") == "opaque-or-partial":
+            continue
+        if int(row.get("vendor_count") or 0) >= 2:
+            if row.get("provenance", {}).get("probable-shared-lineage"):
+                level = "probable-shared-lineage"
+                why = "same helper and service layout recur across multiple vendors"
+            else:
+                level = "heuristic-similarity"
+                why = "multiple vendors share architecture markers, but helper overlap is weaker"
+        else:
+            level = "heuristic-similarity"
+            why = "same vendor and family show repeat architecture across versions"
+        hypotheses.append({
+            "cluster_id": row["cluster_id"],
+            "architecture_family": row["architecture_family"],
+            "provenance_level": level,
+            "vendor_count": row["vendor_count"],
+            "firmware_count": row["firmware_count"],
+            "vendors": vendors,
+            "helper_signature": row["helper_signature"],
+            "marker_signature": row["marker_signature"],
+            "why": why,
+        })
+    hypotheses.sort(key=lambda row: (
+        {"probable-shared-lineage": 0, "heuristic-similarity": 1, "speculative-similarity": 2}.get(row["provenance_level"], 9),
+        -int(row["vendor_count"]),
+        -int(row["firmware_count"]),
+        row["cluster_id"],
+    ))
+    lines = [
+        "# SDK Lineage Hypotheses",
+        "",
+        "- No cluster in this pass is elevated to `confirmed SDK reuse`; provenance remains architecture-level unless external vendor or OEM evidence is added.",
+        "",
+    ]
+    for row in hypotheses[:20]:
+        lines.extend([
+            f"## {row['cluster_id']}",
+            f"- architecture_family: `{row['architecture_family']}`",
+            f"- provenance_level: `{row['provenance_level']}`",
+            f"- recurrence: `vendors={row['vendor_count']}, firmwares={row['firmware_count']}`",
+            f"- vendors: `{row['vendors']}`",
+            f"- marker_signature: `{row['marker_signature']}`",
+            f"- helper_signature: `{row['helper_signature']}`",
+            f"- rationale: `{row['why']}`",
+            "",
+        ])
+    return hypotheses, lines
+
+
+def orchestration_reuse_patterns_report(target_summaries: list[dict], architecture_clusters: list[dict], recurrence_clusters: list[dict]) -> tuple[list[dict], list[str]]:
+    by_family = defaultdict(lambda: {
+        "targets": 0,
+        "vendors": set(),
+        "helpers": Counter(),
+        "templates": Counter(),
+        "sources": Counter(),
+        "execution_modes": Counter(),
+    })
+    for target in target_summaries:
+        family = str(target.get("architecture_family") or "unknown")
+        slot = by_family[family]
+        slot["targets"] += 1
+        slot["vendors"].add(str(target.get("vendor") or ""))
+        for helper in (target.get("architecture_profile") or {}).get("helper_conventions") or []:
+            slot["helpers"][str(helper)] += 1
+        for cand in target.get("candidate_rows") or []:
+            slot["templates"][str(cand.get("command_template") or "unknown")] += 1
+            slot["sources"][str(cand.get("source_type") or "unknown")] += 1
+            slot["execution_modes"][str(cand.get("execution_mode") or "unknown")] += 1
+    rows = []
+    for family, slot in by_family.items():
+        rows.append({
+            "architecture_family": family,
+            "target_count": slot["targets"],
+            "vendor_count": len(slot["vendors"]),
+            "top_helpers": dict(slot["helpers"].most_common(8)),
+            "top_command_templates": dict(slot["templates"].most_common(8)),
+            "top_source_types": dict(slot["sources"].most_common(6)),
+            "top_execution_modes": dict(slot["execution_modes"].most_common(6)),
+        })
+    rows.sort(key=lambda row: (-int(row["target_count"]), -int(row["vendor_count"]), row["architecture_family"]))
+    lines = ["# Orchestration Reuse Patterns", ""]
+    for row in rows[:12]:
+        lines.extend([
+            f"## {row['architecture_family']}",
+            f"- targets: `{row['target_count']}` / vendors: `{row['vendor_count']}`",
+            f"- top_helpers: `{row['top_helpers']}`",
+            f"- top_command_templates: `{row['top_command_templates']}`",
+            f"- top_source_types: `{row['top_source_types']}`",
+            f"- top_execution_modes: `{row['top_execution_modes']}`",
+            "",
+        ])
+    return rows, lines
+
+
+def extraction_bias_analysis_report(target_summaries: list[dict], architecture_clusters: list[dict]) -> tuple[dict, list[str]]:
+    by_family = defaultdict(Counter)
+    by_quality = Counter()
+    for target in target_summaries:
+        family = str(target.get("architecture_family") or "unknown")
+        quality = str(target.get("success_quality") or "missing")
+        by_family[family][quality] += 1
+        by_quality[quality] += 1
+    rows = {
+        family: dict(counter)
+        for family, counter in sorted(by_family.items(), key=lambda kv: (-sum(kv[1].values()), kv[0]))
+    }
+    lines = [
+        "# Extraction Bias Analysis",
+        "",
+        f"- success_quality_totals: `{dict(by_quality)}`",
+        "",
+        "## Family Bias",
+    ]
+    for family, counter in rows.items():
+        total = sum(counter.values())
+        lines.append(f"- `{family}`: `targets={total}` / `{counter}`")
+    lines.extend([
+        "",
+        "## Bias Notes",
+        "- `opaque-or-partial` targets are structurally underrepresented in architecture inference and recurrence measurements.",
+        "- OpenWrt-derived families are overrepresented because rootfs recovery is more complete and helper scripts survive extraction cleanly.",
+        "- Blob-success and fallback-success targets should be separated in any paper-facing prevalence charts.",
+    ])
+    return {"family_quality_counts": rows, "success_quality_totals": dict(by_quality)}, lines
+
+
+def architecture_level_false_positive_notes_report(target_summaries: list[dict]) -> tuple[list[dict], list[str]]:
+    by_family = defaultdict(lambda: {
+        "candidate_rows": 0,
+        "false_positive_reasons": Counter(),
+        "verdict_reasons": Counter(),
+        "templates": Counter(),
+    })
+    for target in target_summaries:
+        family = str(target.get("architecture_family") or "unknown")
+        slot = by_family[family]
+        for cand in target.get("candidate_rows") or []:
+            slot["candidate_rows"] += 1
+            if cand.get("false_positive_reason"):
+                slot["false_positive_reasons"][str(cand["false_positive_reason"])] += 1
+            slot["verdict_reasons"][str(cand.get("verdict_reason") or "unknown")] += 1
+            slot["templates"][str(cand.get("command_template") or "unknown")] += 1
+    rows = []
+    for family, slot in by_family.items():
+        rows.append({
+            "architecture_family": family,
+            "candidate_rows": slot["candidate_rows"],
+            "false_positive_reasons": dict(slot["false_positive_reasons"].most_common(8)),
+            "verdict_reasons": dict(slot["verdict_reasons"].most_common(8)),
+            "templates": dict(slot["templates"].most_common(8)),
+        })
+    rows.sort(key=lambda row: (-int(row["candidate_rows"]), row["architecture_family"]))
+    lines = ["# Architecture-Level False-Positive Notes", ""]
+    for row in rows[:12]:
+        lines.extend([
+            f"## {row['architecture_family']}",
+            f"- candidate_rows: `{row['candidate_rows']}`",
+            f"- false_positive_reasons: `{row['false_positive_reasons']}`",
+            f"- verdict_reasons: `{row['verdict_reasons']}`",
+            f"- dominant_templates: `{row['templates']}`",
+            "",
+        ])
+    return rows, lines
+
+
+def architecture_artifact_schema_report(target_summaries: list[dict]) -> list[str]:
+    emitted = sum(1 for row in target_summaries if row.get("architecture_artifact_source") == "emitted")
+    lines = [
+        "# Architecture Artifact Schema",
+        "",
+        "- Artifact source of truth is now the analysis bundle rather than report-time filesystem rescans.",
+        f"- Targets with emitted architecture metadata: `{emitted}/{len(target_summaries)}`",
+        "",
+        "## Required Bundle Fields",
+        "- `target_metadata`: canonical vendor/model/version/corpus_id metadata normalized from the input artifact.",
+        "- `architecture_profile`: architecture family, deterministic fingerprint, marker signature, helper signature, provenance level.",
+        "- `management_inventory`: detected web servers, frontends, handler families, management endpoints, analysis reason.",
+        "- `service_topology`: init framework, control plane, web stack, orchestration hooks, topology signature.",
+        "- `config_backend`: config abstraction family and markers such as `uci`, `nvram`, `apmib`, `ubus`.",
+        "- `helper_script_inventory`: normalized helper names plus execution and orchestration helper subsets.",
+        "- `command_materialization_features`: command templates, source types, and execution-mode distributions.",
+        "- `execution_wrapper_features`: normalized execution wrapper names and deterministic wrapper signature.",
+        "- `extraction_quality_flags`: rootfs visibility, vendor-partition visibility, web-asset presence, marker/helper counts.",
+        "",
+        "## Stability Rules",
+        "- All identifiers must be sorted before signature construction.",
+        "- Fingerprints must use only canonicalized strings and fixed field ordering.",
+        "- Report scripts should consume emitted fields first and only fall back for older bundles.",
+    ]
+    return lines
+
+
+def architecture_fingerprint_design_report(target_summaries: list[dict]) -> list[str]:
+    lines = [
+        "# Architecture Fingerprint Design",
+        "",
+        "- Fingerprints are deterministic IDs built from `architecture_family`, `marker_signature`, `helper_signature`, `control_plane`, and `config_backend.family`.",
+        "- Marker signatures are derived from stable filesystem artifacts such as web servers, `luci`, `ubus`, `uci`, `apmib`, `nvram`, and `mtk-wifi` markers.",
+        "- Helper signatures are derived from a fixed normalized helper inventory: `config_generate`, `smp*.sh`, `system.lua`, `mtkwifi.lua`, `opkg`, `ndppd`, `easycwmp`, and related orchestration helpers.",
+        "- The design intentionally avoids candidate scores, timestamps, and report ordering so fingerprints remain stable across reruns with identical extraction state.",
+        "",
+        "## Noisy Inputs To Avoid",
+        "- candidate ranking scores",
+        "- analyst verdicts",
+        "- non-normalized filenames",
+        "- absolute temporary paths",
+        "- inferred-only service labels without filesystem support",
+    ]
+    return lines
+
+
+def metadata_normalization_notes_report(target_summaries: list[dict]) -> list[str]:
+    normalization_sources = Counter(
+        (row.get("target_metadata") or {}).get("normalization_source") or "missing"
+        for row in target_summaries
+    )
+    missing = [
+        row for row in target_summaries
+        if not (row.get("target_metadata") or {}).get("corpus_id")
+    ]
+    lines = [
+        "# Metadata Normalization Notes",
+        "",
+        f"- normalization sources: `{dict(normalization_sources)}`",
+        f"- targets missing normalized corpus_id in emitted metadata: `{len(missing)}`",
+        "",
+        "## Current Status",
+        "- The analysis stage now reuses the corpus filename normalizer instead of inventing report-local vendor/model/version strings.",
+        "- Report-side vendor/model/version grouping should prefer emitted `target_metadata` and only fall back to corpus rows for older bundles.",
+        "- Helper names are lowercased and sorted before signature construction.",
+        "",
+        "## Remaining Cleanup",
+        "- Corpus inventory still contains historically inferred notes and suspected stacks that do not always match emitted architecture metadata.",
+        "- Any future paper-facing dataset export should regenerate corpus rows from canonical emitted target metadata where possible.",
+    ]
+    return lines
+
+
+def cluster_stability_report(target_summaries: list[dict]) -> list[str]:
+    comparable = []
+    for row in target_summaries:
+        emitted = row.get("architecture_profile") or {}
+        fallback = row.get("fallback_architecture_profile") or {}
+        if row.get("architecture_artifact_source") != "emitted":
+            continue
+        if not (
+            (row.get("extraction_quality_flags") or {}).get("rootfs_recovered")
+            or bool(fallback.get("rootfs_recovered"))
+        ):
+            continue
+        comparable.append({
+            "firmware": f"{row.get('vendor')} {row.get('model')} {row.get('version')}",
+            "emitted_family": emitted.get("architecture_family") or "",
+            "fallback_family": fallback.get("architecture_family") or "",
+            "emitted_marker_signature": emitted.get("marker_signature") or "",
+            "fallback_marker_signature": fallback.get("marker_signature") or "",
+            "emitted_helper_signature": emitted.get("helper_signature") or "",
+            "fallback_helper_signature": fallback.get("helper_signature") or "",
+            "fingerprint_present": bool(emitted.get("architecture_fingerprint")),
+        })
+    family_match = sum(1 for row in comparable if row["emitted_family"] == row["fallback_family"])
+    marker_match = sum(1 for row in comparable if row["emitted_marker_signature"] == row["fallback_marker_signature"])
+    helper_match = sum(1 for row in comparable if row["emitted_helper_signature"] == row["fallback_helper_signature"])
+    missing_emitted = [row for row in target_summaries if row.get("architecture_artifact_source") != "emitted"]
+    emitted_without_rootfs = [
+        row for row in target_summaries
+        if row.get("architecture_artifact_source") == "emitted"
+        and not (row.get("extraction_quality_flags") or {}).get("rootfs_recovered")
+    ]
+    lines = [
+        "# Cluster Stability Report",
+        "",
+        f"- comparable emitted vs legacy-fallback targets: `{len(comparable)}`",
+        f"- family agreement: `{family_match}/{len(comparable) if comparable else 0}`",
+        f"- marker-signature agreement: `{marker_match}/{len(comparable) if comparable else 0}`",
+        f"- helper-signature agreement: `{helper_match}/{len(comparable) if comparable else 0}`",
+        f"- targets still requiring report-time fallback: `{len(missing_emitted)}`",
+        f"- emitted targets lacking preserved rootfs for stable comparison: `{len(emitted_without_rootfs)}`",
+        "",
+        "## Stability Notes",
+        "- Current stability numbers measure agreement between emitted analysis-stage metadata and the older report-time inference path.",
+        "- Direct rerun variance is not yet measurable from this single current bundle set; that requires preserving multiple runs per same corpus target.",
+        "- Any mismatch here indicates either earlier report-time drift or an extraction-sensitive marker that should not drive clustering alone.",
+    ]
+    if missing_emitted:
+        lines.extend([
+            "",
+            "## Fallback Targets",
+            *[
+                f"- `{row['vendor']} {row['model']} {row['version']}` / `{row.get('success_quality')}`"
+                for row in missing_emitted[:20]
+            ],
+        ])
+    return lines
+
+
+def reproducibility_notes_report(target_summaries: list[dict]) -> list[str]:
+    completeness = Counter()
+    required = [
+        "architecture_profile",
+        "management_inventory",
+        "service_topology",
+        "config_backend",
+        "helper_script_inventory",
+        "command_materialization_features",
+        "execution_wrapper_features",
+        "extraction_quality_flags",
+        "target_metadata",
+    ]
+    for row in target_summaries:
+        present = sum(1 for key in required if row.get(key))
+        completeness[present] += 1
+    emitted = sum(1 for row in target_summaries if row.get("architecture_artifact_source") == "emitted")
+    emitted_with_rootfs = sum(
+        1 for row in target_summaries
+        if row.get("architecture_artifact_source") == "emitted"
+        and (row.get("extraction_quality_flags") or {}).get("rootfs_recovered")
+    )
+    lines = [
+        "# Reproducibility Notes",
+        "",
+        f"- targets with emitted architecture artifacts: `{emitted}/{len(target_summaries)}`",
+        f"- emitted artifacts with preserved rootfs visibility: `{emitted_with_rootfs}/{len(target_summaries)}`",
+        f"- metadata completeness histogram: `{dict(completeness)}`",
+        "",
+        "## Removed Report-Time Assumptions",
+        "- Architecture family no longer has to be inferred exclusively from report-time filesystem scans for fresh bundles.",
+        "- Vendor/model/version grouping can now use emitted normalized target metadata.",
+        "- Helper inventories and fingerprints are now serialized into the bundle, reducing drift from changing report code.",
+        "",
+        "## Remaining Sources Of Instability",
+        "- Old results bundles without emitted artifacts still require fallback inference.",
+        "- Some migrated bundles now contain emitted fields but no longer have preserved rootfs state, so their architecture fingerprints are intentionally conservative.",
+        "- Blob-success and fallback-success targets remain extraction-sensitive and should not anchor architecture prevalence claims.",
+        "- Some recovered-component labels in reports still depend on candidate names and `analysis.reason` until service inventory is also serialized explicitly.",
+    ]
+    return lines
+
+
+def pipeline_quality_report(
+    corpus_rows: list[dict],
+    target_summaries: list[dict],
+    clusters: list[dict],
+    bundles: list[dict],
+) -> tuple[dict, list[str]]:
+    by_vendor_model_version = Counter(
+        (str(row.get("vendor") or ""), str(row.get("model") or ""), str(row.get("version") or ""))
+        for row in corpus_rows
+    )
+    duplicate_triplets = [triplet for triplet, count in by_vendor_model_version.items() if count > 1]
+    fallback_targets = [row for row in target_summaries if row.get("success_quality") == "fallback-success"]
+    blob_targets = [row for row in target_summaries if row.get("success_quality") == "blob-success"]
+    no_component_targets = [row for row in target_summaries if not row.get("recovered_components")]
+    all_candidates = [cand for row in target_summaries for cand in (row.get("candidate_rows") or [])]
+    raw_candidates = len(all_candidates)
+    unique_cluster_members = len({
+        (
+            cand.get("component_family"),
+            cand.get("command_template"),
+            cand.get("source_type"),
+            cand.get("sink_type"),
+            cand.get("execution_mode"),
+        )
+        for cand in all_candidates
+    })
+    suppressed = [cand for cand in all_candidates if cand.get("false_positive_reason")]
+    unclear_grouping = [cluster for cluster in clusters if cluster.get("firmware_count", 0) >= 3 and cluster.get("vendor_count", 0) == 1]
+    out = {
+        "targets_total": len(target_summaries),
+        "raw_candidate_rows": raw_candidates,
+        "unique_recurrence_clusters": len(clusters),
+        "unique_cluster_signatures": unique_cluster_members,
+        "suppressed_candidate_rows": len(suppressed),
+        "blob_success_targets": len(blob_targets),
+        "fallback_success_targets": len(fallback_targets),
+        "targets_without_recovered_components": len(no_component_targets),
+        "duplicate_vendor_model_version_triplets": len(duplicate_triplets),
+        "single_vendor_large_clusters": len(unclear_grouping),
+        "weak_points": [
+            "naive sibling-parameter scans are noisy without request/form-context filtering",
+            "blob-success and fallback-success targets still distort recurrence counts toward rootfs-available vendors",
+            "raw candidate rows overcount repeated idioms; recurrence clustering should be primary measurement unit",
+            "recovered component labeling still depends heavily on analysis.reason and candidate names rather than explicit web/server inventory",
+            "historical runs still require canonical path backfill for fully reproducible report regeneration",
+        ],
+    }
+    lines = [
+        "# Pipeline Quality Report",
+        "",
+        f"- targets_total: `{out['targets_total']}`",
+        f"- raw_candidate_rows: `{out['raw_candidate_rows']}`",
+        f"- unique_recurrence_clusters: `{out['unique_recurrence_clusters']}`",
+        f"- unique_cluster_signatures: `{out['unique_cluster_signatures']}`",
+        f"- suppressed_candidate_rows: `{out['suppressed_candidate_rows']}`",
+        f"- blob_success_targets: `{out['blob_success_targets']}`",
+        f"- fallback_success_targets: `{out['fallback_success_targets']}`",
+        f"- targets_without_recovered_components: `{out['targets_without_recovered_components']}`",
+        f"- duplicate_vendor_model_version_triplets: `{out['duplicate_vendor_model_version_triplets']}`",
+        f"- single_vendor_large_clusters: `{out['single_vendor_large_clusters']}`",
+        "",
+        "## Weak Points",
+    ]
+    for point in out["weak_points"]:
+        lines.append(f"- {point}")
+    if fallback_targets:
+        lines.extend([
+            "",
+            "## Incomplete Extraction Targets",
+        ])
+        for row in fallback_targets[:10]:
+            lines.append(f"- `{row['vendor']} {row['model']} {row['version']}`: `{row['success_quality']}` / `{row['probe_readiness']}`")
+    return out, lines
+
+
+def recurrence_clusters_report(target_summaries: list[dict], clusters: list[dict]) -> tuple[list[dict], list[str]]:
+    lines = ["# Recurrence Clusters", ""]
+    if not clusters:
+        lines.append("(no recurrence clusters built)")
+        return clusters, lines
+    lines.extend([
+        f"- total clusters: `{len(clusters)}`",
+        f"- targets summarized: `{len(target_summaries)}`",
+        "",
+    ])
+    for row in clusters[:20]:
+        lines.extend([
+            f"## {row['cluster_id']}",
+            f"- component_family: `{row['component_family']}`",
+            f"- command_template: `{row['command_template']}`",
+            f"- source_type: `{row['source_type']}`",
+            f"- sink_type: `{row['sink_type']}`",
+            f"- execution_mode: `{row['execution_mode']}`",
+            f"- recurrence: `firmwares={row['firmware_count']}, vendors={row['vendor_count']}, models={row['model_count']}, versions={row['version_count']}`",
+            f"- confidence mix: `{row['confidence']}`",
+            f"- verdict mix: `{row['verdicts']}`",
+            f"- false-positive reasons: `{row['false_positive_reasons'] or {}}`",
+        ])
+        for ex in row.get("examples") or []:
+            lines.append(
+                f"- example: `{ex['firmware']} / {ex['component']} / {ex['candidate_confidence']} / {ex['verdict_reason']}`"
+            )
+        lines.append("")
+    return clusters, lines
+
+
+def candidate_ranking_notes_report(target_summaries: list[dict], clusters: list[dict]) -> tuple[dict, list[str]]:
+    all_candidates = [cand for row in target_summaries for cand in (row.get("candidate_rows") or [])]
+    confidence_counts = Counter(cand.get("candidate_confidence") or "unknown" for cand in all_candidates)
+    verdict_counts = Counter(cand.get("verdict") or "unknown" for cand in all_candidates)
+    by_template = Counter(cand.get("command_template") or "unknown" for cand in all_candidates)
+    strongest = []
+    seen_clusters = set()
+    for cand in sorted(
+        all_candidates,
+        key=lambda cand: (-int(cand.get("priority_score") or 0), -int(cand.get("candidate_score") or 0), cand.get("component") or ""),
+    ):
+        cluster_id = cand.get("recurrence_cluster_id") or f"single-{cand.get('component')}"
+        if cluster_id in seen_clusters:
+            continue
+        seen_clusters.add(cluster_id)
+        strongest.append(cand)
+        if len(strongest) >= 15:
+            break
+    out = {
+        "candidate_rows": len(all_candidates),
+        "confidence_counts": dict(confidence_counts),
+        "verdict_counts": dict(verdict_counts),
+        "top_command_templates": dict(by_template.most_common(12)),
+        "top_examples": strongest,
+    }
+    lines = [
+        "# Candidate Ranking Notes",
+        "",
+        f"- candidate_rows: `{len(all_candidates)}`",
+        f"- confidence_counts: `{dict(confidence_counts)}`",
+        f"- verdict_counts: `{dict(verdict_counts)}`",
+        f"- top_command_templates: `{dict(by_template.most_common(12))}`",
+        "",
+        "## Ranking Guidance",
+        "- Treat recurrence clusters as the primary counting unit for paper-facing statistics; raw candidate rows are too duplicative.",
+        "- Keep `candidate_confidence` distinct from `verdict`: confidence tracks evidence quality, while verdict tracks suppression or promotion decisions.",
+        "- Use `priority_score` for manual validation ordering, not for vulnerability claims.",
+        "- Do not mix recurring implementation idioms with manually verified vulnerabilities in the same headline counts.",
+        "",
+        "## Top Ranking Examples",
+    ]
+    for cand in strongest[:12]:
+        lines.append(
+            f"- `{cand['component']}`: `confidence={cand['candidate_confidence']}`, `priority={cand['priority_score']}`, `template={cand['command_template']}`, `source={cand['source_type']}`, `execution={cand['execution_mode']}`, `verdict={cand['verdict']}`"
+        )
+    return out, lines
+
+
+def false_positive_taxonomy_report(target_summaries: list[dict]) -> tuple[dict, list[str]]:
+    all_candidates = [cand for row in target_summaries for cand in (row.get("candidate_rows") or [])]
+    reason_counts = Counter(cand.get("false_positive_reason") for cand in all_candidates if cand.get("false_positive_reason"))
+    verdict_reason_counts = Counter(cand.get("verdict_reason") for cand in all_candidates)
+    template_counts = Counter(
+        cand.get("command_template")
+        for cand in all_candidates
+        if cand.get("false_positive_reason")
+    )
+    out = {
+        "false_positive_reason_counts": dict(reason_counts),
+        "verdict_reason_counts": dict(verdict_reason_counts.most_common(20)),
+        "suppressed_templates": dict(template_counts.most_common(12)),
+    }
+    lines = [
+        "# False-Positive Taxonomy",
+        "",
+        f"- false_positive_reason_counts: `{dict(reason_counts)}`",
+        f"- top_verdict_reasons: `{dict(verdict_reason_counts.most_common(20))}`",
+        f"- suppressed_templates: `{dict(template_counts.most_common(12))}`",
+        "",
+        "## Taxonomy Notes",
+        "- `reject:constant-or-unproven-exec-argument` captures fixed shell strings and import-only sinks that should not be promoted.",
+        "- `low-priority:false-positive-risk:*` captures cases where a sink exists but attacker control, exact input, or dispatch proof is weak.",
+        "- `risk:key_gated_protocol_surface` should remain separate from exploitability claims; protocol gating is not security validation.",
+        "- `reject:declaration-only-sink` is useful for suppressing shell declarations and environment strings that are not active execution.",
+    ]
+    return out, lines
+
+
+def next_manual_validation_targets_report(target_summaries: list[dict], clusters: list[dict]) -> tuple[list[dict], list[str]]:
+    all_candidates = []
+    by_cluster = {row["cluster_id"]: row for row in clusters}
+    regression_pairs = {(r["firmware"], r["component"].lower()) for r in KNOWN_FP_REGRESSIONS}
+    for target in target_summaries:
+        firmware = f"{target.get('vendor')} {target.get('model')} {target.get('version')}"
+        for cand in target.get("candidate_rows") or []:
+            if cand.get("candidate_confidence") not in {"strong-candidate", "manually-prioritized-candidate", "medium-candidate"}:
+                continue
+            if _suppressed_known_issue(str(target.get("model") or ""), str(cand.get("component") or "")):
+                continue
+            if any(
+                fw == firmware and comp in str(cand.get("component") or "").lower()
+                for fw, comp in regression_pairs
+            ):
+                continue
+            if cand.get("false_positive_reason", "").startswith("reject:constant"):
+                continue
+            cluster = by_cluster.get(cand.get("recurrence_cluster_id") or "")
+            recurrence_bonus = int(cluster.get("firmware_count") or 0) if cluster else 0
+            if cand.get("candidate_confidence") == "medium-candidate" and recurrence_bonus < 2:
+                continue
+            if cand.get("false_positive_reason") and cand.get("candidate_confidence") != "manually-prioritized-candidate":
+                continue
+            confidence_bonus = {
+                "manually-prioritized-candidate": 80,
+                "strong-candidate": 45,
+                "medium-candidate": 0,
+            }.get(cand.get("candidate_confidence") or "", 0)
+            manual_score = int(cand.get("priority_score") or 0) + recurrence_bonus * 10 + confidence_bonus
+            all_candidates.append({
+                "firmware": firmware,
+                "component": cand.get("component"),
+                "cluster_id": cand.get("recurrence_cluster_id"),
+                "candidate_confidence": cand.get("candidate_confidence"),
+                "priority_score": cand.get("priority_score"),
+                "manual_score": manual_score,
+                "command_template": cand.get("command_template"),
+                "source_type": cand.get("source_type"),
+                "execution_mode": cand.get("execution_mode"),
+                "verdict": cand.get("verdict"),
+                "false_positive_reason": cand.get("false_positive_reason"),
+                "cluster_recurrence": int(cluster.get("firmware_count") or 0) if cluster else 1,
+            })
+    all_candidates.sort(key=lambda row: (-int(row["manual_score"]), row["firmware"], row["component"]))
+    top = []
+    seen = set()
+    for row in all_candidates:
+        key = row.get("cluster_id") or (row["firmware"], row["component"])
+        if key in seen:
+            continue
+        seen.add(key)
+        top.append(row)
+        if len(top) >= 15:
+            break
+    lines = [
+        "# Next Manual Validation Targets",
+        "",
+        "- Manual validation targets are ranked by candidate confidence, recurrence breadth, and priority score, not by CVE readiness.",
+        "",
+    ]
+    for row in top:
+        lines.extend([
+            f"## {row['firmware']} / {row['component']}",
+            f"- cluster_id: `{row['cluster_id'] or 'none'}`",
+            f"- candidate_confidence: `{row['candidate_confidence']}`",
+            f"- priority_score: `{row['priority_score']}`",
+            f"- cluster_recurrence: `{row['cluster_recurrence']}`",
+            f"- command_template: `{row['command_template']}`",
+            f"- source_type: `{row['source_type']}`",
+            f"- execution_mode: `{row['execution_mode']}`",
+            f"- verdict: `{row['verdict']}`",
+            f"- false_positive_reason: `{row['false_positive_reason'] or 'none'}`",
+            "",
+        ])
+    return top, lines
 
 
 def corpus_completion_report(corpus_rows: list[dict], blind_summary: dict, bundles: list[dict]) -> tuple[dict, list[str]]:
@@ -312,6 +1583,18 @@ def corpus_completion_report(corpus_rows: list[dict], blind_summary: dict, bundl
             *[f"- `{cid}`" for cid in results_missing[:20]],
         ])
     return out, lines
+
+
+def _batch_summary_snapshot(batch_summary: dict | None) -> dict:
+    if not batch_summary:
+        return {}
+    return {
+        "total": int(batch_summary.get("total") or 0),
+        "counts": dict(batch_summary.get("counts") or {}),
+        "success_quality_counts": dict(batch_summary.get("success_quality_counts") or {}),
+        "probe_readiness_counts": dict(batch_summary.get("probe_readiness_counts") or {}),
+        "blob_family_counts": dict(batch_summary.get("blob_family_counts") or {}),
+    }
 
 
 def candidate_quality_report(bundles: list[dict], manual_eval: dict | None) -> tuple[dict, list[str]]:
@@ -608,6 +1891,104 @@ def _candidate_next_action(candidate: dict) -> str:
     return "review-artifacts"
 
 
+def _candidate_input_rank(candidate: dict) -> int:
+    confirmed_input = str(candidate.get("confirmed_input") or "unconfirmed").lower()
+    endpoint_input = str(candidate.get("endpoint_input") or "unconfirmed").lower()
+    attacker_arg = str(candidate.get("attacker_controlled_argument") or "unconfirmed").lower()
+    if confirmed_input != "unconfirmed":
+        return 4
+    if attacker_arg in {"confirmed", "likely"}:
+        return 3
+    if endpoint_input not in {"", "unconfirmed"} or candidate.get("endpoints"):
+        return 2
+    if candidate.get("config_keys"):
+        return 1
+    return 0
+
+
+def _candidate_sink_rank(candidate: dict) -> int:
+    confirmed_sink = str(candidate.get("confirmed_sink") or "unconfirmed").lower()
+    sink_text = " ".join(str(x).lower() for x in (candidate.get("all_sinks") or []))
+    if confirmed_sink != "unconfirmed":
+        if any(tok in confirmed_sink for tok in ("/bin/sh", "system", "popen", "os.execute", "io.popen", "exec")):
+            return 4
+        if any(tok in confirmed_sink for tok in ("strcpy", "sprintf", "strcat", "memcpy", "memmove", "sscanf")):
+            return 3
+        return 2
+    if any(tok in sink_text for tok in ("/bin/sh", "system", "popen", "os.execute", "io.popen", "exec")):
+        return 2
+    if sink_text:
+        return 1
+    return 0
+
+
+def _candidate_parser_upload_rank(candidate: dict) -> int:
+    flow_type = str(candidate.get("flow_type") or "").lower()
+    text = " ".join(
+        [
+            str(candidate.get("name") or "").lower(),
+            str(candidate.get("raw_name") or "").lower(),
+            str(candidate.get("endpoint_input") or "").lower(),
+            " ".join(str(x).lower() for x in (candidate.get("endpoints") or [])),
+            " ".join(str(x).lower() for x in (candidate.get("config_keys") or [])),
+        ]
+    )
+    uploadish = any(tok in text for tok in ("upload", "restore", "firmware", "backup", "multipart", "config.bin", "firmware.bin"))
+    parserish = flow_type in {"buffer_overflow", "heap_overflow", "format_string", "file_path_injection", "net_copy_partial"}
+    if uploadish and parserish:
+        return 4
+    if uploadish:
+        return 3
+    if parserish:
+        return 2
+    return 0
+
+
+def _candidate_reachability_rank(candidate: dict) -> int:
+    auth = str(candidate.get("auth_boundary") or candidate.get("auth_bypass") or "unknown").lower()
+    endpoint_input = str(candidate.get("endpoint_input") or "").lower()
+    if candidate.get("web_exposed"):
+        return 4
+    if auth in {"pre-auth", "bypassable"} and endpoint_input not in {"", "unconfirmed"}:
+        return 3
+    if candidate.get("web_reachable") or candidate.get("handler_surface"):
+        return 2
+    if endpoint_input not in {"", "unconfirmed"} or candidate.get("endpoints"):
+        return 1
+    return 0
+
+
+def _candidate_missing_proof_rank(candidate: dict) -> int:
+    missing = set(candidate.get("missing_links") or [])
+    fp_risks = set(candidate.get("false_positive_risks") or [])
+    penalty = len(missing) + len(fp_risks & {
+        "constant_or_unproven_exec_argument",
+        "sink_import_only",
+        "cross_function_token_contamination",
+        "input_to_sink_unproven",
+    })
+    return max(0, 4 - penalty)
+
+
+def _candidate_review_priority(candidate: dict) -> tuple[int, dict]:
+    factors = {
+        "input_controllability": _candidate_input_rank(candidate),
+        "sink_proximity": _candidate_sink_rank(candidate),
+        "parser_upload_exposure": _candidate_parser_upload_rank(candidate),
+        "web_rpc_reachability": _candidate_reachability_rank(candidate),
+        "missing_proof": _candidate_missing_proof_rank(candidate),
+    }
+    score = (
+        factors["input_controllability"] * 30
+        + factors["sink_proximity"] * 26
+        + factors["parser_upload_exposure"] * 20
+        + factors["web_rpc_reachability"] * 22
+        + factors["missing_proof"] * 14
+        + min(int(candidate.get("score") or 0), 100)
+    )
+    return score, factors
+
+
 def _derive_smell_strength(candidate: dict) -> str:
     verdict = _candidate_verdict(candidate)
     if verdict == "cve-ready":
@@ -677,6 +2058,7 @@ def _derive_smell_strength(candidate: dict) -> str:
 def cve_smell_queue(bundles: list[dict]) -> tuple[list[dict], list[str]]:
     items = []
     regression_pairs = {(r["firmware"], r["component"]) for r in KNOWN_FP_REGRESSIONS}
+    seen = set()
     for item in bundles:
         corpus = item["corpus"]
         bundle = item.get("bundle") or {}
@@ -684,7 +2066,13 @@ def cve_smell_queue(bundles: list[dict]) -> tuple[list[dict], list[str]]:
         fw_name = f"{corpus.get('vendor') or '?'} {model} {corpus.get('version') or ''}".strip()
         for cand in bundle.get("candidates") or []:
             name = str(cand.get("name") or cand.get("raw_name") or "")
+            dedupe_key = (_norm(fw_name), _norm(name))
+            if dedupe_key in seen:
+                continue
             smell = _derive_smell_strength(cand)
+            verdict = _candidate_verdict(cand)
+            if verdict == "promising" and smell not in {"strong-smell", "cve-candidate"}:
+                smell = "strong-smell"
             if smell not in {"medium-smell", "strong-smell", "cve-candidate"}:
                 continue
             if _suppressed_known_issue(model, name):
@@ -695,11 +2083,15 @@ def cve_smell_queue(bundles: list[dict]) -> tuple[list[dict], list[str]]:
                 for fw in [fw_name, str(corpus.get("model") or "")]
             ):
                 continue
+            priority_score, rank_factors = _candidate_review_priority(cand)
+            if priority_score < 120 and verdict != "promising":
+                continue
+            seen.add(dedupe_key)
             items.append({
                 "firmware": fw_name,
                 "component": name,
                 "suspected_issue": cand.get("flow_type") or "unknown",
-                "verdict": _candidate_verdict(cand),
+                "verdict": verdict,
                 "verdict_reason": _candidate_verdict_reason(cand),
                 "recommended_next_action": _candidate_next_action(cand),
                 "evidence": {
@@ -714,8 +2106,17 @@ def cve_smell_queue(bundles: list[dict]) -> tuple[list[dict], list[str]]:
                     "Claude Code" if smell in {"strong-smell", "cve-candidate"} else "Codex only"
                 ),
                 "confidence": smell,
+                "priority_score": priority_score,
+                "rank_factors": rank_factors,
             })
-    items.sort(key=lambda x: {"cve-candidate": 0, "strong-smell": 1, "medium-smell": 2}.get(x["confidence"], 9))
+    items.sort(
+        key=lambda x: (
+            {"cve-candidate": 0, "strong-smell": 1, "medium-smell": 2}.get(x["confidence"], 9),
+            -int(x.get("priority_score") or 0),
+            x.get("firmware") or "",
+            x.get("component") or "",
+        )
+    )
     lines = ["# CVE Smell Queue", ""]
     if not items:
         lines.append("(no new candidates passed the conservative smell filter)")
@@ -728,6 +2129,8 @@ def cve_smell_queue(bundles: list[dict]) -> tuple[list[dict], list[str]]:
                 f"- verdict reason: `{row.get('verdict_reason')}`",
                 f"- recommended next action: `{row.get('recommended_next_action')}`",
                 f"- evidence: `endpoint={row['evidence'].get('endpoint_input') or 'unconfirmed'}, sink={row['evidence'].get('confirmed_sink') or 'unconfirmed'}, auth={row['evidence'].get('auth_boundary') or 'unknown'}`",
+                f"- ranking factors: `input={row['rank_factors'].get('input_controllability')}, sink={row['rank_factors'].get('sink_proximity')}, parser/upload={row['rank_factors'].get('parser_upload_exposure')}, reachability={row['rank_factors'].get('web_rpc_reachability')}, missing-proof={row['rank_factors'].get('missing_proof')}`",
+                f"- priority score: `{row.get('priority_score')}`",
                 f"- missing proof: `{row['missing_proof']}`",
                 f"- recommended deep-analysis tool: `{row['recommended_deep_analysis_tool']}`",
                 f"- confidence: `{row['confidence']}`",
@@ -773,6 +2176,19 @@ def _top_target_score(row: dict) -> tuple[int, list[str]]:
     if row.get("confidence") == "strong-smell":
         score += 25
         reasons.append("strong-smell")
+    if row.get("verdict") == "promising":
+        score += 40
+        reasons.append("analyst-promoted")
+    score += int(row.get("priority_score") or 0)
+    rank_factors = row.get("rank_factors") or {}
+    if int(rank_factors.get("input_controllability") or 0) >= 3:
+        reasons.append("high-input-control")
+    if int(rank_factors.get("sink_proximity") or 0) >= 3:
+        reasons.append("sink-nearby")
+    if int(rank_factors.get("parser_upload_exposure") or 0) >= 3:
+        reasons.append("upload-parser-exposure")
+    if int(rank_factors.get("web_rpc_reachability") or 0) >= 3:
+        reasons.append("web-rpc-reachable")
 
     if not endpoint and not sink:
         score -= 80
@@ -816,6 +2232,7 @@ def top_targets_report(smells: list[dict]) -> tuple[list[dict], list[str]]:
                 f"- endpoint/input: `{ev.get('endpoint_input') or 'unconfirmed'}`",
                 f"- sink: `{ev.get('confirmed_sink') or 'unconfirmed'}`",
                 f"- auth: `{ev.get('auth_boundary') or 'unknown'}`",
+                f"- ranking factors: `input={row.get('rank_factors', {}).get('input_controllability')}, sink={row.get('rank_factors', {}).get('sink_proximity')}, parser/upload={row.get('rank_factors', {}).get('parser_upload_exposure')}, reachability={row.get('rank_factors', {}).get('web_rpc_reachability')}, missing-proof={row.get('rank_factors', {}).get('missing_proof')}`",
                 f"- missing_links: `{', '.join(ev.get('missing_links') or []) or 'none'}`",
                 f"- why prioritized: `{', '.join(row.get('priority_reasons') or [])}`",
                 f"- recommended tool: `{row.get('recommended_deep_analysis_tool')}`",
@@ -829,16 +2246,19 @@ def tool_improvement_log_report(
     quality_out: dict,
     fp_out: dict,
     backlog_out: list[dict],
+    batch_snapshot: dict | None = None,
 ) -> list[str]:
+    today = datetime.now().date().isoformat()
     lines = [
         "# Tool Improvement Log",
         "",
-        "## 2026-04-28",
+        f"## {today}",
         "",
         "### Pipeline / Extraction",
         "- Added generic embedded-payload salvage for `gzip`, `zip`, `xz`, and `lzma` signatures when classic filesystem detection fails.",
         "- Added recursion guards so carved payloads and compressed salvage outputs do not recursively trigger the same recovery path forever.",
         "- Widened opaque nested-blob handling so large extensionless high-entropy payloads are still explored instead of being dropped too early.",
+        "- Corpus-level reporting now resolves `canonical_result_path` before transient `result_path`, so current successful runs are not lost when older `/tmp` outputs disappear.",
         "",
         "### Opaque-Format Triage",
         "- Added `source_kind` and `extraction_hints` to exported `container_targets` so opaque cases preserve extraction context in structured results.",
@@ -849,9 +2269,17 @@ def tool_improvement_log_report(
         f"- Corpus status: `rows={corpus_out.get('corpus_rows')}`, `bundles_found={corpus_out.get('bundles_found')}`, `manifests_found={corpus_out.get('manifests_found')}`.",
         f"- Candidate quality snapshot: `bundles_with_candidates={quality_out.get('bundles_with_candidates')}`, `candidates_total={quality_out.get('candidates_total')}`.",
         f"- False-positive regression snapshot: `{len(fp_out.get('rows') or [])}` tracked regression rows, no regression failure introduced in this iteration.",
+    ]
+    if batch_snapshot:
+        lines.extend([
+            f"- Batch status: `total={batch_snapshot.get('total')}`, `counts={batch_snapshot.get('counts')}`.",
+            f"- Success quality counts: `{batch_snapshot.get('success_quality_counts')}`.",
+            f"- Probe readiness counts: `{batch_snapshot.get('probe_readiness_counts')}`.",
+        ])
+    lines.extend([
         "",
         "### Current Highest-Value Backlog",
-    ]
+    ])
     for row in (backlog_out or [])[:5]:
         lines.append(f"- P{row.get('priority')}: {row.get('task')}")
     lines.append("")
@@ -913,7 +2341,8 @@ def backlog_report(corpus_rows: list[dict], quality: dict, fp_report: dict) -> t
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus", required=True)
-    ap.add_argument("--blind-summary", required=True)
+    ap.add_argument("--blind-summary")
+    ap.add_argument("--batch-summary")
     ap.add_argument("--manual-eval", default="research/review/manual/manual_review_eval.master_20260422_plus_linksys_plus_alignment_plus_touched6.json")
     ap.add_argument("--corpus-md", required=True)
     ap.add_argument("--corpus-json", required=True)
@@ -928,12 +2357,38 @@ def main() -> None:
     ap.add_argument("--top-targets-md", required=True)
     ap.add_argument("--top-targets-json", required=True)
     ap.add_argument("--log-md", required=True)
+    ap.add_argument("--pipeline-quality-md")
+    ap.add_argument("--pipeline-quality-json")
+    ap.add_argument("--recurrence-clusters-md")
+    ap.add_argument("--recurrence-clusters-json")
+    ap.add_argument("--candidate-ranking-notes-md")
+    ap.add_argument("--candidate-ranking-notes-json")
+    ap.add_argument("--false-positive-taxonomy-md")
+    ap.add_argument("--false-positive-taxonomy-json")
+    ap.add_argument("--next-manual-validation-targets-md")
+    ap.add_argument("--next-manual-validation-targets-json")
+    ap.add_argument("--architecture-clusters-md")
+    ap.add_argument("--architecture-clusters-json")
+    ap.add_argument("--sdk-lineage-hypotheses-md")
+    ap.add_argument("--sdk-lineage-hypotheses-json")
+    ap.add_argument("--orchestration-reuse-patterns-md")
+    ap.add_argument("--orchestration-reuse-patterns-json")
+    ap.add_argument("--extraction-bias-analysis-md")
+    ap.add_argument("--extraction-bias-analysis-json")
+    ap.add_argument("--architecture-level-false-positive-notes-md")
+    ap.add_argument("--architecture-level-false-positive-notes-json")
+    ap.add_argument("--architecture-artifact-schema-md")
+    ap.add_argument("--reproducibility-notes-md")
+    ap.add_argument("--architecture-fingerprint-design-md")
+    ap.add_argument("--metadata-normalization-notes-md")
+    ap.add_argument("--cluster-stability-report-md")
     args = ap.parse_args()
 
     corpus_rows = load_jsonl(args.corpus)
-    blind_summary = load_json(args.blind_summary)
+    blind_summary = load_json(args.blind_summary) if args.blind_summary and Path(args.blind_summary).is_file() else {}
+    batch_summary = load_json(args.batch_summary) if args.batch_summary and Path(args.batch_summary).is_file() else {}
     manual_eval = load_json(args.manual_eval) if Path(args.manual_eval).is_file() and Path(args.manual_eval).stat().st_size > 0 else {}
-    bundles = load_corpus_bundles(corpus_rows)
+    bundles = load_corpus_bundles(corpus_rows, batch_summary=batch_summary)
 
     corpus_out, corpus_lines = corpus_completion_report(corpus_rows, blind_summary, bundles)
     quality_out, quality_lines = candidate_quality_report(bundles, manual_eval)
@@ -941,7 +2396,40 @@ def main() -> None:
     backlog_out, backlog_lines = backlog_report(corpus_rows, quality_out, fp_out)
     smell_out, smell_lines = cve_smell_queue(bundles)
     top_out, top_lines = top_targets_report(smell_out)
-    log_lines = tool_improvement_log_report(corpus_out, quality_out, fp_out, backlog_out)
+    target_summaries = build_target_summaries(bundles)
+    recurrence_clusters = build_recurrence_clusters(target_summaries)
+    recurrence_out, recurrence_lines = recurrence_clusters_report(target_summaries, recurrence_clusters)
+    architecture_clusters = build_architecture_clusters(target_summaries)
+    architecture_out, architecture_lines = architecture_clusters_report(target_summaries, architecture_clusters)
+    pipeline_quality_out, pipeline_quality_lines = pipeline_quality_report(
+        corpus_rows,
+        target_summaries,
+        recurrence_out,
+        bundles,
+    )
+    ranking_out, ranking_lines = candidate_ranking_notes_report(target_summaries, recurrence_out)
+    fp_taxonomy_out, fp_taxonomy_lines = false_positive_taxonomy_report(target_summaries)
+    manual_out, manual_lines = next_manual_validation_targets_report(target_summaries, recurrence_out)
+    lineage_out, lineage_lines = sdk_lineage_hypotheses_report(target_summaries, architecture_clusters)
+    orchestration_out, orchestration_lines = orchestration_reuse_patterns_report(
+        target_summaries,
+        architecture_clusters,
+        recurrence_clusters,
+    )
+    extraction_bias_out, extraction_bias_lines = extraction_bias_analysis_report(target_summaries, architecture_clusters)
+    arch_fp_out, arch_fp_lines = architecture_level_false_positive_notes_report(target_summaries)
+    architecture_schema_lines = architecture_artifact_schema_report(target_summaries)
+    reproducibility_lines = reproducibility_notes_report(target_summaries)
+    fingerprint_design_lines = architecture_fingerprint_design_report(target_summaries)
+    normalization_lines = metadata_normalization_notes_report(target_summaries)
+    cluster_stability_lines = cluster_stability_report(target_summaries)
+    log_lines = tool_improvement_log_report(
+        corpus_out,
+        quality_out,
+        fp_out,
+        backlog_out,
+        batch_snapshot=_batch_summary_snapshot(batch_summary),
+    )
 
     write_json(args.corpus_json, corpus_out)
     write_md(args.corpus_md, corpus_lines)
@@ -956,12 +2444,64 @@ def main() -> None:
     write_json(args.top_targets_json, top_out)
     write_md(args.top_targets_md, top_lines)
     write_md(args.log_md, log_lines)
+    if args.pipeline_quality_json:
+        write_json(args.pipeline_quality_json, pipeline_quality_out)
+    if args.pipeline_quality_md:
+        write_md(args.pipeline_quality_md, pipeline_quality_lines)
+    if args.recurrence_clusters_json:
+        write_json(args.recurrence_clusters_json, recurrence_out)
+    if args.recurrence_clusters_md:
+        write_md(args.recurrence_clusters_md, recurrence_lines)
+    if args.candidate_ranking_notes_json:
+        write_json(args.candidate_ranking_notes_json, ranking_out)
+    if args.candidate_ranking_notes_md:
+        write_md(args.candidate_ranking_notes_md, ranking_lines)
+    if args.false_positive_taxonomy_json:
+        write_json(args.false_positive_taxonomy_json, fp_taxonomy_out)
+    if args.false_positive_taxonomy_md:
+        write_md(args.false_positive_taxonomy_md, fp_taxonomy_lines)
+    if args.next_manual_validation_targets_json:
+        write_json(args.next_manual_validation_targets_json, manual_out)
+    if args.next_manual_validation_targets_md:
+        write_md(args.next_manual_validation_targets_md, manual_lines)
+    if args.architecture_clusters_json:
+        write_json(args.architecture_clusters_json, architecture_out)
+    if args.architecture_clusters_md:
+        write_md(args.architecture_clusters_md, architecture_lines)
+    if args.sdk_lineage_hypotheses_json:
+        write_json(args.sdk_lineage_hypotheses_json, lineage_out)
+    if args.sdk_lineage_hypotheses_md:
+        write_md(args.sdk_lineage_hypotheses_md, lineage_lines)
+    if args.orchestration_reuse_patterns_json:
+        write_json(args.orchestration_reuse_patterns_json, orchestration_out)
+    if args.orchestration_reuse_patterns_md:
+        write_md(args.orchestration_reuse_patterns_md, orchestration_lines)
+    if args.extraction_bias_analysis_json:
+        write_json(args.extraction_bias_analysis_json, extraction_bias_out)
+    if args.extraction_bias_analysis_md:
+        write_md(args.extraction_bias_analysis_md, extraction_bias_lines)
+    if args.architecture_level_false_positive_notes_json:
+        write_json(args.architecture_level_false_positive_notes_json, arch_fp_out)
+    if args.architecture_level_false_positive_notes_md:
+        write_md(args.architecture_level_false_positive_notes_md, arch_fp_lines)
+    if args.architecture_artifact_schema_md:
+        write_md(args.architecture_artifact_schema_md, architecture_schema_lines)
+    if args.reproducibility_notes_md:
+        write_md(args.reproducibility_notes_md, reproducibility_lines)
+    if args.architecture_fingerprint_design_md:
+        write_md(args.architecture_fingerprint_design_md, fingerprint_design_lines)
+    if args.metadata_normalization_notes_md:
+        write_md(args.metadata_normalization_notes_md, normalization_lines)
+    if args.cluster_stability_report_md:
+        write_md(args.cluster_stability_report_md, cluster_stability_lines)
 
     print(json.dumps({
         "corpus_rows": len(corpus_rows),
         "bundles_scanned": sum(1 for row in bundles if row.get("bundle")),
         "smell_rows": len(smell_out),
         "top_rows": len(top_out),
+        "recurrence_clusters": len(recurrence_out),
+        "architecture_clusters": len(architecture_out),
     }, indent=2))
 
 

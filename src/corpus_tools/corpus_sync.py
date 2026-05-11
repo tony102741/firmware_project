@@ -73,6 +73,22 @@ def infer_entry(path, inputs_root="inputs"):
 
     patterns = [
         (
+            re.compile(r"^(A3002RU V\d+)-(?P<version>V.+)\.(?P<ext>zip|rar)$", re.I),
+            lambda m: {
+                "vendor": "TOTOLINK",
+                "model": "A3002RU",
+                "version": m.group("version"),
+                "release_date": infer_release_date(
+                    re.search(r"B(\d{8})", m.group("version")).group(1)
+                )
+                if re.search(r"B(\d{8})", m.group("version"))
+                else "",
+                "suspected_stack": ["boa", "boafrm"],
+                "arch": "mips",
+                "notes": "Metadata inferred from filename pattern. Older A3002RU archive naming includes a hardware suffix that is normalized back to model A3002RU.",
+            },
+        ),
+        (
             re.compile(r"^(A3002RU)-(?P<version>V.+)\.(?P<ext>zip|rar)$", re.I),
             lambda m: {
                 "vendor": "TOTOLINK",

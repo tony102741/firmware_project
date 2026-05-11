@@ -213,6 +213,10 @@ def classify_blob_family(result):
         return None
 
     candidates = result.get("_candidates") or []
+    system_path = (result.get("analysis_system_path") or "").lower()
+    candidate_names = " ".join(str(c.get("name") or "").lower() for c in candidates)
+    if "_segmented_partial_layout" in system_path or "segments::" in candidate_names:
+        return "tp-link-segmented-bundle"
     if not candidates:
         return "generic-blob-signal"
 
@@ -262,6 +266,10 @@ def classify_probe_readiness(result):
             return "bundle-probe-ready"
 
     if success_quality == "blob-success":
+        system_path = (result.get("analysis_system_path") or "").lower()
+        candidate_names = " ".join(str(c.get("name") or "").lower() for c in (result.get("_candidates") or []))
+        if "_segmented_partial_layout" in system_path or "segments::" in candidate_names:
+            return "bundle-probe-ready"
         return "blob-ready"
     return None
 
