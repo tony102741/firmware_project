@@ -3650,8 +3650,11 @@ def _candidate_passphrases_from_blob_name(blob_path, vendor_hint=""):
     seeds.extend(re.findall(r"[A-Za-z0-9]+", stem))
     if vendor_hint:
         seeds.extend(re.findall(r"[A-Za-z0-9]+", vendor_hint))
-    preferred = ["TENDAWIFI", "TendaWiFi", "tendawifi", "tendawifi.com", "Tenda", "tenda"]
-    seeds = preferred + seeds
+    lower_vendor = (vendor_hint or "").lower()
+    lower_stem = stem.lower()
+    if "tenda" in lower_vendor or "tenda" in lower_stem:
+        preferred = ["TENDAWIFI", "TendaWiFi", "tendawifi", "tendawifi.com", "Tenda", "tenda"]
+        seeds = preferred + seeds
 
     out = []
     seen = set()

@@ -2749,7 +2749,10 @@ def _export_container_targets(results, run_dir):
         seeds.extend(re.findall(r"[A-Za-z0-9]+", stem))
         if vendor_guess:
             seeds.extend(re.findall(r"[A-Za-z0-9]+", vendor_guess))
-        seeds = ["TENDAWIFI", "TendaWiFi", "tendawifi", "tendawifi.com", "Tenda", "tenda"] + seeds
+        lower_vendor = (vendor_guess or "").lower()
+        lower_stem = stem.lower()
+        if "tenda" in lower_vendor or "tenda" in lower_stem:
+            seeds = ["TENDAWIFI", "TendaWiFi", "tendawifi", "tendawifi.com", "Tenda", "tenda"] + seeds
 
         out = []
         seen_local = set()

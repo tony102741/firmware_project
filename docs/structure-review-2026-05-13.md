@@ -1,5 +1,8 @@
 # Structure Review: Research + CVE Hunting Pipeline
 
+This note is a point-in-time structure review from a portable-development pass.
+It is not authoritative for the desktop WSL workspace, which may contain additional local run bundles, regenerated corpora, Ghidra state, and other non-Git artifacts.
+
 ## Current Shape
 
 The project already has the right high-level loop:

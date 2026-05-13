@@ -7,6 +7,7 @@ runs/
 fw_dump/
 report/
 research/
+analysis_output/
 
 .codex
 .mcp.json
@@ -19,6 +20,8 @@ research/
 ghidra_projects/
 ghidra_targets/
 extract_tmp/
+*.gpr
+*.rep
 tools/
 tools/ghidra
 tools/ghidra_11.3.2_PUBLIC/

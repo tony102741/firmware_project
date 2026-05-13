@@ -1,5 +1,8 @@
 # Portable Environment Workflow
 
+This document is a portability guide, not the canonical WSL operating procedure.
+The primary analysis environment remains the desktop WSL workspace.
+
 The goal is to continue the same firmware work on a desktop and a MacBook with minimal friction.
 
 Git carries the shared working state:
@@ -19,6 +22,26 @@ Each machine keeps its own heavy local state:
 - Python virtualenv in `.venv/`
 - machine-specific MCP config in `.mcp.json`
 
+## WSL Desktop Baseline
+
+On the main WSL machine, keep the heavy local analysis state in place and do not try to reconstruct it from Git alone.
+
+Use:
+
+```bash
+cd firmware_project
+. scripts/env.sh
+scripts/check-env-wsl.sh
+```
+
+The WSL workspace is expected to hold the real local analysis data, including:
+
+- `research/regeneration/full_corpus_20260508/`
+- `ghidra_targets/`
+- copied firmware samples in `inputs/`
+- older run bundles in `runs/`
+- local tools under `tools/`
+
 ## First Setup On Each Mac
 
 ```bash
@@ -34,7 +57,7 @@ Install missing system tools with Homebrew:
 brew install git go binwalk p7zip
 ```
 
-`scripts/check-env.sh` is the quick compatibility check before starting serious work.
+`scripts/check-env.sh` is the generic compatibility check before starting serious work on a Mac.
 
 ## Starting Work
 
@@ -51,7 +74,7 @@ If a firmware file exists only on the other machine, copy just that product fold
 
 ```bash
 git status
-git add README.md CLAUDE.md .gitignore requirements.txt docs scripts src research report
+git add README.md .gitignore requirements.txt docs scripts src
 git add 'ghidra_targets/**/*.md' 'ghidra_targets/**/*.json'
 git commit -m "Save firmware research progress"
 git push
@@ -69,6 +92,11 @@ Do not try to make these identical through Git:
 - `tools/`
 - `.venv/`
 - `.mcp.json`
+- `research/regeneration/full_corpus_20260508/`
+- `research/**/*.jsonl`
+- `research/**/*.md`
 - `ghidra_targets/**/rootfs/`
 
 Move them manually only when the next task needs them.
+
+If a local machine has irreplaceable analysis outputs, protect them first and treat Git as code/document sync only.
