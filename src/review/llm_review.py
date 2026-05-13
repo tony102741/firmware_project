@@ -126,6 +126,7 @@ def _infer_success_quality_from_bundle(bundle: dict) -> Optional[str]:
         "/rootfs",
         "/system",
         "/_ubi_extract/",
+        "/_raw_fs",
         "/.cache/rootfs/",
     )
     if analysis_mode in {"iot_web", "android"} and any(marker in system_path for marker in rootfs_markers):
