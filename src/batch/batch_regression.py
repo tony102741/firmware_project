@@ -130,6 +130,26 @@ def load_json(path):
         return json.load(fh)
 
 
+def dir_size_bytes(path):
+    total = 0
+    root = Path(path)
+    if not root.exists():
+        return 0
+    for item in root.rglob("*"):
+        try:
+            if item.is_file() or item.is_symlink():
+                total += item.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def cleanup_sample_workspace(sample_root):
+    size = dir_size_bytes(sample_root)
+    shutil.rmtree(sample_root, ignore_errors=True)
+    return size
+
+
 def write_jsonl(path, entries):
     with open(path, "w", encoding="utf-8") as fh:
         for entry in entries:
@@ -303,7 +323,7 @@ def update_corpus_entry(corpus_entries, entry, result):
     return True
 
 
-def run_one(entry, workspace_root):
+def run_one(entry, workspace_root, keep_sample_workspace=False):
     local_path = entry.get("local_path")
     if not local_path:
         return {
@@ -369,6 +389,9 @@ def run_one(entry, workspace_root):
     summary = (results or {}).get("summary") or {}
     analysis = (results or {}).get("analysis") or {}
     candidates = (results or {}).get("candidates") or []
+    cleaned_bytes = 0
+    if not keep_sample_workspace:
+        cleaned_bytes = cleanup_sample_workspace(sample_root)
     return {
         "corpus_id": entry.get("corpus_id"),
         "sample": entry.get("local_filename"),
@@ -388,6 +411,9 @@ def run_one(entry, workspace_root):
         "candidate_count": len(candidates),
         "blob_candidate_count": int(summary.get("blob_candidates") or 0),
         "web_surface_detected": None if summary.get("web_exposed") is None else summary.get("web_exposed", 0) > 0,
+        "sample_workspace": str(sample_root) if keep_sample_workspace else None,
+        "sample_workspace_cleaned": not keep_sample_workspace,
+        "sample_workspace_cleaned_bytes": cleaned_bytes,
         "tail": "\n".join(output.strip().splitlines()[-20:]),
         "_candidates": candidates,
         "_container_targets": (results or {}).get("container_targets") or [],
@@ -517,6 +543,11 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--only-blocked", action="store_true")
     ap.add_argument("--workspace-root", default="/tmp/fw_batch_regression")
+    ap.add_argument(
+        "--keep-sample-workspaces",
+        action="store_true",
+        help="Keep large per-sample extraction/cache directories for debugging.",
+    )
     ap.add_argument("--timeout", type=int, default=1800, help="Per-sample timeout in seconds.")
     ap.add_argument("--json-output", help="Write the batch summary JSON to this path.")
     ap.add_argument("--write-corpus", action="store_true", help="Update the corpus JSONL in place with regression statuses.")
@@ -560,7 +591,7 @@ def main():
             f"{entry.get('version')} -> {entry.get('local_filename')}",
             flush=True,
         )
-        result = run_one(entry, args.workspace_root)
+        result = run_one(entry, args.workspace_root, keep_sample_workspace=args.keep_sample_workspaces)
         result["success_quality"] = classify_success_quality(result)
         result["blob_family"] = classify_blob_family(result)
         result["probe_readiness"] = classify_probe_readiness(result)

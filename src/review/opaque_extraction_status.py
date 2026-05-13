@@ -26,6 +26,13 @@ def load_jsonl(path: str | Path) -> list[dict]:
 
 
 def result_path_for_row(row: dict) -> Path | None:
+    results_json = row.get("results_json")
+    if results_json:
+        path = Path(results_json)
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        return path
+
     run_id = str(row.get("run_id") or "")
     if not run_id:
         return None
@@ -150,14 +157,27 @@ def write_markdown(rows: list[dict], path: str | Path) -> None:
     Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
+def load_rows(args: argparse.Namespace) -> list[dict]:
+    if args.batch_summary:
+        payload = load_json(args.batch_summary)
+        rows = payload.get("results") or []
+        if not isinstance(rows, list):
+            raise SystemExit("batch summary does not contain a list-valued 'results' field")
+        return rows
+    if args.corpus:
+        return load_jsonl(args.corpus)
+    raise SystemExit("provide --corpus or --batch-summary")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--corpus", required=True)
+    ap.add_argument("--corpus")
+    ap.add_argument("--batch-summary", help="Read rows from batch_regression.py JSON output.")
     ap.add_argument("--markdown-out", required=True)
     ap.add_argument("--json-out", required=True)
     args = ap.parse_args()
 
-    rows = load_jsonl(args.corpus)
+    rows = load_rows(args)
     out = [row for row in (summarize_row(r) for r in rows) if row]
     out.sort(key=lambda x: (x["extraction_status"] != "opaque", x["firmware"]))
     Path(args.json_out).write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
