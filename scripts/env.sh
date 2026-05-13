@@ -2,7 +2,15 @@
 # Source this file from the project root before working:
 # . scripts/env.sh
 
-PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+if [ -n "${ZSH_VERSION:-}" ]; then
+  SCRIPT_PATH="${(%):-%x}"
+elif [ -n "${BASH_VERSION:-}" ]; then
+  SCRIPT_PATH="${BASH_SOURCE}"
+else
+  SCRIPT_PATH="$0"
+fi
+
+PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")/.." >/dev/null && pwd -P)"
 
 export FIRMWARE_INPUTS_DIR="${FIRMWARE_INPUTS_DIR:-$PROJECT_ROOT/inputs}"
 export FIRMWARE_CACHE_DIR="${FIRMWARE_CACHE_DIR:-$PROJECT_ROOT/.cache}"

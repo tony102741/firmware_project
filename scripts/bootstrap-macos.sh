@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." >/dev/null && pwd -P)"
 cd "$PROJECT_ROOT"
 
 mkdir -p inputs runs .cache tools
