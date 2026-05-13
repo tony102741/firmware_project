@@ -2744,22 +2744,12 @@ def _export_container_targets(results, run_dir):
         return source_kind, deduped
 
     def _candidate_passphrases(base_name, vendor_guess):
-        if "tenda" in (vendor_guess or "").lower():
-            return [
-                "TENDAWIFI",
-                "TendaWiFi",
-                "tendawifi",
-                "tendawifi.com",
-                "Tenda",
-                "tenda",
-            ]
-
         seeds = []
         stem = os.path.splitext(base_name)[0]
         seeds.extend(re.findall(r"[A-Za-z0-9]+", stem))
         if vendor_guess:
             seeds.extend(re.findall(r"[A-Za-z0-9]+", vendor_guess))
-        seeds.extend(["tenda", "Tenda", "TendaWiFi", "tendawifi", "tendawifi.com"])
+        seeds = ["TENDAWIFI", "TendaWiFi", "tendawifi", "tendawifi.com", "Tenda", "tenda"] + seeds
 
         out = []
         seen_local = set()
@@ -2780,7 +2770,7 @@ def _export_container_targets(results, run_dir):
         compact = "".join(ch for ch in stem if ch.isalnum())
         if compact and compact not in seen_local:
             out.append(compact)
-        return out[:48]
+        return out[:96]
 
     def _write_probe_bundle(target_dir, base_name, export_entry):
         crypto_profile = export_entry.get("crypto_profile")
@@ -2872,7 +2862,7 @@ mkdir -p "$OUTDIR"
 while IFS= read -r pass; do
   [ -n "$pass" ] || continue
   safe="$(printf '%s' "$pass" | tr -c 'A-Za-z0-9._-' '_')"
-  for md in md5 sha256; do
+  for md in md5 sha1 sha256; do
     for cipher in aes-128-cbc aes-192-cbc aes-256-cbc; do
       openssl enc -d "-$cipher" -md "$md" -S "$SALT" -salt -pass "pass:$pass" \\
         -in "$CIPHERTEXT" -out "$OUTDIR/${{safe}}_${{cipher}}_${{md}}.bin" 2>/dev/null || true
@@ -2894,7 +2884,7 @@ echo "probe outputs: $OUTDIR"
                 "extraction_hints": export_entry.get("extraction_hints") or [],
                 "candidate_count": len(candidates),
                 "ciphers": ["aes-128-cbc", "aes-192-cbc", "aes-256-cbc"],
-                "digests": ["md5", "sha256"],
+                "digests": ["md5", "sha1", "sha256"],
             }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
             return {

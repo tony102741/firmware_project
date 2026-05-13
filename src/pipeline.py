@@ -3645,16 +3645,6 @@ def _synthesize_probe_partial_layout(base_dir, payload_paths, layout_name="_prob
 
 
 def _candidate_passphrases_from_blob_name(blob_path, vendor_hint=""):
-    if "tenda" in vendor_hint.lower():
-        return [
-            "TENDAWIFI",
-            "TendaWiFi",
-            "tendawifi",
-            "tendawifi.com",
-            "Tenda",
-            "tenda",
-        ]
-
     seeds = []
     stem = os.path.splitext(os.path.basename(blob_path))[0]
     seeds.extend(re.findall(r"[A-Za-z0-9]+", stem))
@@ -3678,7 +3668,7 @@ def _candidate_passphrases_from_blob_name(blob_path, vendor_hint=""):
     compact = "".join(ch for ch in stem if ch.isalnum())
     if compact and compact not in seen:
         out.append(compact)
-    return out[:64]
+    return out[:96]
 
 
 def _try_auto_openssl_container_extract(blob_path, out_dir, vendor_hint=""):
@@ -3704,7 +3694,7 @@ def _try_auto_openssl_container_extract(blob_path, out_dir, vendor_hint=""):
     if not candidates:
         return None
 
-    digest_order = ("sha256", "md5")
+    digest_order = ("sha256", "md5", "sha1")
     cipher_order = ("aes-128-cbc", "aes-256-cbc", "aes-192-cbc")
     attempts = []
 
