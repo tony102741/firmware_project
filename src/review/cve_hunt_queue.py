@@ -4,7 +4,7 @@ Build a conservative ranked CVE-hunting queue from batch regression results.
 Example:
   python3 src/review/cve_hunt_queue.py \
       --batch-summary runs/regression/batch_regression_summary.json \
-      --markdown-out research/review/cve_hunt_queue_latest.md
+      --markdown-out research/review/active/cve_hunt_queue_latest.md
 """
 
 from __future__ import annotations
@@ -1107,7 +1107,7 @@ def main() -> None:
     ap.add_argument("--include-rejected", action="store_true")
     ap.add_argument(
         "--regression-rejects",
-        default="research/review/cve_false_positive_regressions.json",
+        default="research/review/reports/cve_false_positive_regressions.json",
     )
     args = ap.parse_args()
 
