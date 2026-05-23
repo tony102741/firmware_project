@@ -1,0 +1,204 @@
+{
+  "schema_version": "1.0",
+  "target_id": "AX72-client_mgmt-function-scoped",
+  "prune_context_only_noise": false,
+  "notes": [
+    {
+      "category": "function_role",
+      "function": "FUN_0041b270",
+      "label": "FUN_0041b270",
+      "node_type": "native_coordinator",
+      "evidence_class": "E1_function_level_confirmed",
+      "summary": "Function-level confirmed strict 17-character textual MAC parser that normalizes into a 6-byte native MAC buffer.",
+      "source_ref": "Ghidra:0x0041b270"
+    },
+    {
+      "category": "function_role",
+      "function": "FUN_00409ea4",
+      "label": "FUN_00409ea4",
+      "node_type": "native_coordinator",
+      "evidence_class": "E1_function_level_confirmed",
+      "summary": "Function-level confirmed bounded textual record parser that converts MAC text into byte-form native records.",
+      "source_ref": "Ghidra:0x00409ea4"
+    },
+    {
+      "category": "function_role",
+      "function": "FUN_0041386c",
+      "label": "FUN_0041386c",
+      "node_type": "native_coordinator",
+      "evidence_class": "E1_function_level_confirmed",
+      "summary": "Function-level confirmed generic UCI set/save/commit helper.",
+      "source_ref": "Ghidra:0x0041386c"
+    },
+    {
+      "category": "function_role",
+      "function": "FUN_00414170",
+      "label": "FUN_00414170",
+      "node_type": "native_coordinator",
+      "evidence_class": "E1_function_level_confirmed",
+      "summary": "Function-level confirmed delete-by-node helper that reverts /var/state/fing and deletes history_list sections.",
+      "source_ref": "Ghidra:0x00414170"
+    },
+    {
+      "category": "function_role",
+      "function": "FUN_00413e18",
+      "label": "FUN_00413e18",
+      "node_type": "native_coordinator",
+      "evidence_class": "E1_function_level_confirmed",
+      "summary": "Function-level confirmed persistence-and-save path that updates history_list and triggers saveconfig().",
+      "source_ref": "Ghidra:0x00413e18"
+    },
+    {
+      "category": "function_role",
+      "function": "FUN_004133dc",
+      "label": "FUN_004133dc",
+      "node_type": "native_coordinator",
+      "evidence_class": "E1_function_level_confirmed",
+      "summary": "Function-level confirmed history_list cleanup path using UCI delete and commit.",
+      "source_ref": "Ghidra:0x004133dc"
+    },
+    {
+      "category": "persistence_boundary",
+      "source": "FUN_004133dc",
+      "source_type": "native_coordinator",
+      "target": "history_list",
+      "target_type": "persistence_object",
+      "edge_type": "projects_downstream",
+      "ordering": "ordered",
+      "evidence_class": "E1_function_level_confirmed",
+      "summary": "clean_config_file loads and deletes history_list sections before UCI commit.",
+      "source_ref": "Ghidra:0x004133dc"
+    },
+    {
+      "category": "persistence_boundary",
+      "source": "FUN_0041386c",
+      "source_type": "native_coordinator",
+      "target": "uci",
+      "target_type": "persistence_object",
+      "edge_type": "projects_downstream",
+      "ordering": "ordered",
+      "evidence_class": "E1_function_level_confirmed",
+      "summary": "uci_set_by_string performs uci_lookup_ptr, uci_set, uci_save, and uci_commit.",
+      "source_ref": "Ghidra:0x0041386c"
+    },
+    {
+      "category": "xref_confirmed_edge",
+      "source": "FUN_00413e18",
+      "source_type": "native_coordinator",
+      "target": "FUN_0041386c",
+      "target_type": "native_coordinator",
+      "edge_type": "calls_native",
+      "ordering": "ordered",
+      "evidence_class": "E1_function_level_confirmed",
+      "summary": "save_user_set_to_flash reuses uci_set_by_string for history_list field updates.",
+      "source_ref": "Ghidra:0x00413e18"
+    },
+    {
+      "category": "persistence_boundary",
+      "source": "FUN_00413e18",
+      "source_type": "native_coordinator",
+      "target": "history_list",
+      "target_type": "persistence_object",
+      "edge_type": "projects_downstream",
+      "ordering": "ordered",
+      "evidence_class": "E1_function_level_confirmed",
+      "summary": "save_user_set_to_flash finds or creates a history_list section before persistence.",
+      "source_ref": "Ghidra:0x00413e18"
+    },
+    {
+      "category": "persistence_boundary",
+      "source": "FUN_00413e18",
+      "source_type": "native_coordinator",
+      "target": "saveconfig",
+      "target_type": "activation_endpoint",
+      "edge_type": "projects_downstream",
+      "ordering": "ordered",
+      "evidence_class": "E1_function_level_confirmed",
+      "summary": "save_user_set_to_flash triggers shell-mediated saveconfig after successful history_list mutation.",
+      "source_ref": "Ghidra:0x00413e18",
+      "original_target": "lua -e 'require(\"luci.sys.config\").saveconfig()'"
+    },
+    {
+      "category": "ordering_hint",
+      "source": "FUN_00413e18",
+      "source_type": "native_coordinator",
+      "target": "saveconfig",
+      "target_type": "activation_endpoint",
+      "edge_type": "projects_downstream",
+      "ordering": "ordered",
+      "evidence_class": "E1_function_level_confirmed",
+      "summary": "history_list mutation occurs before saveconfig().",
+      "source_ref": "Ghidra:0x00413e18"
+    },
+    {
+      "category": "persistence_boundary",
+      "source": "FUN_00414170",
+      "source_type": "native_coordinator",
+      "target": "/var/state/fing",
+      "target_type": "temporary_state_object",
+      "edge_type": "projects_downstream",
+      "ordering": "ordered",
+      "evidence_class": "E1_function_level_confirmed",
+      "summary": "uci_delete_section_by_node reverts /var/state/fing before history_list deletion/commit.",
+      "source_ref": "Ghidra:0x00414170",
+      "original_target": "uci -P /var/state revert fing.%s"
+    },
+    {
+      "category": "persistence_boundary",
+      "source": "FUN_00414170",
+      "source_type": "native_coordinator",
+      "target": "history_list",
+      "target_type": "persistence_object",
+      "edge_type": "projects_downstream",
+      "ordering": "ordered",
+      "evidence_class": "E1_function_level_confirmed",
+      "summary": "uci_delete_section_by_node deletes a matching history_list section and commits the result.",
+      "source_ref": "Ghidra:0x00414170"
+    },
+    {
+      "category": "ordering_hint",
+      "source": "FUN_00414170",
+      "source_type": "native_coordinator",
+      "target": "history_list",
+      "target_type": "persistence_object",
+      "edge_type": "projects_downstream",
+      "ordering": "ordered",
+      "evidence_class": "E1_function_level_confirmed",
+      "summary": "/var/state/fing revert occurs before matching history_list deletion and commit.",
+      "source_ref": "Ghidra:0x00414170"
+    },
+    {
+      "category": "xref_confirmed_edge",
+      "source": "FUN_00409ea4",
+      "source_type": "native_coordinator",
+      "target": "mac",
+      "target_type": "context_only",
+      "edge_type": "updates_identity_state",
+      "ordering": "unordered",
+      "evidence_class": "E1_function_level_confirmed",
+      "summary": "Bounded record parser ingests textual MAC before native byte storage.",
+      "source_ref": "Ghidra:0x00409ea4"
+    },
+    {
+      "category": "xref_confirmed_edge",
+      "source": "FUN_00409ea4",
+      "source_type": "native_coordinator",
+      "target": "FUN_0041b270",
+      "target_type": "native_coordinator",
+      "edge_type": "unordered_association",
+      "ordering": "unordered",
+      "evidence_class": "E3_converging_static_evidence",
+      "summary": "Bounded record parsing and strict MAC normalization occupy the same downstream normalized sink role, even though this path performs its own byte conversion inline.",
+      "source_ref": "AX72 client_mgmt validation"
+    },
+    {
+      "category": "semantic_recurrence_hint",
+      "claim": "client_mgmt acts as the downstream normalized mutation sink in OneMesh, but this hint should remain analyst guidance only.",
+      "evidence_class": "E3_converging_static_evidence",
+      "summary": "Optional recurrence hint; do not auto-apply.",
+      "source_ref": "AX72 client_mgmt validation"
+    }
+  ],
+  "warnings": [],
+  "unsupported_assumptions": []
+}
