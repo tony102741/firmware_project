@@ -5,14 +5,11 @@ work/
 data/
 runs/
 fw_dump/
-report/
 research/
 analysis_output/
 docs/
 paper/
 contact/
-research_strategy/
-_paper_workspace/
 
 .codex
 .mcp.json

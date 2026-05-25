@@ -1,53 +1,43 @@
 # client_mgmt Sink Workflow Assessment
 
-## Does the workflow transfer to downstream sinks?
+## Does the function-scoped graph workflow transfer to MR90X client_mgmt?
 
 Yes.
 
-The workflow remains useful even though `client_mgmt` is less helper-centric than `meshd` and less staging-centric than `sync-server`.
+The workflow remains useful on `MR90X client_mgmt` for the same reason it was useful on `AX72 client_mgmt`:
 
-Its strongest value here is not helper recovery. It is sink-boundary recovery:
+- raw graph extraction alone exposes sink artifacts
+- function-scoped notes recover the local normalization and mutation semantics that raw strings alone do not fully explain
 
-- textual identity carrier
-- native MAC normalization
-- bounded record mutation
-- UCI mutation
-- flash/save side effects
+## What the workflow captures well
 
-## How client_mgmt differs
+- strict MAC parsing and normalization
+- bounded native record mutation
+- `history_list` persistence
+- `uci_*` sink mutation primitives
+- shell-mediated `saveconfig`
 
-### Compared to `meshd`
+## What differs from meshd and sync-server
 
-- less shell-mediated ubus fan-out
-- more sink-local normalization
-- stronger native mutation semantics
+Compared to `meshd`:
 
-### Compared to `sync-server`
+- much less helper and ubus fan-out
+- much more local normalization and local mutation
 
-- less helper output staging
-- less `/tmp` bridge emphasis
-- more direct persistent mutation
+Compared to `sync-server`:
 
-## Category fit
+- much less staging and callback ingestion
+- much more direct sink-side persistence
 
-Categories that worked well:
+## Warnings and limitations
 
-- `function_role`
-- `persistence_boundary`
-- `ordering_hint`
-- `xref_confirmed_edge`
+Current `MR90X` function-scoped refinement still emits:
 
-Categories that mattered less here:
+- `2` ordering downgrade warnings for saveconfig-related note merges
+- `1` recurrence-hint warning that is intentionally not auto-applied
 
-- `helper_relationship`
-- `reconnect_relationship`
-
-This is expected. `client_mgmt` is a normalized sink, not an orchestration launcher.
+No hard conflicts were observed.
 
 ## Safe conclusion
 
-The graph workflow handles downstream normalized sinks adequately, but the useful graph shape changes:
-
-- fewer helper nodes
-- more persistence and sink nodes
-- more value from function roles than from prose-derived helper narratives
+The OneMesh function-scoped note workflow transfers to downstream normalized sinks, not only to orchestration-heavy or staging-heavy binaries.
