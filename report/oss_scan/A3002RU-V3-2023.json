@@ -1,0 +1,11 @@
+{
+  "label": "A3002RU-V3-2023",
+  "oss": {
+    "busybox": {"versions": ["1.13.4"], "found_in": ["bin/busybox"]},
+    "openssl": {"versions": ["0.9.8b", "0.9.8s", "1.0.2d"], "found_in": ["bin/wscd", "lib/libcrypto.so.1.0.0"]},
+    "boa": {"versions": ["0.94.14"], "found_in": ["bin/boa"]},
+    "curl": {"versions": ["7.36.0"], "found_in": ["bin/curl"]},
+    "dnsmasq": {"versions": ["2.33"], "found_in": ["bin/dnsmasq"]},
+    "miniupnpd": {"versions": ["1.0"], "found_in": ["bin/miniigd"]}
+  }
+}

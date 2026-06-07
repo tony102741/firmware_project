@@ -19,6 +19,7 @@ import sys
 import subprocess
 import shutil
 import argparse
+import base64
 import time
 import tempfile
 import re
@@ -117,6 +118,22 @@ _DJI_PRAK_MAX_TARGETS = 2
 _DJI_PRAK_PAYLOAD_MAGICS = (
     ("zip", b"PK\x03\x04"),
     ("gzip", b"\x1f\x8b\x08"),
+)
+
+_DLINK_SHRS_HEADER_LEN = 1756
+_DLINK_SHRS_SALT_HEX = "67c6697351ff4aec29cdbaabf2fbe346"
+_DLINK_SHRS_ENK = {
+    "dir-x3260": "NF5yKy10JTl+bSkhNj1kTTIkI3FhIyUsJDU0czMyZmR6Jl4jMzI4KjA2Mg==",
+}
+_DLINK_SHRS_INTERLEAVE = (
+    (2, 5, 7, 4, 0, 6, 1, 3),
+    (7, 3, 2, 6, 4, 5, 1, 0),
+    (5, 1, 6, 7, 3, 0, 4, 2),
+    (0, 3, 7, 6, 5, 4, 2, 1),
+    (1, 5, 7, 0, 3, 2, 6, 4),
+    (3, 6, 2, 5, 4, 7, 1, 0),
+    (6, 0, 5, 1, 3, 4, 2, 7),
+    (4, 6, 7, 3, 2, 0, 1, 5),
 )
 
 INPUT_ZIP     = "zip"
@@ -2241,6 +2258,10 @@ def _structure_info(path):
         kind = "ubi-image"
         confidence = "high"
         reasons.append("ubi-magic@0")
+    elif head.startswith(_MAGIC_FDT):
+        kind = "fit-image"
+        confidence = "high"
+        reasons.append("fdt-magic@0")
     elif head.startswith(b"hsqs") or head.startswith(b"sqsh") or head.startswith(b"qshs") or head.startswith(b"shsq"):
         kind = "squashfs-image"
         confidence = "high"
@@ -2303,7 +2324,7 @@ def _structure_info(path):
 
 def _should_attempt_nested_extract(structure):
     kind = str((structure or {}).get("kind") or "")
-    if kind.startswith(("zip-", "gzip-", "xz-", "lzma-", "ubi-", "squashfs-", "wrapped-", "android-")):
+    if kind.startswith(("zip-", "gzip-", "xz-", "lzma-", "ubi-", "squashfs-", "wrapped-", "android-", "fit-")):
         return True
     if kind.startswith("embedded-"):
         return True
@@ -2836,6 +2857,131 @@ def _detect_dlink_wrapper(path):
     return None
 
 
+def _dlink_shrs_model_key(path):
+    stem = os.path.basename(path).lower()
+    compact = re.sub(r"[^a-z0-9]+", "-", stem)
+    alnum = re.sub(r"[^a-z0-9]+", "", stem)
+    for model in _DLINK_SHRS_ENK:
+        if model in compact or model.replace("-", "") in alnum:
+            return model
+    return None
+
+
+def _dlink_shrs_vendor_key_hex(model):
+    encoded = _DLINK_SHRS_ENK.get(model)
+    if not encoded:
+        return None
+    try:
+        decoded = base64.b64decode(encoded)
+    except Exception:
+        return None
+    out = bytearray()
+    pos = 0
+    pattern = 0
+    while len(decoded) - pos >= 8 and len(out) < 16:
+        block = decoded[pos:pos + 8]
+        for idx in _DLINK_SHRS_INTERLEAVE[pattern]:
+            out.append(block[idx])
+            if len(out) >= 16:
+                break
+        pos += 8
+        pattern += 1
+        if pattern >= len(_DLINK_SHRS_INTERLEAVE):
+            pattern = 0
+    if len(out) != 16:
+        return None
+    return out.hex()
+
+
+def _try_decrypt_dlink_shrs_blob(blob_path, out_dir, wrapper):
+    if wrapper.get("kind") != "shrs":
+        return None
+    if shutil.which("openssl") is None:
+        _warn("D-Link SHRS decrypt skipped: openssl unavailable")
+        return None
+
+    model = _dlink_shrs_model_key(blob_path)
+    if not model:
+        _warn("D-Link SHRS decrypt skipped: no supported model key")
+        return None
+    key_hex = _dlink_shrs_vendor_key_hex(model)
+    if not key_hex:
+        _warn(f"D-Link SHRS decrypt skipped: failed to derive key for {model}")
+        return None
+
+    try:
+        size = os.path.getsize(blob_path)
+        with open(blob_path, "rb") as fh:
+            head = fh.read(_DLINK_SHRS_HEADER_LEN)
+    except OSError:
+        return None
+
+    if len(head) < _DLINK_SHRS_HEADER_LEN or not head.startswith(b"SHRS"):
+        return None
+
+    padded_len = int.from_bytes(head[8:12], "big")
+    remaining = max(0, size - _DLINK_SHRS_HEADER_LEN)
+    if padded_len <= 0 or padded_len > remaining or padded_len % 16 != 0:
+        padded_len = remaining - (remaining % 16)
+    if padded_len < 1024 * 1024:
+        return None
+
+    decrypt_dir = os.path.join(out_dir, ".dlink_shrs_auto")
+    shutil.rmtree(decrypt_dir, ignore_errors=True)
+    os.makedirs(decrypt_dir, exist_ok=True)
+    ciphertext = os.path.join(decrypt_dir, "ciphertext.bin")
+    decrypted = os.path.join(decrypt_dir, f"{model}_decrypted.bin")
+
+    try:
+        with open(blob_path, "rb") as src, open(ciphertext, "wb") as dst:
+            src.seek(_DLINK_SHRS_HEADER_LEN)
+            remaining_to_copy = padded_len
+            while remaining_to_copy > 0:
+                chunk = src.read(min(1024 * 1024, remaining_to_copy))
+                if not chunk:
+                    break
+                dst.write(chunk)
+                remaining_to_copy -= len(chunk)
+    except OSError:
+        return None
+
+    proc = run(
+        " ".join([
+            "openssl", "enc", "-d", "-aes-128-cbc",
+            "-K", key_hex,
+            "-iv", _DLINK_SHRS_SALT_HEX,
+            "-nopad",
+            "-in", shlex.quote(ciphertext),
+            "-out", shlex.quote(decrypted),
+        ]),
+        label=f"dlink shrs decrypt  {os.path.basename(blob_path)} ({model})",
+        quiet=True,
+    )
+    if proc.returncode != 0 or not os.path.isfile(decrypted):
+        return None
+
+    structure = _structure_info(decrypted)
+    _record_container_evidence(out_dir, decrypted, {
+        "kind": structure.get("kind"),
+        "confidence": structure.get("confidence"),
+        "reasons": structure.get("reasons"),
+        "size_bytes": structure.get("size_bytes"),
+        "entropy": structure.get("entropy"),
+        "printable_ratio": structure.get("printable_ratio"),
+        "extract_offset": structure.get("extract_offset"),
+        "salvage_source": "dlink-shrs-decrypt",
+        "wrapper_kind": wrapper.get("kind"),
+        "wrapper_signature_offset": wrapper.get("signature_offset"),
+        "model_key": model,
+        "cipher": "aes-128-cbc",
+        "ciphertext_size": padded_len,
+        "header_len": _DLINK_SHRS_HEADER_LEN,
+    })
+    if structure.get("kind") not in {"fit-image", "squashfs-image", "ubi-image"}:
+        return None
+    return decrypted
+
+
 def _try_extract_dlink_wrapped_blob(blob_path, out_dir):
     wrapper = _detect_dlink_wrapper(blob_path)
     if not wrapper:
@@ -2845,6 +2991,29 @@ def _try_extract_dlink_wrapped_blob(blob_path, out_dir):
         f"{wrapper['label']} detected; trying common D-Link payload offsets "
         f"({', '.join(hex(o) for o in wrapper['candidate_offsets'])})"
     )
+
+    decrypted = _try_decrypt_dlink_shrs_blob(blob_path, out_dir, wrapper)
+    if decrypted:
+        decrypt_dir = os.path.join(out_dir, ".dlink_shrs_auto")
+        nested_dir = os.path.join(decrypt_dir, f"_nested_{os.path.basename(decrypted)}")
+        rootfs = _try_extract_iot_blob(
+            decrypted,
+            nested_dir,
+            f"dlink shrs nested  {os.path.basename(decrypted)}",
+        )
+        if rootfs:
+            _ok(
+                "D-Link SHRS decrypt extract succeeded: "
+                f"{os.path.relpath(decrypted, PROJECT_ROOT)}"
+            )
+            return rootfs
+        raw_candidates = _scan_raw_fs_offsets(decrypted, nested_dir, decrypt_dir)
+        if raw_candidates:
+            _ok(
+                "D-Link SHRS raw-fs salvage succeeded: "
+                f"{os.path.relpath(decrypted, PROJECT_ROOT)}"
+            )
+            return raw_candidates[0]["path"]
 
     candidates = []
     header_base = int(wrapper.get("signature_offset") or 0)

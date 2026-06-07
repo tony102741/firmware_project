@@ -34,6 +34,10 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 SRC_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = SRC_ROOT.parent
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from core.analyzer.evidence_profile import build_evidence_profile
 
 TOP_CANDIDATES = 5
 TOP_DOSSIERS = 5
@@ -127,6 +131,7 @@ def _infer_success_quality_from_bundle(bundle: dict) -> Optional[str]:
         "/system",
         "/_ubi_extract/",
         "/_raw_fs",
+        "/_raw",
         "/.cache/rootfs/",
     )
     if analysis_mode in {"iot_web", "android"} and any(marker in system_path for marker in rootfs_markers):
@@ -163,6 +168,8 @@ def _infer_blob_family_from_bundle(bundle: dict, success_quality: Optional[str])
     if flow_type == "container_signal":
         if "tenda-style" in vendor_guess or "openssl salted" in (top.get("vuln_summary") or "").lower():
             return "tenda-openssl-container"
+        if "dlink" in vendor_guess or "shrs" in vendor_guess:
+            return "dlink-shrs-container"
         if "tp-link/mercusys cloud" in vendor_guess:
             return "mercusys-cloud-container"
         return "generic-container"
@@ -314,6 +321,8 @@ def _infer_best_next_action(
     if success_quality == "blob-success":
         if blob_family == "tenda-openssl-container":
             return "run-decrypt-probe"
+        if blob_family == "dlink-shrs-container":
+            return "inspect-container-payload"
         if blob_family == "mercusys-cloud-container":
             return "inspect-container-payload"
         if blob_family == "tp-link-segmented-bundle":
@@ -504,6 +513,7 @@ def _resolve_results_path(
 
 
 def _slim_candidate(candidate: dict) -> dict:
+    profile = candidate.get("evidence_profile") or build_evidence_profile(candidate)
     return {
         "name": candidate.get("name"),
         "binary_path": _safe_rel(candidate.get("binary_path") or candidate.get("exec")),
@@ -520,6 +530,14 @@ def _slim_candidate(candidate: dict) -> dict:
         "all_sinks": candidate.get("all_sinks") or [],
         "vuln_summary": candidate.get("vuln_summary") or "",
         "missing_links": candidate.get("missing_links") or [],
+        "false_positive_risks": candidate.get("false_positive_risks") or [],
+        "evidence_profile": {
+            "schema_version": profile.get("schema_version"),
+            "field_states": profile.get("field_states") or {},
+            "review_state": profile.get("review_state"),
+            "blockers": (profile.get("blockers") or [])[:8],
+            "validation_targets": (profile.get("validation_targets") or [])[:4],
+        },
         "next_steps": candidate.get("next_steps") or [],
     }
 
@@ -654,7 +672,7 @@ def build_review_packet(bundle: dict, corpus_entry: Optional[dict] = None) -> di
                 "has_web_ui": "boolean",
                 "artifact_kind": "rootfs-success | fallback-success | blob-success | unknown",
                 "probe_readiness": "rootfs-ready | fallback-ready | bundle-probe-ready | decrypt-probe-ready | scan-probe-ready | blob-ready | unknown",
-                "blob_family": "tp-link-segmented-bundle | mercusys-cloud-container | tenda-openssl-container | generic-container | generic-blob-signal | none",
+                "blob_family": "tp-link-segmented-bundle | mercusys-cloud-container | tenda-openssl-container | dlink-shrs-container | generic-container | generic-blob-signal | none",
                 "encrypted_container": "boolean",
                 "best_next_action": "triage-top-candidates | run-decrypt-probe | inspect-container-payload | inspect-segmented-bundle | expand-binary-signals | review-artifacts",
                 "top_risk_family": "cmd-injection | memory-corruption | upgrade-risk | crypto-risk | container-analysis | no-clear-rce",

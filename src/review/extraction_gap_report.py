@@ -10,6 +10,37 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 
+def classify_fix_lane(row: dict) -> tuple[str, str]:
+    """Group extraction gaps by the next engineering fix they need."""
+    sq = row.get("success_quality")
+    pr = row.get("probe_readiness")
+    bf = row.get("blob_family")
+    vendor = str(row.get("vendor") or "").lower()
+    model = str(row.get("model") or "").lower()
+
+    if sq == "rootfs-success":
+        return "rootfs-candidate-quality", "rootfs recovered; improve entrypoint/candidate evidence"
+    if bf == "tenda-openssl-container" or pr == "decrypt-probe-ready":
+        return "encrypted-container-decrypt", "decrypt or key-derivation probe needs improvement"
+    if bf == "dlink-shrs-container":
+        return "dlink-shrs-container", "D-Link SHRS payload is encrypted or obfuscated; identify decrypt/unpack path"
+    if bf == "tp-link-segmented-bundle" or pr == "bundle-probe-ready":
+        return "segmented-bundle-extract", "segmented/chunked bundle extractor needs improvement"
+    if bf == "mercusys-cloud-container":
+        return "cloud-container-extract", "cloud container extraction needs deeper payload recovery"
+    if pr == "scan-probe-ready" and "d-link" in vendor:
+        return "dlink-container-scan", "D-Link generic container scan should be turned into rootfs recovery"
+    if pr == "scan-probe-ready":
+        return "generic-container-scan", "generic container scan should identify a filesystem payload"
+    if sq == "fallback-success" and ("netgear" in vendor or "synology" in vendor):
+        return "vendor-fallback-extract", "vendor-specific fallback extractor is missing or incomplete"
+    if sq == "fallback-success":
+        return "fallback-extract", "fallback analysis needs a format-specific extractor"
+    if sq == "blob-success":
+        return "opaque-blob-triage", "blob-level evidence exists but no rootfs recovery path is known"
+    return "metadata-backfill", "metadata or regression status needs backfill"
+
+
 def load_jsonl(path: str | Path) -> list[dict]:
     return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
 
@@ -47,6 +78,7 @@ def build_rows(corpus_rows: list[dict]) -> list[dict]:
         score, reasons = classify_priority(row)
         if score <= 0:
             continue
+        fix_lane, fix_reason = classify_fix_lane(row)
         out.append({
             "corpus_id": row.get("corpus_id"),
             "vendor": row.get("vendor"),
@@ -58,8 +90,10 @@ def build_rows(corpus_rows: list[dict]) -> list[dict]:
             "local_path": row.get("local_path"),
             "priority_score": score,
             "priority_reasons": reasons,
+            "fix_lane": fix_lane,
+            "fix_reason": fix_reason,
         })
-    out.sort(key=lambda r: (-int(r["priority_score"]), r["vendor"] or "", r["model"] or "", r["version"] or ""))
+    out.sort(key=lambda r: (-int(r["priority_score"]), r["fix_lane"], r["vendor"] or "", r["model"] or "", r["version"] or ""))
     return out
 
 
@@ -76,9 +110,33 @@ def write_markdown(corpus_rows: list[dict], priority_rows: list[dict], path: str
         f"- probe_readiness: `{dict(pr)}`",
         f"- blob_family: `{dict(bf)}`",
         "",
-        "## Top Extraction Priorities",
+        "## Fix Lanes",
         "",
     ]
+
+    by_lane: dict[str, list[dict]] = defaultdict(list)
+    for row in priority_rows:
+        by_lane[row["fix_lane"]].append(row)
+    lane_rows = sorted(
+        by_lane.items(),
+        key=lambda item: (-len(item[1]), -max(int(row["priority_score"]) for row in item[1]), item[0]),
+    )
+    for lane, rows in lane_rows:
+        first = rows[0]
+        lines.extend([
+            f"### {lane}",
+            f"- targets: `{len(rows)}`",
+            f"- max_priority: `{max(int(row['priority_score']) for row in rows)}`",
+            f"- reason: `{first['fix_reason']}`",
+            f"- first_target: `{first['vendor']} {first['model']} {first['version']}`",
+            f"- first_path: `{first['local_path']}`",
+            "",
+        ])
+
+    lines.extend([
+        "## Top Extraction Priorities",
+        "",
+    ])
     for idx, row in enumerate(priority_rows[:top], 1):
         lines.extend([
             f"### Rank {idx}",
@@ -90,6 +148,8 @@ def write_markdown(corpus_rows: list[dict], priority_rows: list[dict], path: str
             f"- local_path: `{row['local_path']}`",
             f"- priority_score: `{row['priority_score']}`",
             f"- reasons: `{', '.join(row['priority_reasons'])}`",
+            f"- fix_lane: `{row['fix_lane']}`",
+            f"- fix_reason: `{row['fix_reason']}`",
             "",
         ])
     Path(path).write_text("\n".join(lines), encoding="utf-8")

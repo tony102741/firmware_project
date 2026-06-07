@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 
+try:
+    from .paths import regeneration_dir
+except ImportError:
+    from paths import regeneration_dir
 
-OUTDIR = Path("/home/user/firmware_project/research/regeneration/full_corpus_20260508")
+OUTDIR = regeneration_dir()
 
 
 @dataclass

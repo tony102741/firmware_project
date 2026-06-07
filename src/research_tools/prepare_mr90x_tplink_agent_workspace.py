@@ -3,17 +3,22 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from component_dossier import build_dossier
+try:
+    from .component_dossier import build_dossier
+    from .paths import ghidra_targets_dir, regeneration_dir
+except ImportError:
+    from component_dossier import build_dossier
+    from paths import ghidra_targets_dir, regeneration_dir
 
 
-ROOTFS = Path(
-    "/home/user/firmware_project/research/regeneration/full_corpus_20260508/"
-    "MR90X (EU)/MR90X(EU)_V1.20_23080820240123090924/.cache/build/"
-    "_iot_extract_mr90xv1-2-up-eu-ver1-0-1-p1_cfa5c26b/_ubi_extract/117A.ubi/"
-    "_nested_img-2086401218_vol-rootfs.ubifs/"
-    "_img-2086401218_vol-rootfs.ubifs.extracted/squashfs-root"
+ROOTFS = (
+    regeneration_dir()
+    / "MR90X (EU)/MR90X(EU)_V1.20_23080820240123090924/.cache/build/"
+    / "_iot_extract_mr90xv1-2-up-eu-ver1-0-1-p1_cfa5c26b/_ubi_extract/117A.ubi/"
+    / "_nested_img-2086401218_vol-rootfs.ubifs/"
+    / "_img-2086401218_vol-rootfs.ubifs.extracted/squashfs-root"
 )
-WORKSPACE = Path("/home/user/firmware_project/ghidra_targets/mr90x_tplink_agent_stack")
+WORKSPACE = ghidra_targets_dir() / "mr90x_tplink_agent_stack"
 
 COMPONENTS = [
     "usr/bin/cloud-pfclient",

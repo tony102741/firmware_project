@@ -1,0 +1,10 @@
+{
+  "label": "X6000R-V9.4-2025",
+  "oss": {
+    "busybox": {"versions": ["1.33.2"], "found_in": ["bin/busybox"]},
+    "openssl": {"versions": ["1.1.1t"], "found_in": ["usr/lib/libcrypto.so.1.1"]},
+    "lua": {"versions": ["5.1.5"], "found_in": ["usr/bin/lua5.1"]},
+    "miniupnpd": {"versions": ["2.2"], "found_in": ["usr/sbin/miniupnpd"]},
+    "openwrt": {"versions": ["21.02-SNAPSHOT"], "found_in": ["etc/banner"]}
+  }
+}

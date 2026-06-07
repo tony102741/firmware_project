@@ -28,6 +28,7 @@ from analyzer.verify_flow import verify_exploitable_flows
 from analyzer.reach_check import analyze_reachability
 from analyzer.strings_analyzer import extract_strings
 from analyzer.cve_triage import select_cve_candidates, explain_triage
+from analyzer.evidence_profile import build_evidence_profile, evidence_adjusted_score
 from analyzer.scoring import is_logging_only_sink
 from analyzer.crypto_scanner import scan_crypto_material
 from analyzer.upgrade_analyzer import scan_upgrade_scripts
@@ -2318,6 +2319,11 @@ def _build_result_snapshot(result, cgi_files=None, exploit_paths=None):
         "next_steps": _next_steps_for_result(result, review=review, exploit_paths=exploit_paths),
     }
     snapshot["triage_score"] = explain_triage(snapshot)[0]
+    snapshot["evidence_profile"] = _json_safe(build_evidence_profile(snapshot))
+    snapshot["evidence_adjusted_score"] = evidence_adjusted_score(
+        snapshot,
+        raw_score=snapshot["triage_score"] or snapshot["score"],
+    )
     return snapshot
 
 
@@ -3132,6 +3138,7 @@ def _emit_analysis_bundle(mode, mode_reason, result, *, output_path=None, dossie
                 "binary_path":   c.get("binary_path"),
                 "vuln_summary":  c.get("vuln_summary") or "",
                 "triage_score":  c.get("triage_score", 0),
+                "evidence_adjusted_score": c.get("evidence_adjusted_score", 0),
                 "score":         c.get("score", 0),
                 "auth_bypass":   c.get("auth_bypass"),
                 "confidence":    c.get("confidence"),
@@ -3149,6 +3156,7 @@ def _emit_analysis_bundle(mode, mode_reason, result, *, output_path=None, dossie
                 "protections": c.get("protections") or [],
                 "missing_links": c.get("missing_links") or [],
                 "false_positive_risks": c.get("false_positive_risks") or [],
+                "evidence_profile": c.get("evidence_profile") or {},
                 "verdict": c.get("cve_verdict"),
                 "next_steps": c.get("next_steps") or [],
             }

@@ -1,0 +1,715 @@
+[
+  {
+    "label": "A3002RU-V3-2020",
+    "oss": {
+      "busybox": {
+        "versions": [
+          "1.13.4"
+        ],
+        "found_in": [
+          "bin/busybox"
+        ]
+      },
+      "openssl": {
+        "versions": [
+          "0.9.8b",
+          "0.9.8s",
+          "1.0.2d"
+        ],
+        "found_in": [
+          "bin/wscd",
+          "lib/libcrypto.so.1.0.0",
+          "lib/libssl.so.1.0.0"
+        ]
+      },
+      "boa": {
+        "versions": [
+          "0.94.14"
+        ],
+        "found_in": [
+          "bin/boa"
+        ]
+      },
+      "dnsmasq": {
+        "versions": [
+          "2.33"
+        ],
+        "found_in": [
+          "bin/dnsmasq"
+        ]
+      },
+      "miniupnpd": {
+        "versions": [
+          "1.0"
+        ],
+        "found_in": [
+          "bin/miniigd"
+        ]
+      }
+    }
+  },
+  {
+    "label": "A3002RU-V3-2022",
+    "oss": {
+      "busybox": {
+        "versions": [
+          "1.13.4"
+        ],
+        "found_in": [
+          "bin/busybox"
+        ]
+      },
+      "openssl": {
+        "versions": [
+          "0.9.8b",
+          "0.9.8s",
+          "1.0.2d"
+        ],
+        "found_in": [
+          "bin/wscd",
+          "lib/libcrypto.so.1.0.0"
+        ]
+      },
+      "boa": {
+        "versions": [
+          "0.94.14"
+        ],
+        "found_in": [
+          "bin/boa"
+        ]
+      },
+      "curl": {
+        "versions": [
+          "7.36.0"
+        ],
+        "found_in": [
+          "bin/curl"
+        ]
+      },
+      "dnsmasq": {
+        "versions": [
+          "2.33"
+        ],
+        "found_in": [
+          "bin/dnsmasq"
+        ]
+      },
+      "miniupnpd": {
+        "versions": [
+          "1.0"
+        ],
+        "found_in": [
+          "bin/miniigd"
+        ]
+      }
+    }
+  },
+  {
+    "label": "A3002RU-V3-2023",
+    "oss": {
+      "busybox": {
+        "versions": [
+          "1.13.4"
+        ],
+        "found_in": [
+          "bin/busybox"
+        ]
+      },
+      "openssl": {
+        "versions": [
+          "0.9.8b",
+          "0.9.8s",
+          "1.0.2d"
+        ],
+        "found_in": [
+          "bin/wscd",
+          "lib/libcrypto.so.1.0.0"
+        ]
+      },
+      "boa": {
+        "versions": [
+          "0.94.14"
+        ],
+        "found_in": [
+          "bin/boa"
+        ]
+      },
+      "curl": {
+        "versions": [
+          "7.36.0"
+        ],
+        "found_in": [
+          "bin/curl"
+        ]
+      },
+      "dnsmasq": {
+        "versions": [
+          "2.33"
+        ],
+        "found_in": [
+          "bin/dnsmasq"
+        ]
+      },
+      "miniupnpd": {
+        "versions": [
+          "1.0"
+        ],
+        "found_in": [
+          "bin/miniigd"
+        ]
+      }
+    }
+  },
+  {
+    "label": "X6000R-V9.4-2025",
+    "oss": {
+      "busybox": {
+        "versions": [
+          "1.33.2"
+        ],
+        "found_in": [
+          "bin/busybox"
+        ]
+      },
+      "openssl": {
+        "versions": [
+          "1.1.1t"
+        ],
+        "found_in": [
+          "usr/lib/libcrypto.so.1.1"
+        ]
+      },
+      "lua": {
+        "versions": [
+          "5.1.5"
+        ],
+        "found_in": [
+          "usr/bin/lua5.1"
+        ]
+      },
+      "miniupnpd": {
+        "versions": [
+          "2.2"
+        ],
+        "found_in": [
+          "usr/sbin/miniupnpd"
+        ]
+      },
+      "openwrt": {
+        "versions": [
+          "21.02-SNAPSHOT"
+        ],
+        "found_in": [
+          "etc/banner"
+        ]
+      }
+    }
+  },
+  {
+    "label": "MR60X-V1.1-2025",
+    "oss": {
+      "busybox": {
+        "versions": [
+          "1.19.4"
+        ],
+        "found_in": [
+          "bin/busybox"
+        ]
+      },
+      "curl": {
+        "versions": [
+          "7.29.0"
+        ],
+        "found_in": [
+          "usr/bin/curl"
+        ]
+      },
+      "openssl": {
+        "versions": [
+          "1.0.2u",
+          "1.1.1"
+        ],
+        "found_in": [
+          "usr/bin/openssl",
+          "usr/lib/libcrypto.so.1.0.0"
+        ]
+      },
+      "dnsmasq": {
+        "versions": [
+          "2.83"
+        ],
+        "found_in": [
+          "usr/sbin/dnsmasq"
+        ]
+      },
+      "lua": {
+        "versions": [
+          "5.1.4"
+        ],
+        "found_in": [
+          "usr/bin/lua"
+        ]
+      },
+      "miniupnpd": {
+        "versions": [
+          "1.8"
+        ],
+        "found_in": [
+          "usr/sbin/miniupnpd"
+        ]
+      },
+      "uclibc": {
+        "versions": [
+          "0.9.33"
+        ],
+        "found_in": [
+          "usr/lib/opkg/info/libc.list"
+        ]
+      },
+      "uhttpd": {
+        "versions": [
+          "detected"
+        ],
+        "found_in": [
+          "usr/lib/opkg/info/uhttpd.list"
+        ]
+      },
+      "openwrt": {
+        "versions": [
+          "12.09"
+        ],
+        "found_in": [
+          "etc/openwrt_release"
+        ]
+      }
+    }
+  },
+  {
+    "label": "MR70X-V1.2-2025",
+    "oss": {},
+    "error": "no_rootfs"
+  },
+  {
+    "label": "RX9Pro-V22.03",
+    "oss": {
+      "busybox": {
+        "versions": [
+          "1.30.1"
+        ],
+        "found_in": [
+          "bin/busybox"
+        ]
+      },
+      "openssl": {
+        "versions": [
+          "1.0.2t"
+        ],
+        "found_in": [
+          "usr/lib/libcrypto.so.1.0.0"
+        ]
+      },
+      "lua": {
+        "versions": [
+          "5.1.5"
+        ],
+        "found_in": [
+          "usr/lib/liblua.so.5.1.5"
+        ]
+      },
+      "miniupnpd": {
+        "versions": [
+          "1.9"
+        ],
+        "found_in": [
+          "usr/sbin/miniupnpd"
+        ]
+      }
+    }
+  },
+  {
+    "label": "TX2Pro-V16.03",
+    "oss": {},
+    "error": "no_rootfs"
+  },
+  {
+    "label": "AX2004M-ml14",
+    "oss": {
+      "busybox": {
+        "versions": [
+          "1.25.1"
+        ],
+        "found_in": [
+          "bin/busybox"
+        ]
+      },
+      "curl": {
+        "versions": [
+          "7.71.1"
+        ],
+        "found_in": [
+          "lib/libcurl.so.4.6.0"
+        ]
+      },
+      "openssl": {
+        "versions": [
+          "1.0.2u",
+          "1.1.1"
+        ],
+        "found_in": [
+          "lib/libcrypto.so.1.0.0"
+        ]
+      },
+      "lighttpd": {
+        "versions": [
+          "1.4.26"
+        ],
+        "found_in": [
+          "sbin/lighttpd"
+        ]
+      },
+      "miniupnpd": {
+        "versions": [
+          "1.6"
+        ],
+        "found_in": [
+          "bin/upnpd"
+        ]
+      }
+    }
+  },
+  {
+    "label": "AX12Pro-V16.03",
+    "oss": {},
+    "error": "no_rootfs"
+  },
+  {
+    "label": "WR1300V4-2.3.8",
+    "oss": {
+      "busybox": {
+        "versions": [
+          "1.25.1"
+        ],
+        "found_in": [
+          "bin/busybox"
+        ]
+      },
+      "curl": {
+        "versions": [
+          "7.82.0"
+        ],
+        "found_in": [
+          "usr/bin/curl"
+        ]
+      },
+      "openssl": {
+        "versions": [
+          "1.0.2o",
+          "1.1.1"
+        ],
+        "found_in": [
+          "usr/bin/openssl"
+        ]
+      },
+      "lua": {
+        "versions": [
+          "5.1.5"
+        ],
+        "found_in": [
+          "usr/bin/lua"
+        ]
+      },
+      "miniupnpd": {
+        "versions": [
+          "2.1"
+        ],
+        "found_in": [
+          "usr/sbin/miniupnpd"
+        ]
+      },
+      "uhttpd": {
+        "versions": [
+          "detected"
+        ],
+        "found_in": [
+          "usr/lib/opkg/info/uhttpd.list"
+        ]
+      },
+      "lede": {
+        "versions": [
+          "17.01.5"
+        ],
+        "found_in": [
+          "etc/banner"
+        ]
+      },
+      "openwrt": {
+        "versions": [
+          "17.01.5"
+        ],
+        "found_in": [
+          "etc/openwrt_release"
+        ]
+      }
+    }
+  },
+  {
+    "label": "WR3000E-2.2.7",
+    "oss": {}
+  },
+  {
+    "label": "GL-MT3000-4.8.1",
+    "oss": {
+      "busybox": {
+        "versions": [
+          "1.33.2"
+        ],
+        "found_in": [
+          "bin/busybox"
+        ]
+      },
+      "curl": {
+        "versions": [
+          "7.83.1"
+        ],
+        "found_in": [
+          "usr/bin/curl"
+        ]
+      },
+      "openssl": {
+        "versions": [
+          "1.1.1q",
+          "1.2.11"
+        ],
+        "found_in": [
+          "usr/bin/openssl"
+        ]
+      },
+      "lua": {
+        "versions": [
+          "5.1.5",
+          "5.4.7"
+        ],
+        "found_in": [
+          "usr/bin/eco"
+        ]
+      },
+      "musl": {
+        "versions": [
+          "8.4.0"
+        ],
+        "found_in": [
+          "usr/bin/mvxattr"
+        ]
+      },
+      "uhttpd": {
+        "versions": [
+          "detected"
+        ],
+        "found_in": [
+          "usr/lib/opkg/info/uhttpd.list"
+        ]
+      },
+      "openwrt": {
+        "versions": [
+          "21.02-SNAPSHOT"
+        ],
+        "found_in": [
+          "etc/banner"
+        ]
+      }
+    }
+  },
+  {
+    "label": "GL-MT6000-4.8.4",
+    "oss": {
+      "busybox": {
+        "versions": [
+          "1.33.2"
+        ],
+        "found_in": [
+          "bin/busybox"
+        ]
+      },
+      "musl": {
+        "versions": [
+          "8.4.0"
+        ],
+        "found_in": [
+          "usr/bin/mvxattr",
+          "usr/bin/nmblookup",
+          "usr/bin/pdbedit",
+          "usr/bin/smbpasswd",
+          "usr/bin/smbstatus"
+        ]
+      },
+      "lua": {
+        "versions": [
+          "5.1.5",
+          "5.4.7"
+        ],
+        "found_in": [
+          "usr/bin/eco",
+          "usr/bin/lua5.1",
+          "usr/lib/liblua.so.5.1.5",
+          "usr/lib/liblua5.4.so.0.0.0"
+        ]
+      },
+      "curl": {
+        "versions": [
+          "7.83.1"
+        ],
+        "found_in": [
+          "usr/bin/curl",
+          "usr/lib/libcurl.so.4.8.0"
+        ]
+      },
+      "openssl": {
+        "versions": [
+          "1.1.1t",
+          "1.2.11"
+        ],
+        "found_in": [
+          "usr/bin/openssl",
+          "usr/lib/libbind9-9.18.7.so",
+          "usr/lib/libcrypto.so.1.1",
+          "usr/sbin/nginx",
+          "usr/sbin/tor"
+        ]
+      },
+      "linux_kernel": {
+        "versions": [
+          "4.4.0"
+        ],
+        "found_in": [
+          "usr/sbin/tailscaled"
+        ]
+      },
+      "openwrt": {
+        "versions": [
+          "21.02-SNAPSHOT"
+        ],
+        "found_in": [
+          "etc/banner",
+          "etc/openwrt_release",
+          "etc/os-release",
+          "usr/lib/os-release"
+        ]
+      },
+      "uhttpd": {
+        "versions": [
+          "detected"
+        ],
+        "found_in": [
+          "usr/lib/opkg/info/uhttpd.list"
+        ]
+      }
+    }
+  },
+  {
+    "label": "GL-X3000-4.8.3",
+    "oss": {
+      "busybox": {
+        "versions": [
+          "1.33.2"
+        ],
+        "found_in": [
+          "bin/busybox"
+        ]
+      },
+      "musl": {
+        "versions": [
+          "8.4.0"
+        ],
+        "found_in": [
+          "usr/bin/mvxattr",
+          "usr/bin/nmblookup",
+          "usr/bin/pdbedit",
+          "usr/bin/smbpasswd",
+          "usr/bin/smbstatus"
+        ]
+      },
+      "lua": {
+        "versions": [
+          "5.1.5",
+          "5.3.5",
+          "5.4.7"
+        ],
+        "found_in": [
+          "usr/bin/eco",
+          "usr/bin/lua5.1",
+          "usr/lib/liblua.so.5.1.5",
+          "usr/lib/liblua5.3.so.0.0.0",
+          "usr/lib/liblua5.4.so.0.0.0"
+        ]
+      },
+      "curl": {
+        "versions": [
+          "7.83.1"
+        ],
+        "found_in": [
+          "usr/bin/curl",
+          "usr/lib/libcurl.so.4.8.0"
+        ]
+      },
+      "openssl": {
+        "versions": [
+          "1.1.1q",
+          "1.2.11"
+        ],
+        "found_in": [
+          "usr/bin/openssl",
+          "usr/lib/libbind9-9.18.1.so",
+          "usr/lib/libcrypto.so.1.1",
+          "usr/sbin/nginx",
+          "usr/sbin/tor"
+        ]
+      },
+      "linux_kernel": {
+        "versions": [
+          "4.4.0"
+        ],
+        "found_in": [
+          "usr/sbin/tailscaled"
+        ]
+      },
+      "openwrt": {
+        "versions": [
+          "21.02-SNAPSHOT"
+        ],
+        "found_in": [
+          "etc/banner",
+          "etc/openwrt_release",
+          "etc/os-release",
+          "usr/lib/os-release"
+        ]
+      },
+      "uhttpd": {
+        "versions": [
+          "detected"
+        ],
+        "found_in": [
+          "usr/lib/opkg/info/uhttpd.list"
+        ]
+      }
+    }
+  },
+  {
+    "label": "MX4200-2.0.7",
+    "oss": {}
+  },
+  {
+    "label": "RAX50-V1.0.0",
+    "oss": {},
+    "error": "no_rootfs"
+  },
+  {
+    "label": "RT2600ac-1.3.6",
+    "oss": {},
+    "error": "no_file"
+  },
+  {
+    "label": "RT6600ax-1.3.1",
+    "oss": {},
+    "error": "no_file"
+  }
+]

@@ -1,0 +1,13 @@
+{
+  "label": "WR1300V4-2.3.8",
+  "oss": {
+    "busybox": {"versions": ["1.25.1"], "found_in": ["bin/busybox"]},
+    "curl": {"versions": ["7.82.0"], "found_in": ["usr/bin/curl"]},
+    "openssl": {"versions": ["1.0.2o", "1.1.1"], "found_in": ["usr/bin/openssl"]},
+    "lua": {"versions": ["5.1.5"], "found_in": ["usr/bin/lua"]},
+    "miniupnpd": {"versions": ["2.1"], "found_in": ["usr/sbin/miniupnpd"]},
+    "uhttpd": {"versions": ["detected"], "found_in": ["usr/lib/opkg/info/uhttpd.list"]},
+    "lede": {"versions": ["17.01.5"], "found_in": ["etc/banner"]},
+    "openwrt": {"versions": ["17.01.5"], "found_in": ["etc/openwrt_release"]}
+  }
+}

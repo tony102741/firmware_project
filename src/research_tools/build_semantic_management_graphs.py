@@ -18,8 +18,9 @@ from research_tools.build_management_plane_graphs_annotated import (  # noqa: E4
     tp_link_graph,
 )
 
+from research_tools.paths import regeneration_dir  # noqa: E402
 
-OUTDIR = Path("/home/user/firmware_project/research/regeneration/full_corpus_20260508")
+OUTDIR = regeneration_dir()
 MOTIF_RESULTS = OUTDIR / "orchestration_motif_results.json"
 
 OUTPUTS = {

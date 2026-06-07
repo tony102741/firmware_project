@@ -104,6 +104,9 @@ def summarize_row(row: dict) -> dict | None:
     elif blob_family == "tenda-openssl-container":
         salvageable.extend(["ciphertext payload", "decrypted candidate blobs"])
         next_action = "decrypt_attempt"
+    elif blob_family == "dlink-shrs-container":
+        salvageable.extend(["SHRS wrapper header", "high-entropy payload", "container scan probes"])
+        next_action = "identify_dlink_unpack_or_decrypt"
     else:
         salvageable.extend(["opaque payload", "static strings", "partial binary artifacts"])
         next_action = "static_only_analysis"

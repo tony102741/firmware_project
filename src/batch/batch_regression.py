@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,7 @@ BLOB_FAMILIES = {
     "tp-link-segmented-bundle",
     "mercusys-cloud-container",
     "tenda-openssl-container",
+    "dlink-shrs-container",
     "generic-container",
     "generic-blob-signal",
 }
@@ -157,6 +159,76 @@ def write_jsonl(path, entries):
             fh.write("\n")
 
 
+def process_output_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def run_pipeline_command(cmd, env, timeout):
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(PROJECT_ROOT),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return proc, (stdout or "") + (stderr or "")
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = proc.communicate()
+        output = (
+            process_output_text(exc.stdout)
+            + process_output_text(exc.stderr)
+            + process_output_text(stdout)
+            + process_output_text(stderr)
+        )
+        return "timeout", output.strip()
+
+
+def build_summary_payload(results, workspace_root):
+    return {
+        "total": len(results),
+        "workspace_root": workspace_root,
+        "counts": {
+            status.lower(): sum(1 for r in results if r["status"] == status)
+            for status in RUN_STATUSES
+        },
+        "success_quality_counts": {
+            quality: sum(1 for r in results if r.get("success_quality") == quality)
+            for quality in SUCCESS_QUALITIES
+        },
+        "probe_readiness_counts": {
+            readiness: sum(1 for r in results if r.get("probe_readiness") == readiness)
+            for readiness in PROBE_READINESS
+        },
+        "blob_family_counts": {
+            family: sum(1 for r in results if r.get("blob_family") == family)
+            for family in BLOB_FAMILIES
+        },
+        "results": [
+            {k: v for k, v in r.items() if k not in {"_candidates", "_container_targets"}}
+            for r in results
+        ],
+    }
+
+
 def classify_run(proc, manifest, results, output):
     lower_output = output.lower()
     summary = (results or {}).get("summary") or {}
@@ -220,6 +292,7 @@ def classify_success_quality(result):
         "/system",
         "/_ubi_extract/",
         "/_raw_fs",
+        "/_raw",
         "/.cache/rootfs/",
     )
     if analysis_mode in {"iot_web", "android"} and any(marker in system_path for marker in rootfs_markers):
@@ -236,8 +309,28 @@ def classify_blob_family(result):
     candidates = result.get("_candidates") or []
     system_path = (result.get("analysis_system_path") or "").lower()
     candidate_names = " ".join(str(c.get("name") or "").lower() for c in candidates)
+    vendor = (result.get("vendor") or "").lower()
     if "_segmented_partial_layout" in system_path or "segments::" in candidate_names:
         return "tp-link-segmented-bundle"
+    container_targets = result.get("_container_targets") or []
+    target_text = " ".join(
+        " ".join(str(value or "").lower() for value in (
+            target.get("name"),
+            target.get("source_kind"),
+            target.get("vendor_guess"),
+            target.get("crypto_profile"),
+            " ".join(str(h or "") for h in (target.get("extraction_hints") or [])),
+            target.get("dest"),
+        ))
+        for target in container_targets
+    )
+    if (
+        "dlink" in vendor
+        or "d-link" in vendor
+        or "shrs" in target_text
+        or "dlink" in target_text
+    ):
+        return "dlink-shrs-container"
     if not candidates:
         return "generic-blob-signal"
 
@@ -246,7 +339,6 @@ def classify_blob_family(result):
     vendor_guess = (top.get("vendor_guess") or "").lower()
     binary_path = (top.get("binary_path") or "").lower()
     name = (top.get("name") or "").lower()
-    vendor = (result.get("vendor") or "").lower()
 
     if flow_type == "container_signal":
         if "tenda-style" in vendor_guess or "openssl salted" in (top.get("vuln_summary") or "").lower():
@@ -361,20 +453,7 @@ def run_one(entry, workspace_root, keep_sample_workspace=False):
 
     cmd = ["python3", str(PIPELINE), "--input", str(input_path)]
     started = time.time()
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(PROJECT_ROOT),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=entry.get("_timeout_seconds"),
-        )
-    except subprocess.TimeoutExpired as exc:
-        proc = "timeout"
-        output = ((exc.stdout or "") + (exc.stderr or "")).strip()
-    else:
-        output = (proc.stdout or "") + (proc.stderr or "")
+    proc, output = run_pipeline_command(cmd, env, entry.get("_timeout_seconds"))
     elapsed = round(time.time() - started, 2)
 
     run_bucket = runs_dir / product_label / version_label
@@ -607,31 +686,19 @@ def main():
         )
         if result["status"] in {"BLOCKED", "BUG"} and result.get("tail"):
             print(result["tail"], flush=True)
+        if args.json_output:
+            checkpoint = build_summary_payload(results, args.workspace_root)
+            checkpoint["checkpoint"] = {
+                "completed": len(results),
+                "expected": len(entries),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            Path(args.json_output).write_text(
+                json.dumps(checkpoint, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
 
-    counts = {status.lower(): sum(1 for r in results if r["status"] == status) for status in RUN_STATUSES}
-    quality_counts = {
-        quality: sum(1 for r in results if r.get("success_quality") == quality)
-        for quality in SUCCESS_QUALITIES
-    }
-    readiness_counts = {
-        readiness: sum(1 for r in results if r.get("probe_readiness") == readiness)
-        for readiness in PROBE_READINESS
-    }
-    payload = {
-        "total": len(results),
-        "workspace_root": args.workspace_root,
-        "counts": counts,
-        "success_quality_counts": quality_counts,
-        "probe_readiness_counts": readiness_counts,
-        "blob_family_counts": {
-            family: sum(1 for r in results if r.get("blob_family") == family)
-            for family in BLOB_FAMILIES
-        },
-        "results": [
-            {k: v for k, v in r.items() if k not in {"_candidates", "_container_targets"}}
-            for r in results
-        ],
-    }
+    payload = build_summary_payload(results, args.workspace_root)
 
     if args.write_corpus:
         corpus_entries = load_jsonl(args.corpus)
@@ -663,7 +730,7 @@ def main():
         if args.json_output:
             Path(args.json_output).write_text(rendered + "\n", encoding="utf-8")
 
-    return 0 if counts["bug"] == 0 else 1
+    return 0 if payload["counts"].get("bug", 0) == 0 else 1
 
 
 if __name__ == "__main__":

@@ -9,7 +9,12 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from service_topology import extract_service_topology, markdown_service_topology
+try:
+    from .paths import relative_to_project
+    from .service_topology import extract_service_topology, markdown_service_topology
+except ImportError:
+    from paths import relative_to_project
+    from service_topology import extract_service_topology, markdown_service_topology
 
 STRING_PATTERNS = [
     "127.0.0.1",
@@ -157,7 +162,7 @@ def classify_candidate(strings: dict[str, list[str]], init_meta: dict[str, objec
 
 
 def short_path(path: str) -> str:
-    return path.replace("/home/user/firmware_project/", "")
+    return relative_to_project(path)
 
 
 def write(path: Path, text: str) -> None:

@@ -188,6 +188,7 @@ def _json_schema() -> dict:
                         "tp-link-segmented-bundle",
                         "mercusys-cloud-container",
                         "tenda-openssl-container",
+                        "dlink-shrs-container",
                         "generic-container",
                         "generic-blob-signal",
                         "none",

@@ -1,0 +1,88 @@
+{
+  "label": "GL-X3000-4.8.3",
+  "oss": {
+    "busybox": {
+      "versions": [
+        "1.33.2"
+      ],
+      "found_in": [
+        "bin/busybox"
+      ]
+    },
+    "musl": {
+      "versions": [
+        "8.4.0"
+      ],
+      "found_in": [
+        "usr/bin/mvxattr",
+        "usr/bin/nmblookup",
+        "usr/bin/pdbedit",
+        "usr/bin/smbpasswd",
+        "usr/bin/smbstatus"
+      ]
+    },
+    "lua": {
+      "versions": [
+        "5.1.5",
+        "5.3.5",
+        "5.4.7"
+      ],
+      "found_in": [
+        "usr/bin/eco",
+        "usr/bin/lua5.1",
+        "usr/lib/liblua.so.5.1.5",
+        "usr/lib/liblua5.3.so.0.0.0",
+        "usr/lib/liblua5.4.so.0.0.0"
+      ]
+    },
+    "curl": {
+      "versions": [
+        "7.83.1"
+      ],
+      "found_in": [
+        "usr/bin/curl",
+        "usr/lib/libcurl.so.4.8.0"
+      ]
+    },
+    "openssl": {
+      "versions": [
+        "1.1.1q",
+        "1.2.11"
+      ],
+      "found_in": [
+        "usr/bin/openssl",
+        "usr/lib/libbind9-9.18.1.so",
+        "usr/lib/libcrypto.so.1.1",
+        "usr/sbin/nginx",
+        "usr/sbin/tor"
+      ]
+    },
+    "linux_kernel": {
+      "versions": [
+        "4.4.0"
+      ],
+      "found_in": [
+        "usr/sbin/tailscaled"
+      ]
+    },
+    "openwrt": {
+      "versions": [
+        "21.02-SNAPSHOT"
+      ],
+      "found_in": [
+        "etc/banner",
+        "etc/openwrt_release",
+        "etc/os-release",
+        "usr/lib/os-release"
+      ]
+    },
+    "uhttpd": {
+      "versions": [
+        "detected"
+      ],
+      "found_in": [
+        "usr/lib/opkg/info/uhttpd.list"
+      ]
+    }
+  }
+}
