@@ -81,9 +81,7 @@ src/
   batch/            Batch execution helpers
   corpus_tools/     Corpus and input organization utilities
   review/           Review and triage support code
-
-tests/
-  research_tools/   Lightweight regression tests for orchestration graph tooling
+  tests/            Lightweight regression tests
 ```
 
 Large local corpora, Ghidra workspaces, extracted firmware targets, and private research artifacts are not required for understanding the released source tree and may not be included in a public upload.
@@ -153,5 +151,5 @@ If you are starting from the public code release:
 
 1. inspect `src/research_tools/orchestration_graph_mvp.py`
 2. read the note drafting and normalization modules beside it
-3. run the regression tests under `tests/research_tools/`
+3. run the regression tests under `src/tests/research_tools/`
 4. treat the tooling as analyst support, not as a push-button answer engine

@@ -14,7 +14,7 @@ from datetime import date, datetime
 from collections import defaultdict
 from itertools import combinations
 
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCAN_DIR = PROJECT_ROOT / "report" / "oss_scan"
 
 # ──────────────────────────────────────────

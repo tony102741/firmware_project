@@ -12,10 +12,10 @@ import subprocess
 import time
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 INPUTS_DIR = PROJECT_ROOT / "inputs"
 CACHE_BUILD = PROJECT_ROOT / ".cache" / "build"
-SCANNER = PROJECT_ROOT / "scripts" / "oss_version_scanner.py"
+SCANNER = PROJECT_ROOT / "src" / "core" / "scanner" / "oss_version.py"
 PIPELINE = PROJECT_ROOT / "src" / "pipeline.py"
 OUT_DIR = PROJECT_ROOT / "report" / "oss_scan"
 
