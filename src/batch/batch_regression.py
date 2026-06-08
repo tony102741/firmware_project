@@ -295,7 +295,7 @@ def classify_success_quality(result):
         "/_raw",
         "/.cache/rootfs/",
     )
-    if analysis_mode in {"iot_web", "android"} and any(marker in system_path for marker in rootfs_markers):
+    if any(marker in system_path for marker in rootfs_markers):
         return "rootfs-success"
     if analysis_mode == "general" and (candidate_count > 0 or blob_candidate_count > 0):
         return "blob-success"

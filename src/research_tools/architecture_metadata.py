@@ -29,8 +29,19 @@ ARCH_MARKERS = {
     "rpcd": ["sbin/rpcd", "usr/sbin/rpcd"],
     "ubus": ["sbin/ubus", "bin/ubus", "usr/sbin/ubus"],
     "uci": ["sbin/uci", "bin/uci"],
-    "etc-config": ["etc/config"],
-    "etc-initd": ["etc/init.d"],
+    # OpenWrt UCI config
+    "etc-config": [
+        "etc/config",
+        # ipTIME overlay layout: static defaults live under default/etc/
+        "default/etc/iconfig.cfg",
+        "default/etc/config",
+        # ASUS / Synology: vendor configs under usr/etc/
+        "usr/etc",
+        # Universal Unix fallback — any complete rootfs has passwd
+        "etc/passwd",
+        "default/etc/passwd",
+    ],
+    "etc-initd": ["etc/init.d", "default/etc/init.d"],
     "apmib": ["bin/flash", "lib/libapmib.so", "lib/libapmib"],
     "nvram": ["usr/sbin/nvram", "sbin/nvram", "bin/nvram"],
     "mtk-wifi": ["sbin/iwpriv", "lib/wifi", "etc/wireless"],

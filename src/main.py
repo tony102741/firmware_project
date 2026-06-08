@@ -253,10 +253,12 @@ def _has_web_layout(root):
     if not os.path.isdir(root):
         return False
     for rel in (
-        "www", "web", "cgi-bin", "usr/www", "var/www", "var/web", "www/cgi-bin",
-        "web/cgi-bin", "web/cgi-bin/cstecgi.cgi",
+        "www", "web", "cgi-bin", "cgibin", "usr/www", "var/www", "var/web",
+        "www/cgi-bin", "web/cgi-bin", "web/cgi-bin/cstecgi.cgi",
         "www/webpages", "etc/wifidog", "usr/lib/lua/luci", "etc/config/uhttpd",
         "etc/boa.org/boa.conf", "etc/boa.conf",
+        "home/httpd",
+        "etc/nginx/nginx.conf", "etc/config/nginx", "usr/sbin/nginx",
     ):
         if os.path.isdir(os.path.join(root, rel)):
             return True

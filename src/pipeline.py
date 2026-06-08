@@ -90,7 +90,8 @@ _UBIREADER_FALLBACK_DIRS = (
 
 _PARTITION_INDICATORS = {"bin", "lib", "lib64", "etc", "app", "framework", "priv-app"}
 _SEARCH_SKIP = {"rootfs", ".git", "node_modules", "__pycache__"}
-_ARCHIVE_FIRMWARE_EXTS = (".bin", ".img", ".web", ".trx", ".w", ".pkgtb")
+# .chk = NETGEAR CHK format (contains squashfs after a fixed 58-byte header)
+_ARCHIVE_FIRMWARE_EXTS = (".bin", ".img", ".web", ".trx", ".w", ".pkgtb", ".chk")
 _ARCHIVE_NOISE_EXTS = (
     ".txt", ".pdf", ".doc", ".docx", ".rtf",
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".ico",
@@ -554,7 +555,12 @@ def _check_required_tools():
         for tool, hint in missing:
             print(f"        {tool}  →  install: {hint}", flush=True)
         sys.exit(1)
-    _ok("tools: strings, unzip, 7z")
+    optional = []
+    if _ubireader_available():
+        optional.append("ubireader")
+    else:
+        optional.append("ubireader:missing")
+    _ok(f"tools: strings, unzip, 7z ({', '.join(optional)})")
 
 
 # ── Tool validation: payload-dumper-go ───────────────────────────────────────
@@ -1685,6 +1691,8 @@ def _describe_rootfs_candidate(path):
             "var/www",
             "var/web",
             "cgi-bin",
+            "cgibin",
+            "home/httpd",
             "web/cgi-bin/cstecgi.cgi",
             "bin/boa",
             "bin/httpd",
@@ -1698,12 +1706,16 @@ def _describe_rootfs_candidate(path):
             "usr/sbin/httpd",
             "usr/sbin/goahead",
             "usr/sbin/uhttpd",
+            "usr/sbin/nginx",
+            "usr/bin/nginx",
             "etc/boa.org/boa.conf",
             "etc/boa/boa.conf",
             "etc/boa.conf",
             "etc/lighttpd/lighttpd.conf",
             "etc/lighttpd.conf",
             "etc/config/uhttpd",
+            "etc/nginx/nginx.conf",
+            "etc/config/nginx",
             "www/apply.cgi",
             "www/goform",
             "www/boafrm",
@@ -1730,6 +1742,8 @@ def _describe_rootfs_candidate(path):
             "sbin/httpd",
             "usr/sbin/httpd",
             "usr/sbin/uhttpd",
+            "usr/sbin/nginx",
+            "usr/bin/nginx",
             "web/cgi-bin/cstecgi.cgi",
         )
         if os.path.exists(os.path.join(path, rel))
@@ -2808,6 +2822,134 @@ def _rank_nested_blob(path):
 
 def _has_ubi_magic(path):
     return _read_magic(path, 4) == b"UBI#"
+
+
+_CHK_MAGIC = b"\x2a\x23\x24\x5e"  # NETGEAR CHK firmware header magic
+
+
+def _is_netgear_chk(path):
+    return _read_magic(path, 4) == _CHK_MAGIC
+
+
+def _extract_netgear_chk(chk_path, out_dir):
+    """
+    Extract rootfs from a NETGEAR CHK firmware image.
+
+    CHK layout:
+      [58-byte header][UBI image]
+
+    The UBI image contains a raw squashfs stored as the data of UBI volume 0
+    (type=dynamic but data is squashfs, not UBIFS). ubireader fails on it
+    because it expects UBIFS internal structures. We reconstruct the squashfs
+    by reading each LEB of volume 0 in order and concatenating the data areas.
+    """
+    import struct as _struct
+
+    try:
+        with open(chk_path, "rb") as fh:
+            raw = fh.read(8)
+        if raw[:4] != _CHK_MAGIC:
+            return None
+
+        # Read CHK header to get header_len
+        with open(chk_path, "rb") as fh:
+            header = fh.read(64)
+        header_len = _struct.unpack(">I", header[4:8])[0]
+        if header_len < 4 or header_len > 0x1000:
+            header_len = 58  # default for NETGEAR RAX50-style
+
+        with open(chk_path, "rb") as fh:
+            fh.seek(header_len)
+            ubi = fh.read()
+    except OSError:
+        return None
+
+    if ubi[:4] != b"UBI#":
+        return None
+
+    # Parse EC header for PEB geometry
+    try:
+        vid_hdr_offset = _struct.unpack(">I", ubi[16:20])[0]
+        data_offset    = _struct.unpack(">I", ubi[20:24])[0]
+    except Exception:
+        return None
+
+    # Auto-detect PEB size
+    peb_size = None
+    for candidate in (0x10000, 0x20000, 0x40000):
+        if len(ubi) > candidate and ubi[candidate:candidate+4] == b"UBI#":
+            peb_size = candidate
+            break
+    if peb_size is None:
+        return None
+
+    leb_size = peb_size - data_offset
+
+    # Map vol_id=0 LEBs → PEBs
+    leb_map = {}
+    total_pebs = len(ubi) // peb_size
+    for peb in range(total_pebs):
+        vid_off = peb * peb_size + vid_hdr_offset
+        if vid_off + 32 > len(ubi):
+            break
+        vid = ubi[vid_off:vid_off + 32]
+        if vid[:4] != b"UBI!":
+            continue
+        vol_id = _struct.unpack(">I", vid[8:12])[0]
+        lnum   = _struct.unpack(">I", vid[12:16])[0]
+        if vol_id == 0:
+            leb_map[lnum] = peb
+
+    if not leb_map:
+        return None
+
+    # Read squashfs superblock from LEB 0 to get bytes_used
+    leb0_peb = leb_map.get(0)
+    if leb0_peb is None:
+        return None
+    sqfs_start_in_ubi = leb0_peb * peb_size + data_offset
+    sqfs_sb = ubi[sqfs_start_in_ubi:sqfs_start_in_ubi + 96]
+    if sqfs_sb[:4] not in (b"hsqs", b"sqsh", b"qshs", b"shsq"):
+        return None  # not squashfs, let regular UBI path handle it
+
+    try:
+        bytes_used = _struct.unpack("<q", sqfs_sb[40:48])[0]
+    except Exception:
+        return None
+    if bytes_used <= 0 or bytes_used > 500 * 1024 * 1024:
+        return None
+
+    # Reconstruct squashfs by concatenating LEB data in order
+    os.makedirs(out_dir, exist_ok=True)
+    sqfs_path = os.path.join(out_dir, "rootfs.squashfs")
+    written = 0
+    try:
+        with open(sqfs_path, "wb") as out:
+            for lnum in range(max(leb_map.keys()) + 1):
+                if written >= bytes_used:
+                    break
+                chunk_size = min(leb_size, bytes_used - written)
+                if lnum in leb_map:
+                    peb = leb_map[lnum]
+                    data_abs = peb * peb_size + data_offset
+                    out.write(ubi[data_abs:data_abs + chunk_size])
+                else:
+                    out.write(b"\x00" * chunk_size)
+                written += chunk_size
+    except OSError:
+        return None
+
+    # Unsquashfs
+    sqfs_root = os.path.join(out_dir, "squashfs-root")
+    result = run(
+        f'unsquashfs -d "{sqfs_root}" "{sqfs_path}"',
+        label=f"unsquashfs CHK  {os.path.basename(chk_path)}",
+        quiet=True,
+    )
+    if result and result.returncode == 0 and _looks_like_rootfs_candidate(sqfs_root):
+        return sqfs_root
+
+    return find_squashfs_root(out_dir)
 
 
 _DLINK_WRAPPER_OFFSETS = (0x40, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000)
@@ -4156,6 +4298,12 @@ def _expand_segmented_bundle_chunks(base_dir, max_blobs=8):
 def _try_extract_iot_blob(blob_path, out_dir, label):
     shutil.rmtree(out_dir, ignore_errors=True)
     os.makedirs(out_dir, exist_ok=True)
+
+    # NETGEAR CHK: 58-byte header + UBI with squashfs stored as raw volume data
+    if _is_netgear_chk(blob_path):
+        chk_root = _extract_netgear_chk(blob_path, os.path.join(out_dir, "_chk_extract"))
+        if chk_root:
+            return chk_root
 
     if _has_ubi_magic(blob_path):
         return _extract_ubi_blob(blob_path, os.path.join(out_dir, "_ubi_extract"))

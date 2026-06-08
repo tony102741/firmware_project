@@ -75,7 +75,7 @@ def _candidate_adjusted_score(candidate: dict) -> int:
 def _normalized_success_quality(row: dict) -> str:
     mode = row.get("analysis_mode")
     system_path = str(row.get("analysis_system_path") or "").lower()
-    if mode in {"iot_web", "android"} and (
+    if (
         "/squashfs-root" in system_path
         or "/rootfs" in system_path
         or "/system" in system_path

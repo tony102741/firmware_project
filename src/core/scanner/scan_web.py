@@ -24,7 +24,9 @@ _WEB_SERVERS = {
 }
 
 # Directory names that indicate web content roots
-_WWW_NAMES = {"www", "webroot", "web", "htdocs", "cgi-bin", "cgi", "html"}
+# "cgibin" (no hyphen): used by ipTIME and several Korean/Asian vendors
+# "goform":             Goahead-style form handler directory
+_WWW_NAMES = {"www", "webroot", "web", "htdocs", "cgi-bin", "cgi", "cgibin", "goform", "html"}
 
 # Frontend and handler files worth tracking as web-surface evidence
 _FRONTEND_EXTS = {".asp", ".htm", ".html", ".cgi", ".lua", ".json", ".js"}
@@ -43,6 +45,12 @@ _WEB_ROOT_REL_HINTS = (
     "usr/lib/lua/luci",
     "usr/lib/oui-httpd/rpc",
     "usr/libexec/rpcd",
+    # ipTIME and similar vendors: CGI files live under home/httpd/<hostname|ip>/cgi/
+    # Adding the parent anchor ensures the depth-walk reaches the nested cgi/ dirs.
+    "home/httpd",
+    # Xiaomi xiaoqiang: nginx-served CGI under www/cgi-bin (www already in _WWW_NAMES
+    # but the nginx config may route differently; explicit hint avoids depth-limit misses)
+    "www/cgi-bin",
 )
 
 _TP_LINK_WEB_FILES = {
@@ -69,6 +77,9 @@ _WEB_CONFIGS = (
     "etc/lighttpd/lighttpd.conf",
     "etc/lighttpd.conf",
     "etc/httpd.conf",
+    # Xiaomi xiaoqiang: nginx with custom config
+    "etc/nginx/nginx.conf",
+    "etc/config/nginx",
 )
 
 _WEB_LAUNCH_DIRS = (
